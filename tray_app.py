@@ -32,6 +32,15 @@ TRAY_LOG = LOG_DIR / "tray.log"
 CONTROL_PORT = int(os.environ.get("TRAY_CONTROL_PORT", "8766"))
 AUTH_LISTENER_PORT = int(os.environ.get("WEB_LOGIN_LISTENER_PORT", "8765"))
 
+# Health-probe tuning.  ``/v1/status`` runs on the same single uvicorn event
+# loop as chat traffic, so a multi-megabyte request body being parsed can stall
+# it well past a short timeout.  A missed probe is therefore *not* proof the
+# relay is dead: we only force a restart when the process is actually gone, or
+# after the relay has stayed unresponsive for a long stretch.
+HEALTH_PROBE_TIMEOUT = float(os.environ.get("TRAY_HEALTH_TIMEOUT", "10"))
+HEALTH_MISS_THRESHOLD = int(os.environ.get("TRAY_HEALTH_MISSES", "3"))
+HEALTH_HARD_RESTART_SECONDS = float(os.environ.get("TRAY_HEALTH_HARD_SECONDS", "180"))
+
 # The relay console page's <title>; used to find an already-open console, both
 # as a window title (active tab) and as a browser tab item (UI Automation).
 CONSOLE_TITLE = "Trae CN Relay 控制台"
@@ -433,6 +442,10 @@ class Manager:
         self._relay_pids: set = set()
         self._relay_fh = None
         self._auth_fh = None
+        # When the health probe first started failing while the relay process
+        # was still alive.  Lets the monitor tell a briefly-busy event loop
+        # apart from a genuinely hung process.
+        self._unhealthy_since: float | None = None
         # Set while the tray is quitting.  The monitor loop and any in-flight
         # restart worker must not resurrect the relay once this is set.
         self.stopping = threading.Event()
@@ -533,7 +546,18 @@ class Manager:
 
     # ---- relay ---------------------------------------------------
     def relay_up(self) -> bool:
-        return http_ok(f"http://127.0.0.1:{self.port}/v1/status")
+        return http_ok(
+            f"http://127.0.0.1:{self.port}/v1/status",
+            timeout=HEALTH_PROBE_TIMEOUT,
+        )
+
+    def relay_listening(self) -> bool:
+        """Whether any process currently accepts TCP connections on our port.
+
+        A listening socket plus a failed ``/v1/status`` means the event loop is
+        busy, not that the relay died, so the monitor must not force-kill it.
+        """
+        return bool(_listening_pids(self.port))
 
     def start_relay(self) -> bool:
         if self.stopping.is_set():
@@ -591,21 +615,47 @@ class Manager:
             time.sleep(0.7)
         return self.relay_up()
 
-    def recover_if_dead(self) -> None:
+    def recover_if_dead(self, force: bool = False) -> None:
         """Health-gated self-heal for the monitor loop.
 
         Restarts the relay only when it is distinctly unhealthy: the process is
-        gone, or nothing/plain-HTTP is wrong.  This is what turns the old
-        "icon just turns red" behaviour into an automatic recovery.
+        gone, or it has stayed unresponsive past ``HEALTH_HARD_RESTART_SECONDS``
+        (the event loop may simply be parsing a huge request, which is not a
+        failure).  ``force`` is used for user-initiated restarts.
+
+        This is what turns the old "icon just turns red" behaviour into an
+        automatic recovery -- and what stops the tray from killing a perfectly
+        healthy relay just because one probe timed out under load.
         """
         if self.stopping.is_set():
             return
         if self.relay_up():
+            self._unhealthy_since = None
             return
+        if not force:
+            if self._relay_process_alive() or self.relay_listening():
+                # The process/socket is still there: treat this as a busy event
+                # loop rather than a crash.  Only escalate to a restart once it
+                # has been continuously unresponsive for a long time.
+                now = time.time()
+                if self._unhealthy_since is None:
+                    self._unhealthy_since = now
+                waited = now - self._unhealthy_since
+                if waited < HEALTH_HARD_RESTART_SECONDS:
+                    log(
+                        f"health probe slow/failed but relay still alive "
+                        f"({waited:.0f}s); deferring forced restart"
+                    )
+                    return
+                log(
+                    f"relay unresponsive for {waited:.0f}s despite live process; "
+                    f"forcing restart"
+                )
         log("health check failed; attempting relay recovery")
         if not self.start_relay():
             return
         ready = self.wait_relay()
+        self._unhealthy_since = None if ready else time.time()
         log(f"relay recovery ready={ready} port={self.port}")
 
     # ---- auth helper --------------------------------------------
@@ -704,11 +754,14 @@ def main() -> int:
         def worker():
             if mgr.stopping.is_set():
                 return
+            # A user-initiated restart always wins, even while the relay still
+            # answers probes: that is the whole point of the menu item.
             mgr.stop_relay()
             if mgr.stopping.is_set():
                 return
             if mgr.start_relay():
                 mgr.wait_relay()
+            mgr._unhealthy_since = None
             refresh()
         threading.Thread(target=worker, daemon=True).start()
 
@@ -779,11 +832,12 @@ def main() -> int:
             try:
                 if mgr.relay_up():
                     misses = 0
+                    mgr._unhealthy_since = None
                     refresh()
                     continue
                 misses += 1
                 refresh()
-                if misses >= 3 and not recovering.is_set():
+                if misses >= HEALTH_MISS_THRESHOLD and not recovering.is_set():
                     recovering.set()
                     try:
                         mgr.recover_if_dead()
