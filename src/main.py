@@ -111,10 +111,8 @@ def _restore_persisted_relay_settings() -> dict:
 
     global UPSTREAM_MODE, WEB_BASE
     settings = auth.get_settings() or {}
-    # The IDE Raw/IDE Agent and Remote/Work Agent presets intentionally share
-    # base URLs.  ``endpoint_id`` is therefore the authoritative persisted
-    # identity when present; URL-only restoration is retained for stores
-    # written by older releases.
+    # ``endpoint_id`` is the authoritative persisted identity when present;
+    # URL-only restoration is retained for stores written by older releases.
     endpoint_id = str(settings.get("endpoint_id") or "").strip().lower()
     endpoint = next(
         (
@@ -140,18 +138,32 @@ def _restore_persisted_relay_settings() -> dict:
     if web_base:
         WEB_BASE = web_base
         os.environ["TRAE_WEB_BASE_URL"] = web_base
+    model_base = str(
+        (endpoint or {}).get("model_base_url")
+        or settings.get("model_base_url")
+        or ""
+    ).strip().rstrip("/")
+    if model_base:
+        os.environ["TRAE_MODEL_API_HOST"] = model_base
     # Repair partially migrated stores once at startup.  This also makes the
     # settings API/UI observe the same canonical mode and URL as dispatch.
     if endpoint is not None and (
         settings.get("upstream_mode") != endpoint["mode"]
         or str(settings.get("web_base_url") or "").strip().rstrip("/")
         != str(endpoint["base_url"]).rstrip("/")
+        or str(settings.get("model_base_url") or "").strip().rstrip("/")
+        != str(endpoint.get("model_base_url") or "").rstrip("/")
     ):
         try:
             auth.set_relay_settings(
                 web_base_url=str(endpoint["base_url"]),
                 upstream_mode=str(endpoint["mode"]),
                 endpoint_id=str(endpoint["id"]),
+                model_base_url=str(
+                    endpoint.get("model_base_url")
+                    or settings.get("model_base_url")
+                    or ""
+                ),
             )
             # ``auth.set_relay_settings`` persists the canonical values, but
             # an older/custom store adapter may return a stale snapshot from
@@ -164,6 +176,11 @@ def _restore_persisted_relay_settings() -> dict:
                     "web_base_url": str(endpoint["base_url"]).rstrip("/"),
                     "upstream_mode": str(endpoint["mode"]).strip().lower(),
                     "endpoint_id": str(endpoint["id"]).strip().lower(),
+                    "model_base_url": str(
+                        endpoint.get("model_base_url")
+                        or settings.get("model_base_url")
+                        or ""
+                    ).rstrip("/"),
                 }
             )
         except Exception:
@@ -186,25 +203,33 @@ CHECKIN_9074_BACKOFF_EXPONENT_CAP = max(
 CHECKIN_AUTO_RETRY_INTERVAL = float(
     os.environ.get("TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS", "60") or "60"
 )
-WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+DEFAULT_REMOTE_BASE_URL = "https://trae-api-cn.mchost.guru/api/remote/v1"
+DEFAULT_MODEL_GATEWAY_URL = "https://trae-api-cn.mchost.guru"
+WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", DEFAULT_REMOTE_BASE_URL)).rstrip("/")
 UPSTREAM_ENDPOINT_PRESETS = (
     {
         "id": "remote",
         "label": "Remote / chat_sessions",
-        "base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "endpoint_url": DEFAULT_REMOTE_BASE_URL + "/chat_sessions",
+        "endpoint_path": "/api/remote/v1/chat_sessions",
         "mode": "remote",
     },
     {
         "id": "ide",
         "label": "IDE Agent / llm_utils_chat",
-        "base_url": "https://trae-api-cn.mchost.guru",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "model_base_url": DEFAULT_MODEL_GATEWAY_URL,
+        "endpoint_url": DEFAULT_MODEL_GATEWAY_URL + "/api/agent/v3/llm_utils_chat",
+        "endpoint_path": "/api/agent/v3/llm_utils_chat",
         "mode": "ide",
     },
     {
         "id": "solo",
         "label": "Solo / api/agent/v3/llm_utils_chat",
-        "base_url": "https://trae-api-cn.mchost.guru",
-        "endpoint_url": "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "model_base_url": DEFAULT_MODEL_GATEWAY_URL,
+        "endpoint_url": DEFAULT_MODEL_GATEWAY_URL + "/api/agent/v3/llm_utils_chat",
         "endpoint_path": "/api/agent/v3/llm_utils_chat",
         # The Solo transport is implemented by the existing IDE client.  The
         # distinct mode keeps the selected protocol visible and persistent
@@ -214,7 +239,9 @@ UPSTREAM_ENDPOINT_PRESETS = (
     {
         "id": "agent",
         "label": "Work Agent / solo_work_remote",
-        "base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "endpoint_url": DEFAULT_REMOTE_BASE_URL + "/chat_sessions",
+        "endpoint_path": "/api/remote/v1/chat_sessions",
         "mode": "work-agent",
     },
 )
@@ -1618,8 +1645,8 @@ def _web_login_html() -> str:
         logout_btn = f'<button class="icon-btn" onclick="logout()" title="登出" aria-label="登出">{ic["log-out"]}</button>'
 
     settings_web = (settings.get("web_base_url") or WEB_BASE).rstrip("/")
+    settings_model_base = str(settings.get("model_base_url") or "").rstrip("/")
     settings_port = settings.get("relay_port") or os.environ.get("RELAY_PORT") or PORT
-    # Remote/Work Agent and IDE Agent intentionally share upstream base URLs.
     # Select by mode as well as URL; URL-only matching can otherwise render a
     # different protocol after a reload.  IDE Raw is deliberately absent from
     # the public preset list because personal accounts consistently receive
@@ -1640,20 +1667,31 @@ def _web_login_html() -> str:
         "trae-remote": "remote",
         "web": "remote",
     }.get(selected_mode, selected_mode)
+    def _preset_url_match(item: Mapping[str, Any]) -> bool:
+        """Match the shared base, or a legacy host-only IDE/SOLO gateway.
+
+        Releases before the IDE/SOLO gateway split persisted the bare host in
+        ``web_base_url``.  Those stores must still render the IDE/SOLO preset
+        (and be repaired on the next save) instead of silently becoming a
+        custom URL.
+        """
+
+        shared = str(item.get("base_url") or "").rstrip("/")
+        gateway = str(item.get("model_base_url") or "").rstrip("/")
+        return settings_web == shared or (bool(gateway) and settings_web == gateway)
+
     url_matches = [
-        item
-        for item in UPSTREAM_ENDPOINT_PRESETS
-        if settings_web == str(item["base_url"]).rstrip("/")
+        item for item in UPSTREAM_ENDPOINT_PRESETS if _preset_url_match(item)
     ]
-    # Prefer the persisted preset identity.  Raw/IDE Agent and Remote/Work
-    # Agent deliberately share URLs, so selecting by URL or by the first
-    # matching mode can silently render the wrong option after a reload.
+    # Prefer the persisted preset identity.  The IDE/SOLO presets keep their
+    # own host-only model gateway, so URL-only matching can silently render
+    # the wrong option after a reload.
     matched_endpoint = next(
         (
             item
             for item in UPSTREAM_ENDPOINT_PRESETS
             if str(item.get("id") or "").strip().lower() == selected_endpoint_id
-            and settings_web == str(item.get("base_url") or "").rstrip("/")
+            and _preset_url_match(item)
         ),
         None,
     )
@@ -1683,6 +1721,7 @@ def _web_login_html() -> str:
             item["id"]: {
                 "base_url": item["base_url"],
                 "mode": item["mode"],
+                "model_base_url": item.get("model_base_url") or "",
                 "endpoint_url": item.get("endpoint_url") or item["base_url"],
                 "endpoint_path": item.get("endpoint_path") or "",
             }
@@ -1974,6 +2013,13 @@ def _web_login_html() -> str:
     <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1" oninput="markEndpointDirty()">
     </div>
   </div>
+  <div class="form-row">
+    <div class="form-group">
+      <label for="settings-model-base">模型网关地址（IDE Agent / Solo）</label>
+    <input id="settings-model-base" class="mono-input" value="{html_mod.escape(settings_model_base)}" placeholder="https://trae-api-cn.mchost.guru" oninput="markEndpointDirty()">
+    </div>
+  </div>
+  <p class="field-note" id="settings-endpoint-preview"></p>
   <div class="btn-group">
     <button class="btn btn-primary btn-sm" id="settings-save-btn" onclick="saveSettings()" disabled>{ic['save']}保存设置</button>
   </div>
@@ -3130,6 +3176,7 @@ function markEndpointDirty(){{
 function readEndpointSelection(){{
   var selector=document.getElementById('settings-endpoint-preset');
   var input=document.getElementById('settings-web');
+  var modelInput=document.getElementById('settings-model-base');
   var preset=selector?selector.value:'';
   var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
   var entry=map[preset]||null;
@@ -3137,6 +3184,7 @@ function readEndpointSelection(){{
     preset:preset,
     endpoint_id:(entry&&preset)?preset:'',
     web_base_url:input?(input.value||'').trim():'',
+    model_base_url:modelInput?(modelInput.value||'').trim():'',
     upstream_mode:entry?entry.mode:''
   }};
 }}
@@ -3144,6 +3192,7 @@ function restoreEndpointSelection(state){{
   state=state||{{}};
   var selector=document.getElementById('settings-endpoint-preset');
   var input=document.getElementById('settings-web');
+  var modelInput=document.getElementById('settings-model-base');
   var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
   var endpointId=String(state.endpoint_id||'').toLowerCase();
   if(selector){{
@@ -3154,12 +3203,38 @@ function restoreEndpointSelection(state){{
   if(input&&state.web_base_url!==undefined&&state.web_base_url!==null){{
     input.value=String(state.web_base_url);
   }}
+  if(modelInput&&state.model_base_url!==undefined&&state.model_base_url!==null){{
+    modelInput.value=String(state.model_base_url);
+  }}
+  renderEndpointPreview();
+}}
+function endpointPreviewText(state){{
+  state=state||readEndpointSelection();
+  var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
+  var entry=map[state.endpoint_id]||map[state.preset]||null;
+  var web=String(state.web_base_url||'').replace(/\\/+$/,'');
+  var model=String(state.model_base_url||'').replace(/\\/+$/,'');
+  var parts=[];
+  if(entry&&(entry.mode==='ide'||entry.mode==='solo')){{
+    parts.push('模型请求 '+(model||'https://trae-api-cn.mchost.guru')+'/api/agent/v3/llm_utils_chat');
+    parts.push('Remote 回落 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
+  }}else{{
+    parts.push('会话请求 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
+    parts.push('模型目录 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/models');
+  }}
+  return parts.join(' ｜ ');
+}}
+function renderEndpointPreview(state){{
+  var el=document.getElementById('settings-endpoint-preview');
+  if(!el) return;
+  el.textContent='当前请求地址：'+endpointPreviewText(state);
 }}
 async function saveSettings(){{
   var serial=++endpointSaveSerial;
   var state=readEndpointSelection();
   var payload={{
     web_base_url:state.web_base_url,
+    model_base_url:state.model_base_url,
     upstream_mode:state.upstream_mode,
     endpoint_id:state.endpoint_id
   }};
@@ -3172,12 +3247,17 @@ async function saveSettings(){{
       var canonical=(d.settings&&typeof d.settings==='object')?d.settings:{{}};
       var canonicalId=String(canonical.endpoint_id||state.endpoint_id||'').toLowerCase();
       var canonicalUrl=canonical.web_base_url;
+      var canonicalModel=canonical.model_base_url;
       var map=(typeof ENDPOINT_PRESET_MAP !== 'undefined') ? ENDPOINT_PRESET_MAP : {{}};
       if(canonicalId&&map[canonicalId]) canonicalUrl=map[canonicalId].base_url;
+      if((canonicalModel===undefined||canonicalModel===null)&&canonicalId&&map[canonicalId]){{
+        canonicalModel=map[canonicalId].model_base_url;
+      }}
       restoreEndpointSelection({{
         preset:canonicalId?canonicalId:state.preset,
         endpoint_id:canonicalId,
-        web_base_url:(canonicalUrl===undefined||canonicalUrl===null)?state.web_base_url:canonicalUrl
+        web_base_url:(canonicalUrl===undefined||canonicalUrl===null)?state.web_base_url:canonicalUrl,
+        model_base_url:(canonicalModel===undefined||canonicalModel===null)?state.model_base_url:canonicalModel
       }});
       endpointLastGoodState=readEndpointSelection();
       endpointDirty=false;
@@ -3304,16 +3384,20 @@ async function detectMaxModels(){{
 }}
 const ENDPOINT_PRESET_MAP = {endpoint_map_json};
 endpointLastGoodState=readEndpointSelection();
+renderEndpointPreview(endpointLastGoodState);
 function applyEndpointPreset(){{
   var selector=document.getElementById('settings-endpoint-preset');
   var input=document.getElementById('settings-web');
+  var modelInput=document.getElementById('settings-model-base');
   if(!selector||!input) return;
   var map=ENDPOINT_PRESET_MAP;
   var entry=map[selector.value]||null;
   var value=entry?entry.base_url:'';
   if(value) input.value=value;
+  if(modelInput){{ modelInput.value=(entry&&entry.model_base_url)||''; }}
   // Selecting a preset only updates the draft URL.  The explicit Save button
   // is the sole path that persists endpoint settings.
+  renderEndpointPreview();
   markEndpointDirty();
 }}
 async function checkinRefreshAll(){{
@@ -10337,6 +10421,10 @@ async def api_settings(request: Request):
     web_base_url = body.get("web_base_url") or ""
     upstream_mode = body.get("upstream_mode") or ""
     endpoint_id = body.get("endpoint_id")
+    # The IDE/SOLO model gateway is stored separately from the Web/Remote base
+    # so selecting an IDE/SOLO preset cannot strip ``/api/remote/v1`` from the
+    # Remote transport.  ``None`` means the field was absent (port-only call).
+    body_model_base_url = body.get("model_base_url")
     # Older clients only know URL/mode and do not send the newer preset
     # identity.  Keep ``None`` for a port-only update, where the existing
     # endpoint must remain untouched; endpoint-field updates are migrated below.
@@ -10348,9 +10436,17 @@ async def api_settings(request: Request):
         return JSONResponse({"success": False, "error": "URL and mode must be strings"}, status_code=400)
     if endpoint_id is not None and not isinstance(endpoint_id, str):
         return JSONResponse({"success": False, "error": "endpoint_id must be a string"}, status_code=400)
+    if body_model_base_url is not None and not isinstance(body_model_base_url, str):
+        return JSONResponse({"success": False, "error": "model_base_url must be a string"}, status_code=400)
     web_base_url = web_base_url.strip().rstrip("/")
     upstream_mode = upstream_mode.strip().lower()
     endpoint_id = endpoint_id.strip().lower() if isinstance(endpoint_id, str) else None
+    explicit_model_base_url = (
+        body_model_base_url.strip().rstrip("/")
+        if isinstance(body_model_base_url, str)
+        else None
+    )
+    model_base_url: Optional[str] = None
     if endpoint_id:
         endpoint = next(
             (
@@ -10365,17 +10461,41 @@ async def api_settings(request: Request):
                 {"success": False, "error": f"Unsupported endpoint preset: {endpoint_id}"},
                 status_code=400,
             )
-        # The preset id is authoritative.  This prevents a stale client URL or
-        # mode field from turning Work Agent into Remote (or IDE Agent into Raw).
+        # The preset id is authoritative.  The shared Web/Remote base URL is
+        # always the preset's canonical value; the IDE/SOLO model gateway is a
+        # separate host-only base so selecting an IDE/SOLO preset can no longer
+        # strip ``/api/remote/v1`` from the Remote transport.
         if not web_base_url:
             web_base_url = str(endpoint["base_url"]).rstrip("/")
         if not upstream_mode:
             upstream_mode = str(endpoint["mode"]).strip().lower()
-        if web_base_url != str(endpoint["base_url"]).rstrip("/") or upstream_mode != str(endpoint["mode"]).strip().lower():
+        # An explicit body value wins so a custom gateway can be paired with a
+        # preset, but the preset default is used when the field is absent.
+        model_base_url = (
+            explicit_model_base_url
+            if explicit_model_base_url is not None
+            else str(endpoint.get("model_base_url") or "").rstrip("/")
+        )
+        preset_web_base = str(endpoint["base_url"]).rstrip("/")
+        legacy_gateway = str(endpoint.get("model_base_url") or "").rstrip("/")
+        if upstream_mode != str(endpoint["mode"]).strip().lower():
             return JSONResponse(
                 {"success": False, "error": "endpoint_id does not match URL/mode"},
                 status_code=400,
             )
+        if web_base_url not in (preset_web_base, legacy_gateway) and legacy_gateway:
+            return JSONResponse(
+                {"success": False, "error": "endpoint_id does not match URL"},
+                status_code=400,
+            )
+        # Old IDE/SOLO stores may have persisted the host-only gateway into
+        # the shared web base.  Normalize it back to the Remote base so a
+        # subsequent fallback keeps the ``/api/remote/v1`` prefix.
+        if web_base_url == legacy_gateway:
+            web_base_url = preset_web_base
+    elif explicit_model_base_url is not None:
+        # No preset identity: the caller manages the model gateway directly.
+        model_base_url = explicit_model_base_url
     elif legacy_endpoint_update and (web_base_url or upstream_mode):
         # Older clients only sent URL/mode.  Migrate those updates to the
         # unique preset when possible, and clear a stale shared-URL identity
@@ -10388,6 +10508,11 @@ async def api_settings(request: Request):
             if (
                 not web_base_url
                 or web_base_url == str(item.get("base_url") or "").rstrip("/")
+                or (
+                    item.get("model_base_url")
+                    and web_base_url
+                    == str(item.get("model_base_url") or "").rstrip("/")
+                )
             )
             and (
                 not upstream_mode
@@ -10399,6 +10524,21 @@ async def api_settings(request: Request):
             if len(matches) == 1
             else ""
         )
+        if endpoint_id:
+            matched = next(
+                (
+                    item
+                    for item in UPSTREAM_ENDPOINT_PRESETS
+                    if str(item.get("id") or "").strip().lower() == endpoint_id
+                ),
+                None,
+            )
+            if matched is not None and model_base_url is None:
+                model_base_url = str(matched.get("model_base_url") or "").rstrip("/")
+        elif web_base_url and model_base_url is None:
+            # A custom URL is an explicit Web/Remote base; clear the preset
+            # model gateway so it cannot leak into the next selection.
+            model_base_url = ""
     relay_port = body.get("relay_port", body.get("port", 0))
     port_requested = "relay_port" in body or "port" in body
     if upstream_mode and upstream_mode not in _VALID_UPSTREAM_MODES:
@@ -10423,6 +10563,11 @@ async def api_settings(request: Request):
         "port": relay_port,
         "upstream_mode": upstream_mode,
     }
+    # A port-only call leaves ``model_base_url`` as ``None`` so the adapter
+    # keeps the current gateway; endpoint updates always send the resolved
+    # value (possibly empty for a custom URL).
+    if model_base_url is not None:
+        relay_settings["model_base_url"] = model_base_url
     # Keep the new keyword out of port-only calls for compatibility with
     # older store adapters.  Passing ``None`` is semantically equivalent in
     # the current adapter, but legacy wrappers may treat it as an overwrite.

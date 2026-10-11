@@ -1812,6 +1812,40 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(headers["x-user-region"], "CN")
         self.assertIn("solo.trae.cn", headers["Referer"])
 
+    def test_bare_trae_host_is_repaired_with_remote_path(self):
+        """A host-only base must not 404 every chat_sessions/models call (#9)."""
+
+        cases = (
+            "https://trae-api-cn.mchost.guru",
+            "https://trae-api-cn.mchost.guru/",
+            "https://core-normal.trae.cn",
+        )
+        for value in cases:
+            self.assertEqual(
+                trae_remote_client._normalize_remote_base(value),
+                value.rstrip("/") + "/api/remote/v1",
+            )
+
+    def test_existing_remote_path_and_custom_hosts_are_preserved(self):
+        self.assertEqual(
+            trae_remote_client._normalize_remote_base(
+                "https://trae-api-cn.mchost.guru/api/remote/v1/"
+            ),
+            "https://trae-api-cn.mchost.guru/api/remote/v1",
+        )
+        self.assertEqual(
+            trae_remote_client._normalize_remote_base("https://custom.example/v1"),
+            "https://custom.example/v1",
+        )
+
+    def test_base_url_normalizes_a_legacy_bare_gateway_override(self):
+        """``base_url()`` must repair a stale bare-domain option, not just env."""
+
+        self.assertEqual(
+            trae_remote_client.base_url({"base_url": "https://trae-api-cn.mchost.guru"}),
+            "https://trae-api-cn.mchost.guru/api/remote/v1",
+        )
+
     def test_dispatch_uses_remote_alias_for_plain_chat(self):
         async def fake_remote(messages, model, stream, options):
             return "remote-ok"

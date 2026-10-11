@@ -1316,6 +1316,11 @@ def get_settings() -> dict:
     with _STORE_LOCK:
         return {
             'web_base_url': _settings.get('web_base_url', ''),
+            # The IDE/SOLO model gateway is a host-only base that is stored
+            # separately from the Web/Remote base URL.  Keeping them apart
+            # prevents an IDE/SOLO preset selection from stripping the
+            # ``/api/remote/v1`` path that the Remote transport requires.
+            'model_base_url': _settings.get('model_base_url', ''),
             'upstream_mode': _settings.get('upstream_mode', ''),
             # ``web_base_url`` is shared by the IDE Raw/IDE Agent pair and by
             # Remote/Work Agent.  Keep the selected preset id separately so a
@@ -1329,6 +1334,7 @@ def get_settings() -> dict:
 
 def set_relay_settings(
     web_base_url: str = '',
+    model_base_url: str | None = None,
     port: int = 0,
     upstream_mode: str = '',
     endpoint_id: str | None = None,
@@ -1338,6 +1344,16 @@ def set_relay_settings(
             _settings['web_base_url'] = web_base_url
             # Update the running process so the change takes effect without a restart.
             os.environ['TRAE_WEB_BASE_URL'] = web_base_url
+        # ``None`` means this call does not touch the model gateway (for
+        # example the relay-port form).  An explicit value is persisted even
+        # when empty so choosing the custom URL entry clears a stale preset
+        # gateway instead of silently reusing it.
+        if model_base_url is not None:
+            _settings['model_base_url'] = str(model_base_url).strip()
+            if str(model_base_url).strip():
+                os.environ['TRAE_MODEL_API_HOST'] = str(model_base_url).strip()
+            else:
+                os.environ.pop('TRAE_MODEL_API_HOST', None)
         if upstream_mode:
             _settings['upstream_mode'] = upstream_mode
             os.environ['UPSTREAM_MODE'] = upstream_mode
@@ -1358,6 +1374,11 @@ def set_relay_settings(
     values = {}
     if web_base_url:
         values['TRAE_WEB_BASE_URL'] = web_base_url
+    if model_base_url is not None:
+        # Keep the IDE/SOLO model gateway visible in ``.env`` alongside the
+        # Web/Remote base.  An empty value is written deliberately so a
+        # container that reads ``env_file`` cannot resurrect a stale gateway.
+        values['TRAE_MODEL_API_HOST'] = str(model_base_url).strip()
     if upstream_mode:
         values['UPSTREAM_MODE'] = upstream_mode
     if port and port > 0:

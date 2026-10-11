@@ -430,34 +430,6 @@ def _model_gateway_base(*candidates: Any) -> str:
     return DEFAULT_MODEL_GATEWAY
 
 
-_REMOTE_API_PATH = "/api/remote/v1"
-
-
-def _remote_web_base(value: str = "") -> str:
-    """Return the Remote web API base whatever dispatch tier is selected.
-
-    ``TRAE_WEB_BASE_URL`` is shared by the IDE/Solo presets, which persist only
-    the gateway host, and the Remote/Work presets, which persist the full
-    ``/api/remote/v1`` root.  Remote-only helpers -- the model list,
-    ``chat_sessions`` and session stop/events -- must re-append the Remote root
-    so selecting IDE Agent cannot turn ``{base}/models`` into a bare-host 404.
-    An explicit ``value`` (a bound transport URL) is normalized the same way.
-    """
-
-    default = DEFAULT_MODEL_GATEWAY + _REMOTE_API_PATH
-    base = (value or os.environ.get("TRAE_WEB_BASE_URL") or default).rstrip("/")
-    parsed = urlsplit(base)
-    if not (parsed.scheme and parsed.netloc):
-        return base
-    path = (parsed.path or "").rstrip("/")
-    if path.endswith(_REMOTE_API_PATH):
-        return base
-    if not path or path.startswith(("/api/agent", "/api/ide", "/api/remote")):
-        return urlunsplit((parsed.scheme, parsed.netloc, _REMOTE_API_PATH, "", ""))
-    # A custom gateway path is preserved: only known Trae API prefixes are repaired.
-    return base
-
-
 # Cache of checkin device ids per account. The upstream checkin API is
 # device-scoped and rate limits the claim endpoint (code 9074). A JWT is
 # refreshed periodically, so the raw token is not a stable device identity;
@@ -954,9 +926,35 @@ def build_web_headers(
     }
 
 
+REMOTE_BASE_DEFAULT = "https://trae-api-cn.mchost.guru/api/remote/v1"
+
+
+def remote_base_url() -> str:
+    """Return the Web/Remote base, repairing a host-only legacy value.
+
+    Selecting the IDE/SOLO preset used to persist the bare model gateway into
+    ``TRAE_WEB_BASE_URL``.  Every ``chat_sessions`` / ``events`` / ``models``
+    request then 404s because the ``/api/remote/v1`` path is missing.  Append
+    the canonical path for known Trae hosts and preserve custom gateways.
+    """
+
+    value = str(os.environ.get("TRAE_WEB_BASE_URL") or REMOTE_BASE_DEFAULT).strip().rstrip("/")
+    if not value:
+        return REMOTE_BASE_DEFAULT
+    lowered = value.lower()
+    if "/api/remote/" in lowered:
+        return value
+    if any(
+        host in lowered
+        for host in ("mchost.guru", "core-normal.trae.cn", "trae.ai")
+    ):
+        return value + "/api/remote/v1"
+    return value
+
+
 def web_origin() -> str:
     """Return the browser Origin/Referer matching the current web upstream."""
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).lower()
+    base = remote_base_url().lower()
     if "core-normal.trae.cn" in base or "trae-api-cn" in base or "mchost.guru" in base:
         return "https://solo.trae.cn"
     return "https://solo.trae.ai"
@@ -1245,7 +1243,7 @@ async def stop_web_session(
     """Actively interrupt an upstream web session so it stops occupying a running slot."""
     if not session_id or not message_id:
         return
-    base = _remote_web_base()
+    base = remote_base_url()
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")
     if not token:
@@ -1361,7 +1359,7 @@ async def _fetch_web_model_configs(
     agent_type: str = "",
 ) -> dict[str, dict]:
     """Fetch the same model list used by the Trae web client."""
-    base = _remote_web_base()
+    base = remote_base_url()
     token = token_override or auth.get_token()
     if not token:
         return {}
@@ -1668,7 +1666,7 @@ async def create_web_session(
         raise RuntimeError(
             "Trae web remote cannot safely proxy caller-owned tool policy"
         )
-    base = _remote_web_base()
+    base = remote_base_url()
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")
     if not token:
@@ -1749,7 +1747,7 @@ async def stream_web_events(
     options: Optional[dict] = None,
 ) -> AsyncIterator[tuple[str, dict]]:
     """GET /chat_sessions/{id}/events?reply_to_message_id=...（SSE）。"""
-    base = _remote_web_base()
+    base = remote_base_url()
     url = f"{base}/chat_sessions/{session_id}/events?reply_to_message_id={message_id}"
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")
