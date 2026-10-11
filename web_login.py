@@ -2,7 +2,7 @@
 """web_login.py - Trae CN Relay 本地授权回调监听器
 
 使用方式:
-  python web_login.py [--relay http://192.168.5.246:8000] [--port 8765]
+  python web_login.py [--relay http://127.0.0.1:8000] [--port 8765]
 
 依赖: 仅用 Python 标准库。
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Trae CN Relay 本地授权回调监听器")
-    parser.add_argument("--relay", default="http://192.168.5.246:8000", help="Relay 地址")
+    parser.add_argument("--relay", default="http://127.0.0.1:8000", help="Relay 地址")
     parser.add_argument("--port", type=int, default=8765, help="本地监听端口")
     parser.add_argument("--client-id", default="ono9krqynydwx5", help="Trae Client ID")
     parser.add_argument("--auth-url", default="https://www.trae.cn/authorization", help="Trae 授权 URL")

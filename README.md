@@ -6,6 +6,22 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 
 **仅供学习使用。请勿用于商业用途。**
 
+---
+
+> **关于本仓库（Fork）**
+>
+> 本仓库是 [autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn)
+> 的 Fork，**新增了 Windows 本地部署的托盘守护机制**，其余能力与上游一致。
+> 上游的 Docker / 服务器部署方式完全保留。
+>
+> - 新增内容：`tray_app.py`、`启动服务.bat` / `启动服务.vbs`（无窗口启动）、
+>   `启动服务-调试.bat`、`assets/`（托盘图标）、`requirements-tray.txt`、
+>   `tools/make_tray_icon.py`。
+> - 详细指南：[docs/windows-tray.md](docs/windows-tray.md)
+> - 上游同步：`git fetch upstream && git merge upstream/main`
+>
+> 若你不需要 Windows 托盘，请直接使用上游仓库。
+
 ## 特点
 
 - OpenAI 兼容接口：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/chat`、`POST /v1`
@@ -106,6 +122,44 @@ docker compose up -d --build
 Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 label，并由
 `/v1/status` 返回，便于确认运行容器与源码版本一致。手动源码构建可设置
 `RELAY_BUILD_REVISION=$(git rev-parse --short HEAD)`。
+
+## Windows 托盘启动（本 Fork 新增）
+
+> 本节由 [akaicn/Trae2api-cn](https://github.com/akaicn/Trae2api-cn) 在
+> 上游基础上新增，面向 **Windows 本地部署**：用一个系统托盘守护进程托管
+> relay 服务，免去手动开命令行窗口。
+
+### 能力
+
+- 双击启动，无黑框窗口（由 `启动服务.vbs` 拉起 `tray_app.py`）
+- 托盘右键菜单：打开控制台 / 启动·停止授权助手 / 重启服务 / 查看日志 / 退出
+- 启动时自动拉起 relay，并对 `/v1/status` 做就绪探测
+- 健康检查连续失败后自动恢复（先清理残留进程、释放端口，再重新绑定）
+- 绑定端口前主动确认端口空闲，避免 Windows 上 `SO_REUSEADDR` 导致的
+  重复绑定与 `WinError 64` 假死
+
+### 前置依赖
+
+除 relay 本体依赖外，托盘还需要额外依赖：
+
+```bash
+.venv\Scripts\pip install -r requirements-tray.txt
+```
+
+### 使用
+
+1. 双击 `启动服务.bat`（或直接 `启动服务.vbs`），右下角出现托盘图标
+2. 托盘图标为绿色表示服务运行中，红色表示已停止/异常（右键可重启）
+3. 需要排查问题时，双击 `启动服务-调试.bat` 会保留一个带实时日志的窗口
+
+> **注意**：托盘机制只跟踪自身拉起的 relay。若你曾用其它方式手动启动过
+> relay，请先结束那些进程，避免多个 relay 抢占同一端口。
+
+### 与 Docker 部署的关系
+
+Docker/容器部署仍按上文说明使用，托管由 compose 的
+`restart: unless-stopped` 负责，不需要托盘。托盘是 **纯 Windows 本机** 的
+替代方案，二者选其一即可。
 
 ## 网页授权（推荐：web-login 模式）
 

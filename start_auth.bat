@@ -2,7 +2,7 @@
 rem Trae CN Relay - 一键网页授权（Windows）
 rem 在浏览器打开的 relay 页面上点授权后，凭据会自动写入服务器。
 chcp 65001 >nul
-set RELAY=http://192.168.5.246:8000
+set RELAY=http://127.0.0.1:8000
 set PORT=8765
 echo ================================================
 echo  Trae CN Relay 本机授权监听器
