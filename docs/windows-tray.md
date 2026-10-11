@@ -135,21 +135,47 @@ OSError: [WinError 64] 指定的网络名不再可用。
 后台线程每 5 秒探测 `/v1/status`：
 
 - 探测成功 → 图标绿色；
-- 连续失败达到阈值（默认 3 次）**且确认 relay 进程/端口已真正失联** →
-  记录日志、清理残留、重新拉起 relay，并等待就绪。
+- 探测失败时按「端口是否仍在监听」区分两种情况：
+  - **端口仍在监听** → 判定为事件循环繁忙（例如正在解析数 MB 请求体），
+    记日志但不重启；仅当**持续无响应**超过 `TRAY_HEALTH_HARD_SECONDS`
+    （默认 180 秒）才强制恢复；
+  - **端口已无监听** → 说明 accept 循环已死（进程可能还在），立即清理旧进程
+    并重新拉起 relay、等待就绪。
 
 > **探测超时与「假死」区分**：`/v1/status` 与聊天请求跑在同一个 uvicorn 事件
-> 循环里。当 relay 正在解析超大请求体（数 MB）时，探测可能短暂超时，但这
-> **不代表 relay 已死**。因此探测超时放宽到 10 秒（`TRAY_HEALTH_TIMEOUT`），
-> 并且只要 relay 的进程或监听端口仍在，托盘**不会**强杀重启，而是等到其
-> **持续无响应**超过 180 秒（`TRAY_HEALTH_HARD_SECONDS`）后才强制恢复。
-> 这避免了「探测抖动 → 误杀健康 relay → 重拉 → 再次抖动」的重启循环。
-> 相关阈值可用环境变量 `TRAY_HEALTH_TIMEOUT`（秒）、
-> `TRAY_HEALTH_MISSES`（连续失败次数）、`TRAY_HEALTH_HARD_SECONDS`（秒）调整。
+> 循环里。当 relay 正在解析数 MB 请求体时，探测可能短暂超时，但这**不代表
+> relay 已死**。因此探测超时放宽到 10 秒（`TRAY_HEALTH_TIMEOUT`），并且只要
+> **端口仍在监听**，托盘不会强杀重启。这避免了「探测抖动 → 误杀健康 relay →
+> 重拉 → 再次抖动」的重启循环。相关阈值可用环境变量 `TRAY_HEALTH_TIMEOUT`
+> （秒）、`TRAY_HEALTH_MISSES`（连续失败次数）、`TRAY_HEALTH_HARD_SECONDS`
+> （秒）调整。
+
+> **为什么端口会「进程活着但不监听」**：uvicorn 在 Windows 单进程下默认使用
+> `ProactorEventLoop`，它遇到一次瞬时 accept 错误（如 `WinError 64`，常见于大
+> 请求上传中途客户端断开）会**关闭监听 socket 且不再重新挂载**；表现为
+> `ERROR:asyncio:Accept failed on a socket ... WinError 64`，此后所有新请求被拒。
+> 本项目通过 `--loop src.asyncio_loop:loop_factory` 改用选择器事件循环规避
+> （见 5.4），托盘的「端口已无监听」自愈则作为第二道保险。
 
 > 自愈只针对**非主动**的失联。菜单「退出」会先置停止标志，自愈逻辑随即
 > 停止工作，因此退出后服务不会被重新拉起（这正是早期版本"退出后服务又
 > 自己起来"问题的修复点）。
+
+### 5.4 Windows 事件循环（避免端口"假死"）
+
+uvicorn 在 Windows 单进程下默认跑在 `ProactorEventLoop`（IOCP）上，它的
+accept 处理在遇到一次瞬时错误时会**关闭监听 socket 且不再重新挂载**，于是
+进程还在、端口却不再监听。项目为此提供了 `src/asyncio_loop.py`：
+
+```bash
+uvicorn src.main:app --host 0.0.0.0 --port 8000 --loop src.asyncio_loop:loop_factory
+```
+
+- 非 `cli` 模式 → 使用选择器事件循环（对瞬时 accept 错误容错，持续服务）；
+- `UPSTREAM_MODE=cli` → 保留 `ProactorEventLoop`，因为
+  `asyncio.create_subprocess_exec` 只有它支持。
+
+托盘启动 relay 时已默认带上该 `--loop` 参数，无需手动配置。
 
 ---
 
@@ -232,4 +258,6 @@ requirements-tray.txt
 tools/make_tray_icon.py
 ```
 
-随后照主 README 用 `uvicorn src.main:app --host 0.0.0.0 --port 8000` 启动即可。
+随后照主 README 用
+`uvicorn src.main:app --host 0.0.0.0 --port 8000 --loop src.asyncio_loop:loop_factory`
+启动即可。

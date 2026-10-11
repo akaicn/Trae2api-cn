@@ -573,6 +573,11 @@ class Manager:
             [
                 self._python(), "-m", "uvicorn", "src.main:app",
                 "--host", self.host, "--port", str(self.port),
+                # Selector-based loop: uvicorn's Windows default (Proactor)
+                # closes the listening socket on a transient accept error such
+                # as WinError 64, which leaves the process alive but the port
+                # dead.  Selector treats those errors as non-fatal.
+                "--loop", "src.asyncio_loop:loop_factory",
             ],
             cwd=str(ROOT),
             stdout=self._relay_fh,
@@ -633,25 +638,34 @@ class Manager:
             self._unhealthy_since = None
             return
         if not force:
-            if self._relay_process_alive() or self.relay_listening():
-                # The process/socket is still there: treat this as a busy event
-                # loop rather than a crash.  Only escalate to a restart once it
-                # has been continuously unresponsive for a long time.
+            if self.relay_listening():
+                # The port is still bound: the event loop is merely busy (e.g.
+                # parsing a huge request body), which is not a failure.  Only
+                # escalate to a restart once it has stayed unresponsive for a
+                # long time.
                 now = time.time()
                 if self._unhealthy_since is None:
                     self._unhealthy_since = now
                 waited = now - self._unhealthy_since
                 if waited < HEALTH_HARD_RESTART_SECONDS:
                     log(
-                        f"health probe slow/failed but relay still alive "
+                        f"health probe slow/failed but port still listening "
                         f"({waited:.0f}s); deferring forced restart"
                     )
                     return
                 log(
-                    f"relay unresponsive for {waited:.0f}s despite live process; "
-                    f"forcing restart"
+                    f"relay unresponsive for {waited:.0f}s despite listening "
+                    f"port; forcing restart"
                 )
+            # No listener on the port: the accept loop is dead (e.g. Windows
+            # ProactorEventLoop closing the socket on WinError 64), so a live
+            # process is not serving anyone.  Recover immediately.
         log("health check failed; attempting relay recovery")
+        # Reap the old relay first.  A deaf-but-alive interpreter is no longer
+        # listening, so the port scan in ``start_relay`` would miss it and leak
+        # one process per recovery; ``stop_relay`` also matches it by command
+        # line.
+        self.stop_relay()
         if not self.start_relay():
             return
         ready = self.wait_relay()

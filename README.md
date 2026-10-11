@@ -79,6 +79,18 @@ pip install -r requirements.txt
 uvicorn src.main:app --host 0.0.0.0 --port 8000
 ```
 
+> **Windows 提示**：uvicorn 在 Windows 单进程下默认使用 `ProactorEventLoop`，
+> 它在遇到一次瞬时的 accept 错误（如 `WinError 64`，常见于大请求体上传过程中
+> 客户端断开）时会**关闭监听 socket 且不再重新挂载**——进程还活着，端口却已
+> 停止监听，于是所有新请求被拒。Windows 上请加上项目提供的选择器事件循环工厂：
+>
+> ```bash
+> uvicorn src.main:app --host 0.0.0.0 --port 8000 --loop src.asyncio_loop:loop_factory
+> ```
+>
+> 托盘启动已默认带上该参数。`UPSTREAM_MODE=cli` 因需要 asyncio 子进程仍保留
+> Proactor，其余模式自动使用选择器循环。
+
 开发环境使用 `pip install -r requirements-dev.txt`，Windows TraeWork native
 helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只安装核心依赖。
 
