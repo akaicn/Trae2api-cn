@@ -926,9 +926,35 @@ def build_web_headers(
     }
 
 
+REMOTE_BASE_DEFAULT = "https://trae-api-cn.mchost.guru/api/remote/v1"
+
+
+def remote_base_url() -> str:
+    """Return the Web/Remote base, repairing a host-only legacy value.
+
+    Selecting the IDE/SOLO preset used to persist the bare model gateway into
+    ``TRAE_WEB_BASE_URL``.  Every ``chat_sessions`` / ``events`` / ``models``
+    request then 404s because the ``/api/remote/v1`` path is missing.  Append
+    the canonical path for known Trae hosts and preserve custom gateways.
+    """
+
+    value = str(os.environ.get("TRAE_WEB_BASE_URL") or REMOTE_BASE_DEFAULT).strip().rstrip("/")
+    if not value:
+        return REMOTE_BASE_DEFAULT
+    lowered = value.lower()
+    if "/api/remote/" in lowered:
+        return value
+    if any(
+        host in lowered
+        for host in ("mchost.guru", "core-normal.trae.cn", "trae.ai")
+    ):
+        return value + "/api/remote/v1"
+    return value
+
+
 def web_origin() -> str:
     """Return the browser Origin/Referer matching the current web upstream."""
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).lower()
+    base = remote_base_url().lower()
     if "core-normal.trae.cn" in base or "trae-api-cn" in base or "mchost.guru" in base:
         return "https://solo.trae.cn"
     return "https://solo.trae.ai"
@@ -1217,7 +1243,7 @@ async def stop_web_session(
     """Actively interrupt an upstream web session so it stops occupying a running slot."""
     if not session_id or not message_id:
         return
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    base = remote_base_url()
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")
     if not token:
@@ -1333,7 +1359,7 @@ async def _fetch_web_model_configs(
     agent_type: str = "",
 ) -> dict[str, dict]:
     """Fetch the same model list used by the Trae web client."""
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    base = remote_base_url()
     token = token_override or auth.get_token()
     if not token:
         return {}
@@ -1640,7 +1666,7 @@ async def create_web_session(
         raise RuntimeError(
             "Trae web remote cannot safely proxy caller-owned tool policy"
         )
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    base = remote_base_url()
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")
     if not token:
@@ -1721,7 +1747,7 @@ async def stream_web_events(
     options: Optional[dict] = None,
 ) -> AsyncIterator[tuple[str, dict]]:
     """GET /chat_sessions/{id}/events?reply_to_message_id=...（SSE）。"""
-    base = (os.environ.get("TRAE_WEB_BASE_URL", "https://trae-api-cn.mchost.guru/api/remote/v1")).rstrip("/")
+    base = remote_base_url()
     url = f"{base}/chat_sessions/{session_id}/events?reply_to_message_id={message_id}"
     options = options or {}
     token = str(options.get("_auth_token") or auth.get_token() or "")

@@ -94,7 +94,30 @@ def base_url(options: Optional[Mapping[str, Any]] = None) -> str:
     options = options or {}
     configured = options.get("base_url") or options.get("baseURL")
     value = configured or os.environ.get("TRAE_WEB_BASE_URL") or DEFAULT_BASE_URL
-    return str(value).rstrip("/")
+    return _normalize_remote_base(str(value))
+
+
+def _normalize_remote_base(value: str) -> str:
+    """Repair a Web/Remote base URL that is missing the ``/api/remote/v1`` path.
+
+    The console used to write the IDE/SOLO host-only gateway into the shared
+    ``TRAE_WEB_BASE_URL``.  A stale store or an older release could therefore
+    leave a bare host here, which turns every ``chat_sessions``/``models``
+    call into a 404.  Append the canonical path for known Trae hosts so the
+    Remote transport keeps working; custom hosts are preserved verbatim.
+    """
+
+    value = str(value or "").strip().rstrip("/")
+    if not value:
+        return DEFAULT_BASE_URL
+    lowered = value.lower()
+    if "/api/remote/" in lowered:
+        return value
+    if any(host in lowered for host in ("trae-api-cn.mchost.guru", "core-normal.trae.cn", "mchost.guru")):
+        return value + "/api/remote/v1"
+    if "trae.ai" in lowered:
+        return value + "/api/remote/v1"
+    return value
 
 
 def _provider_specific(options: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:

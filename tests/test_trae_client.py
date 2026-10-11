@@ -1129,6 +1129,44 @@ class IdeRequestContextTests(unittest.TestCase):
                 "https://trae-api-cn.mchost.guru",
             )
 
+    def test_remote_base_url_repairs_host_only_gateway(self):
+        """A legacy bare gateway must not 404 the Remote transport (#9)."""
+
+        cases = (
+            "https://trae-api-cn.mchost.guru",
+            "https://trae-api-cn.mchost.guru/",
+            "https://core-normal.trae.cn",
+        )
+        for value in cases:
+            with patch.dict("os.environ", {"TRAE_WEB_BASE_URL": value}, clear=False):
+                self.assertEqual(
+                    trae_client.remote_base_url(),
+                    value.rstrip("/") + "/api/remote/v1",
+                )
+
+    def test_remote_base_url_preserves_path_and_custom_host(self):
+        with patch.dict(
+            "os.environ",
+            {"TRAE_WEB_BASE_URL": "https://trae-api-cn.mchost.guru/api/remote/v1/"},
+            clear=False,
+        ):
+            self.assertEqual(
+                trae_client.remote_base_url(),
+                "https://trae-api-cn.mchost.guru/api/remote/v1",
+            )
+        with patch.dict(
+            "os.environ", {"TRAE_WEB_BASE_URL": "https://custom.example/v1"}, clear=False
+        ):
+            self.assertEqual(
+                trae_client.remote_base_url(), "https://custom.example/v1"
+            )
+
+    def test_remote_base_url_defaults_when_unset(self):
+        with patch.dict("os.environ", {"TRAE_WEB_BASE_URL": ""}, clear=False):
+            self.assertEqual(
+                trae_client.remote_base_url(), trae_client.REMOTE_BASE_DEFAULT
+            )
+
     def test_work_agent_body_carries_native_tools(self):
         options = {
             "_auth_user_id": "uid-1",

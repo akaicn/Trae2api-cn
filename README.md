@@ -30,13 +30,15 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 | 端点 | `UPSTREAM_MODE` | 上游路径 | 工具调用 | 思考强度 | 说明 |
 |---|---|---|---|---|---|
 | Remote（默认） | `remote` | `/api/remote/v1/chat_sessions` | glm-5.3 6/7（不支持并行调用） | 生效 | 最稳定的通用通道；Agent 优先，失败回退一次 Work |
-| Solo | `solo` | `https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat` | 与 IDE Agent 相同 | 端点忽略该字段 | JeffHu0912/trae2api 所称 SOLO 通道；请求体使用 `function=solo_work_lite` |
-| IDE Agent | `ide` | `/api/agent/v3/llm_utils_chat` | glm-5.3 7/7，deepseek-v4-pro 7/7 | 不生效（端点忽略该字段） | 工具能力最完整，适合 Codex / Agent 类客户端 |
+| Solo | `solo` | `https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`（模型网关 `TRAE_MODEL_API_HOST` + `/api/agent/v3/llm_utils_chat`） | 与 IDE Agent 相同 | 端点忽略该字段 | JeffHu0912/trae2api 所称 SOLO 通道；请求体使用 `function=solo_work_lite` |
+| IDE Agent | `ide` | `https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`（模型网关 `TRAE_MODEL_API_HOST` + `/api/agent/v3/llm_utils_chat`） | glm-5.3 7/7、deepseek-v4-pro 7/7 | 不生效（端点忽略该字段） | 适合并行请求，避免 Codex / Agent 冲突；与 Remote 基址分离，选择后回落 Remote 仍保留 `/api/remote/v1` |
 | Work Agent | `work-agent` | Remote `solo_work_remote` | glm-5.3 6/7 | 生效（无 Work 档位时借用 Agent 档位） | 走 Work 执行器，不会被默认 provider 接管 |
 
 部分模型在 Remote / Work 上会出现上游 `4028` / 502（例如 deepseek-v4-pro），此时请切换到 IDE Agent。需要完整工具能力（含并行调用）时推荐 IDE Agent；只聊天或需要思考强度时用 Remote。
 
 > **IDE Raw 暂不作为正式端点发布。** 逆向报告确认其协议是
+
+> **基址分离**：Web/Remote 使用 `TRAE_WEB_BASE_URL`（含 `/api/remote/v1`），IDE Agent / Solo 使用 `TRAE_MODEL_API_HOST`（仅主机名）。两者分开保存，选择 IDE/SOLO 预设不会再破坏 Remote 回落（#9）。
 > `POST /api/ide/v2/llm_raw_chat`，但个人账号的 Cloud-IDE-JWT 没有企业
 > app config 时，上游在鉴权/配置绑定阶段固定返回
 > `2001 failed to get app config: record not found`。这不是请求体、模型名或
@@ -175,6 +177,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_CLIENT_SYSTEM_TYPE` | `Windows` | 未传 `client_context` 时使用的调用方系统 |
 | `TRAE_CLI_DISALLOWED_TOOLS` | `Read,Bash,Edit,Replace,Write,Glob,Grep,Task` | CLI 模式额外禁用的 relay 本机工具；外部工具请求会与默认项合并 |
 | `TRAE_WEB_BASE_URL` | `https://trae-api-cn.mchost.guru/api/remote/v1` | remote 上游端点；`remote` 模式按 9router 的 `chat_sessions` + `events` 协议转发 |
+| `TRAE_MODEL_API_HOST` | `https://trae-api-cn.mchost.guru` | IDE Agent / Solo 模型网关主机地址；与 `TRAE_WEB_BASE_URL` 分开持久化，选择 IDE/SOLO 预设不会再把 `/api/remote/v1` 从 Remote 基址中剥掉（#9） |
 | `TRAE_WEB_PARALLEL_LIMIT` | `2` | 每账号最大并行会话数 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
 | `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS` | `120` | remote 会话创建成功但没有首个 SSE 事件时的重试等待；首事件前 EOF/读超时同样按可重试空响应处理，`0` 表示关闭独立首事件期限 |

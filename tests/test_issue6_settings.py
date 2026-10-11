@@ -41,7 +41,7 @@ class Issue6SettingsTests(unittest.TestCase):
                 ide = client.post(
                     "/api/settings",
                     json={
-                        "web_base_url": "https://trae-api-cn.mchost.guru",
+                        "web_base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
                         "upstream_mode": "ide",
                         "endpoint_id": "ide",
                     },
@@ -51,11 +51,20 @@ class Issue6SettingsTests(unittest.TestCase):
                 self.assertEqual(saved["upstream_mode"], "ide")
                 self.assertEqual(ide.json()["settings"]["endpoint_id"], "ide")
                 self.assertEqual(main_module.UPSTREAM_MODE, "ide")
+                # The IDE preset keeps its own host-only model gateway while
+                # the shared Web/Remote base keeps the ``/api/remote/v1`` path.
+                self.assertEqual(
+                    saved["web_base_url"],
+                    "https://trae-api-cn.mchost.guru/api/remote/v1",
+                )
+                self.assertEqual(
+                    saved["model_base_url"], "https://trae-api-cn.mchost.guru"
+                )
 
                 solo = client.post(
                     "/api/settings",
                     json={
-                        "web_base_url": "https://trae-api-cn.mchost.guru",
+                        "web_base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
                         "upstream_mode": "solo",
                         "endpoint_id": "solo",
                     },
@@ -64,6 +73,9 @@ class Issue6SettingsTests(unittest.TestCase):
                 self.assertEqual(saved["endpoint_id"], "solo")
                 self.assertEqual(saved["upstream_mode"], "solo")
                 self.assertEqual(solo.json()["settings"]["endpoint_id"], "solo")
+                self.assertEqual(
+                    saved["model_base_url"], "https://trae-api-cn.mchost.guru"
+                )
 
                 work = client.post(
                     "/api/settings",
@@ -108,10 +120,126 @@ class Issue6SettingsTests(unittest.TestCase):
             "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
         )
         self.assertEqual(solo["endpoint_path"], "/api/agent/v3/llm_utils_chat")
-        self.assertEqual(solo["base_url"], "https://trae-api-cn.mchost.guru")
+        # The shared Web/Remote base keeps ``/api/remote/v1``; the IDE/SOLO
+        # model gateway is a separate host-only base (issue #9).  Sharing one
+        # bare-domain base made the Remote fallback 404 on every request.
+        self.assertEqual(
+            solo["base_url"], "https://trae-api-cn.mchost.guru/api/remote/v1"
+        )
+        self.assertEqual(
+            solo["model_base_url"], "https://trae-api-cn.mchost.guru"
+        )
         # Solo is dispatched by the existing IDE client, which already builds
         # the same native function/body contract used by Jeff's implementation.
         self.assertEqual(solo["mode"], "solo")
+
+    def test_ide_preset_keeps_remote_base_and_separate_model_gateway(self):
+        """Selecting IDE Agent must not strip ``/api/remote/v1`` (issue #9)."""
+
+        ide = next(
+            item
+            for item in main_module.UPSTREAM_ENDPOINT_PRESETS
+            if item["id"] == "ide"
+        )
+        self.assertEqual(
+            ide["base_url"], "https://trae-api-cn.mchost.guru/api/remote/v1"
+        )
+        self.assertEqual(
+            ide["model_base_url"], "https://trae-api-cn.mchost.guru"
+        )
+        self.assertEqual(
+            ide["endpoint_url"],
+            "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
+        )
+
+    def test_remote_and_work_presets_expose_concrete_request_url(self):
+        """Every preset must publish the real request path, not a bare domain."""
+
+        for preset_id, expected_path in (
+            ("remote", "/api/remote/v1/chat_sessions"),
+            ("agent", "/api/remote/v1/chat_sessions"),
+        ):
+            preset = next(
+                item
+                for item in main_module.UPSTREAM_ENDPOINT_PRESETS
+                if item["id"] == preset_id
+            )
+            self.assertEqual(preset["endpoint_path"], expected_path)
+            self.assertTrue(preset["endpoint_url"].endswith(expected_path))
+            self.assertNotIn("model_base_url", preset)
+
+    def test_selecting_ide_preset_persists_remote_base_and_gateway(self):
+        """The settings API must apply both bases, not a bare shared domain."""
+
+        saved = {}
+
+        def save_settings(**values):
+            saved.update(
+                {key: value for key, value in values.items() if value is not None}
+            )
+
+        def get_settings():
+            return {
+                "web_base_url": saved.get("web_base_url", ""),
+                "model_base_url": saved.get("model_base_url", ""),
+                "upstream_mode": saved.get("upstream_mode", ""),
+                "endpoint_id": saved.get("endpoint_id", ""),
+                "relay_port": 0,
+            }
+
+        old_mode = main_module.UPSTREAM_MODE
+        old_env = os.environ.get("TRAE_MODEL_API_HOST")
+        try:
+            with (
+                patch.object(main_module.auth, "set_relay_settings", side_effect=save_settings),
+                patch.object(main_module.auth, "get_settings", side_effect=get_settings),
+                patch.object(main_module, "UPSTREAM_MODE", "remote"),
+                patch.dict(os.environ, {"RELAY_API_KEYS": "", "UPSTREAM_MODE": "remote"}, clear=False),
+            ):
+                client = TestClient(main_module.app)
+                response = client.post(
+                    "/api/settings",
+                    json={
+                        "web_base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+                        "upstream_mode": "ide",
+                        "endpoint_id": "ide",
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    saved["web_base_url"],
+                    "https://trae-api-cn.mchost.guru/api/remote/v1",
+                )
+                self.assertEqual(
+                    saved["model_base_url"], "https://trae-api-cn.mchost.guru"
+                )
+                self.assertEqual(saved["endpoint_id"], "ide")
+                self.assertEqual(saved["upstream_mode"], "ide")
+
+                # A legacy bare-domain IDE update is repaired to the Remote
+                # base instead of being rejected or persisted verbatim.
+                response = client.post(
+                    "/api/settings",
+                    json={
+                        "web_base_url": "https://trae-api-cn.mchost.guru",
+                        "upstream_mode": "ide",
+                        "endpoint_id": "ide",
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    saved["web_base_url"],
+                    "https://trae-api-cn.mchost.guru/api/remote/v1",
+                )
+                self.assertEqual(
+                    saved["model_base_url"], "https://trae-api-cn.mchost.guru"
+                )
+        finally:
+            main_module.UPSTREAM_MODE = old_mode
+            if old_env is None:
+                os.environ.pop("TRAE_MODEL_API_HOST", None)
+            else:
+                os.environ["TRAE_MODEL_API_HOST"] = old_env
 
     def test_ide_raw_is_not_a_formal_endpoint_preset(self):
         """Personal accounts cannot satisfy Raw's enterprise app-config check."""
