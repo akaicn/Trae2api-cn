@@ -18,7 +18,11 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 >   `启动服务-调试.bat`、`assets/`（托盘图标）、`requirements-tray.txt`、
 >   `tools/make_tray_icon.py`。
 > - 详细指南：[docs/windows-tray.md](docs/windows-tray.md)
-> - 上游同步：`git fetch upstream && git merge upstream/main`
+> - 上游同步基线：[`508fda3`](https://github.com/autumnsentiment/Trae2api-cn/commit/508fda3528fb35e287622f3ed647974c7d4737c2)
+>   （`fix: separate IDE/SOLO model gateway from Web/Remote base (#9)`）。
+>   本 Fork 已合并上游全部提交（含 #9 基址分离修复），仅领先 Windows 托盘
+>   相关改动，与上游无实现分歧。
+> - 后续同步：`git fetch upstream && git merge upstream/main`
 >
 > 若你不需要 Windows 托盘，请直接使用上游仓库。
 
