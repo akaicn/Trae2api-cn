@@ -32,6 +32,10 @@ TRAY_LOG = LOG_DIR / "tray.log"
 CONTROL_PORT = int(os.environ.get("TRAY_CONTROL_PORT", "8766"))
 AUTH_LISTENER_PORT = int(os.environ.get("WEB_LOGIN_LISTENER_PORT", "8765"))
 
+# The relay console page's <title>; used to find an already-open console, both
+# as a window title (active tab) and as a browser tab item (UI Automation).
+CONSOLE_TITLE = "Trae CN Relay 控制台"
+
 if os.name == "nt":
     # CREATE_NO_WINDOW: GUI 进程(pythonw)派生控制台子进程时不新建黑色控制台窗口
     CREATE_FLAGS = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -56,6 +60,158 @@ def message_box(text: str, title: str = "Trae2api-cn", flags: int = 0x40) -> Non
         pass
 
 
+def _find_window(substrings) -> int:
+    """HWND of the first visible top-level window whose title contains any of
+    ``substrings`` (case-insensitive); 0 when none matches.
+
+    Used to focus an already-open console window instead of spawning another.
+    """
+    if os.name != "nt":
+        return 0
+    try:
+        user32 = ctypes.windll.user32
+        user32.EnumWindows.restype = ctypes.c_bool
+        user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar), ctypes.c_int
+        ]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        user32.IsWindowVisible.restype = ctypes.c_bool
+    except Exception:
+        return 0
+
+    needles = [s.lower() for s in substrings]
+    found: list[int] = []
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.lower()
+        if any(n in title for n in needles):
+            found.append(hwnd)
+            return False
+        return True
+
+    try:
+        user32.EnumWindows(enum_proc(_callback), 0)
+    except Exception:
+        return 0
+    return found[0] if found else 0
+
+
+def _focus_window(hwnd: int) -> bool:
+    """Bring an existing window to the foreground; True on success.
+
+    Windows refuses ``SetForegroundWindow`` unless the caller owns the
+    foreground.  We try, in order: a plain call; attaching our input queue to
+    the current foreground thread; and finally briefly nudging the ALT key,
+    which makes the OS treat our thread as the last input source and is the
+    only technique that works under Edge on this machine.
+    """
+    if os.name != "nt" or not hwnd:
+        return False
+    VK_MENU = 0x12
+    KEYEVENTF_KEYUP = 0x0002
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.IsIconic.argtypes = [ctypes.c_void_p]
+        user32.IsIconic.restype = ctypes.c_bool
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        user32.SetForegroundWindow.restype = ctypes.c_bool
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        user32.AttachThreadInput.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_bool]
+        user32.AttachThreadInput.restype = ctypes.c_bool
+        user32.keybd_event.argtypes = [
+            ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ulong, ctypes.c_void_p
+        ]
+        kernel32.GetCurrentThreadId.restype = ctypes.c_ulong
+
+        # 9 = SW_RESTORE (un-minimize), 5 = SW_SHOW
+        user32.ShowWindow(hwnd, 9 if user32.IsIconic(hwnd) else 5)
+        if user32.SetForegroundWindow(hwnd):
+            return True
+
+        # Attempt 2: borrow the foreground thread's input queue and retry.
+        current = kernel32.GetCurrentThreadId()
+        foreground = user32.GetForegroundWindow()
+        fg_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+        if fg_thread and fg_thread != current and user32.AttachThreadInput(current, fg_thread, True):
+            try:
+                if user32.SetForegroundWindow(hwnd):
+                    return True
+            finally:
+                user32.AttachThreadInput(current, fg_thread, False)
+
+        # Attempt 3: the ALT-key nudge.
+        user32.keybd_event(VK_MENU, 0, 0, 0)
+        try:
+            return bool(user32.SetForegroundWindow(hwnd))
+        finally:
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        return False
+
+
+def _activate_console_tab() -> bool:
+    """Focus the console even when it sits in a background browser tab.
+
+    A window title only reflects the *active* tab, so a title match cannot find
+    a console hidden behind other tabs.  UI Automation can: it exposes every
+    browser tab as a TabItem, so we ask it to select the one carrying the
+    console title, then raise the owning window.  Returns True when a tab was
+    found and focused.
+    """
+    if os.name != "nt":
+        return False
+    script = (
+        "Add-Type -AssemblyName UIAutomationClient;"
+        "Add-Type -AssemblyName UIAutomationTypes;"
+        "$r=[System.Windows.Automation.AutomationElement]::RootElement;"
+        "$c=New-Object System.Windows.Automation.PropertyCondition("
+        "[System.Windows.Automation.AutomationElement]::ControlTypeProperty,"
+        "[System.Windows.Automation.ControlType]::TabItem);"
+        "$t=$r.FindAll([System.Windows.Automation.TreeScope]::Descendants,$c);"
+        "$hit=$null;"
+        "foreach($x in $t){if($x.Current.Name -like '*" + CONSOLE_TITLE + "*'){$hit=$x;break}};"
+        "if($hit){$p=$null;"
+        "if($hit.TryGetCurrentPattern("
+        "[System.Windows.Automation.SelectionItemPattern]::Pattern,[ref]$p)){$p.Select()};"
+        "$w=[System.Windows.Automation.TreeWalker]::ControlViewWalker;$e=$hit;"
+        "while($e -ne $null -and $e.Current.ControlType -ne "
+        "[System.Windows.Automation.ControlType]::Window){$e=$w.GetParent($e)};"
+        "if($e){'HWND='+$e.Current.NativeWindowHandle}}"
+    )
+    try:
+        out = _run_hidden(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            timeout=25,
+        ).stdout
+    except Exception as exc:
+        log(f"console tab lookup failed: {exc}")
+        return False
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("HWND="):
+            try:
+                hwnd = int(line[len("HWND="):])
+            except ValueError:
+                continue
+            return _focus_window(hwnd)
+    return False
+
+
 def read_env() -> dict:
     env: dict[str, str] = {}
     env_file = ROOT / ".env"
@@ -77,6 +233,26 @@ def http_ok(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
+def _run_hidden(args, timeout: float):
+    """Run a console helper with no visible console window.
+
+    The tray runs under ``pythonw.exe`` (a GUI process with no console), so any
+    console tool it spawns (``netstat`` / ``tasklist`` / ``taskkill`` /
+    ``powershell``) would otherwise get a brand-new console window from Windows
+    for every single call -- which is what produced the burst of black windows
+    on quit.  ``CREATE_NO_WINDOW`` plus ``DEVNULL`` keeps every call silent.
+    """
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "capture_output": True,
+        "text": True,
+        "timeout": timeout,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return subprocess.run(args, **kwargs)
+
+
 def _taskkill_tree(pid: int) -> None:
     """Force-kill a process and its children; ignore a process already gone.
 
@@ -88,12 +264,7 @@ def _taskkill_tree(pid: int) -> None:
         return
     try:
         if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            )
+            _run_hidden(["taskkill", "/F", "/T", "/PID", str(pid)], timeout=15)
         else:
             os.kill(pid, 9)
     except Exception as exc:
@@ -104,12 +275,7 @@ def _listening_pids(port: int) -> set:
     """Return PIDs that currently LISTEN on ``port`` (TCP, IPv4 + IPv6)."""
     pids: set = set()
     try:
-        out = subprocess.run(
-            ["netstat", "-ano", "-p", "tcp"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        ).stdout
+        out = _run_hidden(["netstat", "-ano", "-p", "tcp"], timeout=15).stdout
     except Exception as exc:
         log(f"netstat failed: {exc}")
         return pids
@@ -132,10 +298,8 @@ def _listening_pids(port: int) -> set:
 def _pid_image_name(pid: int) -> str:
     """Return the image name (lowercase) for a PID, or '' when unknown."""
     try:
-        out = subprocess.run(
+        out = _run_hidden(
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
             timeout=10,
         ).stdout.strip()
     except Exception:
@@ -162,10 +326,8 @@ def _stray_relay_pids(port: int) -> set:
         "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"
     )
     try:
-        out = subprocess.run(
+        out = _run_hidden(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True,
-            text=True,
             timeout=20,
         ).stdout
     except Exception as exc:
@@ -271,6 +433,9 @@ class Manager:
         self._relay_pids: set = set()
         self._relay_fh = None
         self._auth_fh = None
+        # Set while the tray is quitting.  The monitor loop and any in-flight
+        # restart worker must not resurrect the relay once this is set.
+        self.stopping = threading.Event()
 
     # ---- helpers -------------------------------------------------
     def _python(self) -> str:
@@ -371,6 +536,8 @@ class Manager:
         return http_ok(f"http://127.0.0.1:{self.port}/v1/status")
 
     def start_relay(self) -> bool:
+        if self.stopping.is_set():
+            return False
         if self._relay_process_alive() and self.relay_up():
             return True
         # A dead/duplicate relay (or an orphan from an earlier session) must be
@@ -431,6 +598,8 @@ class Manager:
         gone, or nothing/plain-HTTP is wrong.  This is what turns the old
         "icon just turns red" behaviour into an automatic recovery.
         """
+        if self.stopping.is_set():
+            return
         if self.relay_up():
             return
         log("health check failed; attempting relay recovery")
@@ -471,6 +640,9 @@ class Manager:
             self._auth_fh = None
 
     def shutdown(self) -> None:
+        # Set the stop flag first: it tells the monitor loop and any in-flight
+        # restart worker not to revive the relay while we tear everything down.
+        self.stopping.set()
         self.stop_auth()
         self.stop_relay()
 
@@ -510,6 +682,15 @@ def main() -> int:
     icon_holder: dict[str, object] = {}
 
     def open_console(icon=None, item=None):
+        # Fast path: the console is the *active* tab, so its title is visible.
+        existing = _find_window([CONSOLE_TITLE])
+        if existing and _focus_window(existing):
+            return
+        # Slow path: the console may sit in a *background* tab, which the
+        # window title cannot reveal.  Ask UI Automation to select it.
+        if _activate_console_tab():
+            return
+        # Not open anywhere: open a fresh browser window.
         webbrowser.open(console_url)
 
     def toggle_auth(icon=None, item=None):
@@ -521,7 +702,11 @@ def main() -> int:
 
     def restart(icon=None, item=None):
         def worker():
+            if mgr.stopping.is_set():
+                return
             mgr.stop_relay()
+            if mgr.stopping.is_set():
+                return
             if mgr.start_relay():
                 mgr.wait_relay()
             refresh()
@@ -537,9 +722,18 @@ def main() -> int:
             log(f"open log error: {exc}")
 
     def quit_app(icon=None, item=None):
+        if mgr.stopping.is_set():
+            return
         log("quit requested")
-        mgr.shutdown()
-        icon.stop()
+        # Signal stop first so the monitor loop cannot "self-heal" the relay
+        # while we are quitting, then drop the tray icon immediately instead of
+        # leaving it (turning red) until the slow child cleanup finishes.  The
+        # actual shutdown runs in the ``icon.run()`` finally block below.
+        mgr.stopping.set()
+        try:
+            icon.stop()
+        except Exception as exc:
+            log(f"icon.stop error: {exc}")
 
     def auth_label(item):
         return "停止授权助手" if mgr.auth_running() else "启动授权助手"
@@ -578,8 +772,10 @@ def main() -> int:
         # Consecutive failed health checks before a self-heal attempt.  A
         # single blip (e.g. a request in flight) must not trigger a restart.
         misses = 0
-        while True:
+        while not mgr.stopping.is_set():
             time.sleep(5)
+            if mgr.stopping.is_set():
+                return
             try:
                 if mgr.relay_up():
                     misses = 0
