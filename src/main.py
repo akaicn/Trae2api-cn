@@ -1508,6 +1508,33 @@ def _status_badge() -> str:
     return '<span class="badge badge-none">\u672a\u767b\u5f55</span>'
 
 
+def _fmt_expiry_display(value) -> str:
+    """把 expires（秒/毫秒时间戳或 ISO 串）格式化成北京时间显示；无法解析时原样回退。"""
+    raw = (value or "").strip()
+    if not raw:
+        return "-"
+    ts = None
+    try:
+        num = float(raw)
+        if num > 1e12:
+            num /= 1000.0  # 毫秒时间戳
+        ts = num
+    except ValueError:
+        pass
+    if ts is None:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.timestamp()
+        except Exception:
+            return raw[:16]
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return raw[:16]
+
+
 def _web_login_html() -> str:
     s = auth.get_auth()
     client_id = TRAE_CLIENT_ID
@@ -1586,7 +1613,7 @@ def _web_login_html() -> str:
         )
         label = html_mod.escape(acc.get("label") or acc.get("user_id") or acc.get("id") or "")
         uid = html_mod.escape(acc.get("user_id") or acc.get("id") or "")
-        expires = html_mod.escape((acc.get("expires") or "")[:16])
+        expires = html_mod.escape(_fmt_expiry_display(acc.get("expires")))
         account_credits = acc.get("account_credits") or {}
         if account_credits.get("unlimited"):
             credits_text = "☆ 无限"
