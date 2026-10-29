@@ -820,7 +820,10 @@ class ResponsesApiCompatibilityTests(unittest.TestCase):
                 },
             )
 
-        with patch("src.main.cli_client.stream_cli_chat", new=fake_stream):
+        with (
+            patch("src.main._task_model_available", return_value=True),
+            patch("src.main.cli_client.stream_cli_chat", new=fake_stream),
+        ):
             response = self.client.post(
                 "/v1/responses",
                 json={"model": "auto", "input": "hello", "stream": False},
@@ -837,7 +840,9 @@ class ResponsesApiCompatibilityTests(unittest.TestCase):
         self.assertEqual(body["usage"]["input_tokens"], 4)
         self.assertEqual(body["usage"]["output_tokens"], 3)
         self.assertEqual(body["usage"]["total_tokens"], 7)
-        self.assertEqual(captured["model"], "auto")
+        # Automatic task routing assigns simple chat turns to the configured
+        # lightweight model before dispatch.
+        self.assertEqual(captured["model"], "deepseek-v4.1-flash")
         self.assertEqual([message["role"] for message in captured["messages"]], ["user"])
         self.assertEqual(_content_text(captured["messages"][0]["content"]), "hello")
 

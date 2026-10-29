@@ -32,6 +32,7 @@ __pycache__/
 # Generated artifacts and source snapshots
 /backups/
 /_baseline_src/
+/dist/
 /*.bundle
 /*.tgz
 /*.tar.gz

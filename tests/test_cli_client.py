@@ -78,6 +78,58 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["arguments"], '{"command":"Get-ChildItem"}')
         self.assertEqual(cli_client.strip_tool_call_blocks(content), "")
 
+    def test_extract_zedex_toolcall_compatibility_formats(self):
+        cases = [
+            (
+                '<toolcall>{"name":"Read","params":{"path":"a.txt"}}</toolcall>',
+                "Read",
+                {"path": "a.txt"},
+            ),
+            (
+                '<toolcall name="Read"><param name="path">a.txt</param></toolcall>',
+                "Read",
+                {"path": "a.txt"},
+            ),
+            (
+                '<toolcall>Read path</arg_key><arg_value>a.txt</arg_value></toolcall>',
+                "Read",
+                {"path": "a.txt"},
+            ),
+            (
+                '<toolcall>Read path="a.txt" mode=\'r\'</toolcall>',
+                "Read",
+                {"path": "a.txt", "mode": "r"},
+            ),
+            (
+                "<toolcall>{'name':'Read','input':{'path':'a.txt',},}</toolcall>",
+                "Read",
+                {"path": "a.txt"},
+            ),
+        ]
+        for content, name, expected in cases:
+            with self.subTest(content=content):
+                calls = cli_client.extract_text_tool_calls(content)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["function"]["name"], name)
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    expected,
+                )
+                self.assertEqual(cli_client.strip_tool_call_blocks(content), "")
+
+    def test_mixed_json_after_plain_text_is_parsed_but_unclosed_tool_is_not(self):
+        calls = cli_client.extract_text_tool_calls(
+            'prefix {"name":"Read","input":{"path":"a.txt"}} suffix'
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "Read")
+        self.assertEqual(
+            cli_client.extract_text_tool_calls(
+                '<opencode_tool_call>{"name":"Read","input":{"path":"a.txt"}} prose'
+            ),
+            [],
+        )
+
     def test_recovers_opencode_call_with_arg_value_closer(self):
         content = (
             'analysis before call\n'
@@ -144,6 +196,18 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(
             delta[0]["function"]["arguments"], '{"filePath":"README.md"}'
         )
+
+    def test_normalize_tool_call_accepts_trae_tool_call_name_alias(self):
+        call = cli_client.normalize_tool_call(
+            {
+                "toolCallId": "call_alias",
+                "toolCallName": "Read",
+                "parameters": {"path": "a.txt"},
+            }
+        )
+        self.assertIsNotNone(call)
+        self.assertEqual(call["function"]["name"], "Read")
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"path": "a.txt"})
 
     def test_extract_native_replay_with_same_real_id_keeps_one_call(self):
         result = {

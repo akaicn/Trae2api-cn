@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
-from src import main, responses_api, trae_client
+from src import main, raw_client, responses_api
 
 
 FUNCTION = {
@@ -117,8 +117,11 @@ class IdeNativeIngressTests(unittest.TestCase):
         self.closers = []
 
         async def send(messages, model, stream, options=None):
+            options = dict(options or {})
             self.bodies.append(
-                trae_client.build_llm_chat_body(messages, model, stream, options=options)
+                raw_client.build_traecode_chat_body(
+                    messages, model, stream=stream, options=options
+                )
             )
             close = Mock()
             self.closers.append(close)
@@ -134,20 +137,56 @@ class IdeNativeIngressTests(unittest.TestCase):
             )
             return SimpleNamespace(response=_ReplayResponse(payload), close=close)
 
-        self.stack.enter_context(patch.object(trae_client, "send_chat_request", new=send))
+        # IDE/SOLO presets use the TraeCode native raw contract.  Keep the
+        # replay at that boundary so the public ingress exercises the real
+        # body builder, session/function binding, and SSE translator instead
+        # of the legacy TraeWork request adapter.
+        self.stack.enter_context(
+            patch.object(raw_client, "send_traecode_chat_request", new=send)
+        )
 
     def assert_native_second_round(self):
         history = self.bodies[1]["messages"]
-        assistant = next(message for message in history if message.get("tool_calls"))
-        call = assistant["tool_calls"][0]
-        self.assertEqual(call["id"], CALL["id"])
-        self.assertEqual(call["function_call"], CALL["function"])
-        result = next(message for message in history if message["role"] == "tool")
-        self.assertEqual(result["tool_call_id"], CALL["id"])
-        self.assertEqual(result["content"], [{"type": "text", "text": "nonce-confirmed"}])
+        # The public IDE bridge deliberately uses TraeCode's prompt tool
+        # contract (the native raw endpoint has no stable tools field in this
+        # mode), so tool history is serialized into assistant/user text.
+        assistant = next(message for message in history if message["role"] == "assistant")
+        assistant_text = "\n".join(
+            block.get("text", "")
+            for block in assistant.get("content", [])
+            if isinstance(block, dict)
+        )
+        self.assertIn(CALL["id"], assistant_text)
+        self.assertIn(CALL["function"]["name"], assistant_text)
+        self.assertIn(CALL["function"]["arguments"], assistant_text)
+        result = next(
+            message
+            for message in history
+            if message["role"] == "user"
+            and "Client tool result" in "\n".join(
+                block.get("text", "")
+                for block in message.get("content", [])
+                if isinstance(block, dict)
+            )
+        )
+        result_text = "\n".join(
+            block.get("text", "")
+            for block in result.get("content", [])
+            if isinstance(block, dict)
+        )
+        self.assertIn(CALL["id"], result_text)
+        self.assertIn("nonce-confirmed", result_text)
         for body in self.bodies:
-            self.assertEqual(body["function"], "solo_work_lite")
-            self.assertEqual(body["tools"][0]["function"]["name"], "read_file")
+            self.assertEqual(body["raw_chat_function"], "chat_v3")
+            self.assertNotIn("tools", body)
+            prompt = "\n".join(
+                block.get("text", "")
+                for message in body["messages"]
+                for block in message.get("content", [])
+                if isinstance(block, dict)
+            )
+            self.assertIn("read_file", prompt)
+            self.assertIn("opencode_tool_call", prompt)
         for close in self.closers:
             close.assert_called_once()
 

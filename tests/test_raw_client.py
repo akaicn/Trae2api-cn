@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
-from src import raw_client
+from src import raw_client, sse, trae_client
 
 
 REAL_HTTPX_CLIENT = httpx.Client
@@ -296,7 +296,7 @@ class RawClientBuildTests(unittest.TestCase):
 
         expected = {
             "auto": ("glm-5.2", "glm-5.2", "GLM-5.2"),
-            "glm-5.2": ("glm-5.2", "glm-5__v2", "GLM-5.2"),
+            "glm-5.2": ("glm-5.2", "glm-5.2", "GLM-5.2"),
             "glm-5.3": ("glm-5.3", "glm-5.3", "GLM-5.3"),
             "coding": ("glm-5.1", "glm-5__v2", "GLM-5.1"),
             "deepseek-v4-pro": (
@@ -511,7 +511,7 @@ class RawClientBuildTests(unittest.TestCase):
     def test_model_aliases_use_shared_trae_mapping(self):
         self.assertEqual(
             raw_client.resolve_raw_model("claude-sonnet-4").raw_model_name,
-            "glm-5__v2",
+            "glm-5.2",
         )
         self.assertEqual(
             raw_client.resolve_raw_model("gpt-4o").raw_model_name,
@@ -522,6 +522,33 @@ class RawClientBuildTests(unittest.TestCase):
             raw_client.resolve_raw_model("glm-5.3").raw_model_name,
             "glm-5.3",
         )
+
+    def test_glm52_model_lock_is_consistent_in_body_and_extra(self):
+        """GLM-5.2 must be bound identically in body and legacy Extra."""
+        model = raw_client.resolve_raw_model("glm-5.2")
+        body = raw_client.build_raw_chat_body(
+            [{"role": "user", "content": "hello"}],
+            "glm-5.2",
+            session_id="glm52-session",
+        )
+        with (
+            patch.object(raw_client.auth, "get_user_id", return_value="user-1"),
+            patch("src.trae_client.build_headers", return_value={}),
+        ):
+            headers = raw_client.build_raw_headers(
+                "https://raw.example",
+                "token",
+                model,
+                "request-id",
+                session_id="glm52-session",
+            )
+
+        extra = json.loads(headers["Extra"])
+        self.assertEqual(body["config_name"], "glm-5.2")
+        self.assertEqual(body["model_name"], "glm-5.2")
+        self.assertEqual(extra["config_name"], "glm-5.2")
+        self.assertEqual(extra["model_name"], "glm-5.2")
+        self.assertNotIn("kimi", json.dumps({"body": body, "extra": extra}).lower())
 
     def test_deepseek_v4_flash_raw_model_mappings_are_pinned(self):
         flash = raw_client.resolve_raw_model("trae/DeepSeek-V4-Flash")
@@ -956,6 +983,53 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
         with raw_client._RAW_SESSION_GATES_LOCK:
             self.assertEqual(raw_client._RAW_SESSION_GATES, {})
 
+    def test_raw_base_prefers_saved_model_gateway_and_strips_api_path(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TRAE_RAW_BASE_URL": "https://diagnostic.example/api/ide/v2",
+                "TRAE_MODEL_API_HOST": "https://saved.example/api/remote/v1",
+                "TRAE_WORK_BASE_URL": "https://work.example",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                raw_client.resolve_raw_base_url(
+                    {"_upstream_mode": "work", "model_base_url": "https://saved.example/api/ide/v2"}
+                ),
+                "https://saved.example",
+            )
+
+    def test_raw_base_honors_work_environment_before_diagnostic_raw(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TRAE_RAW_BASE_URL": "https://diagnostic.example/api/ide/v2",
+                "TRAE_MODEL_API_HOST": "",
+                "TRAE_WORK_BASE_URL": "https://work.example/api/agent/v3",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                raw_client.resolve_raw_base_url({"_upstream_mode": "work"}),
+                "https://work.example",
+            )
+
+    def test_raw_base_keeps_diagnostic_raw_override_for_raw_mode(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TRAE_RAW_BASE_URL": "https://diagnostic.example/api/ide/v2",
+                "TRAE_MODEL_API_HOST": "https://saved.example",
+                "TRAE_WORK_BASE_URL": "https://work.example",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                raw_client.resolve_raw_base_url({"_upstream_mode": "raw"}),
+                "https://diagnostic.example",
+            )
+
     async def test_model_lookup_uses_bound_billing_identity(self):
         with patch(
             "src.trae_client.resolve_model_config",
@@ -980,6 +1054,59 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
             token_override="token-b",
             user_id_override="account-b",
         )
+
+    async def test_lowercase_model_uses_exact_live_config_without_catalog_warmup(self):
+        """Raw body must pin the exact config for a fresh lower-case request."""
+
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b'event: output\ndata: {"response":"ok"}\n\n',
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def client_factory(**kwargs):
+            return REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+
+        with (
+            patch.object(
+                raw_client.auth, "maybe_refresh", new=AsyncMock(return_value=False)
+            ),
+            patch.object(raw_client.auth, "get_token", return_value="jwt-token"),
+            patch.object(raw_client.auth, "get_user_id", return_value="user-1"),
+            patch.dict(
+                os.environ, {"TRAE_RAW_BASE_URL": "https://raw.example"}, clear=False
+            ),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch(
+                "src.trae_client.resolve_model_config",
+                new=AsyncMock(
+                    return_value={
+                        "name": "GLM-5.3 Flash",
+                        "config_name": "GLM-5.3-Flash",
+                        "model_name": "glm-5.3-flash",
+                        "display_name": "GLM-5.3 Flash",
+                    }
+                ),
+            ) as lookup,
+            patch("src.raw_client.httpx.Client", side_effect=client_factory),
+        ):
+            wrapped = await raw_client.send_raw_chat_request(
+                [{"role": "user", "content": "hello"}],
+                "glm-5.3-flash",
+            )
+
+        self.assertEqual(captured["body"]["config_name"], "GLM-5.3-Flash")
+        self.assertEqual(captured["body"]["model_name"], "glm-5.3-flash")
+        lookup.assert_awaited_once_with(
+            "glm-5.3-flash", token_override="jwt-token"
+        )
+        wrapped.close()
 
     async def test_display_model_label_uses_config_name_in_body(self):
         captured = {}
@@ -1220,6 +1347,7 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
             return client
 
         with (
+            patch.object(trae_client, "_WEB_PARALLEL_LIMIT", 1),
             patch("src.trae_client.build_headers", return_value={}),
             patch("src.raw_client.httpx.Client", side_effect=client_factory),
         ):
@@ -1354,6 +1482,7 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
             return OfflineRawResponse()
 
         with (
+            patch.object(trae_client, "_WEB_PARALLEL_LIMIT", 1),
             patch("src.trae_client.build_headers", return_value={}),
             patch(
                 "src.raw_client.httpx.Client",
@@ -1379,6 +1508,367 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
             first.close()
 
         self.assert_no_raw_session_gates()
+
+    async def test_tool_streams_share_model_capacity_and_keep_request_output_isolated(self):
+        class ToolResponse(OfflineRawResponse):
+            def __init__(self, label):
+                super().__init__()
+                self.label = label
+
+            def iter_lines(self):
+                frames = [
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": f"call_{self.label}",
+                                "function_call": {
+                                    "name": "read_file",
+                                    "arguments": '{"path":',
+                                },
+                            }
+                        ]
+                    },
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function_call": {
+                                    "arguments": json.dumps(self.label) + "}",
+                                },
+                            }
+                        ]
+                    },
+                ]
+                for frame in frames:
+                    yield "event: output"
+                    yield "data: " + json.dumps(frame)
+                yield "event: done"
+                yield 'data: {"finish_reason":"tool_calls"}'
+
+        async def collect_tool_arguments(wrapped):
+            arguments = ""
+            call_ids = []
+            async for chunk in sse.translate_ide_stream(
+                wrapped.response,
+                "glm-5.1",
+                allowed_tools=options["tools"],
+                parallel_tool_calls=False,
+                fail_on_empty=True,
+            ):
+                if not chunk.startswith("data: ") or chunk.strip() == "data: [DONE]":
+                    continue
+                event = json.loads(chunk[6:])
+                for call in event["choices"][0]["delta"].get("tool_calls", []):
+                    arguments += call["function"].get("arguments", "")
+                    if call.get("id"):
+                        call_ids.append(call["id"])
+            return call_ids, json.loads(arguments)
+
+        for transport in ("raw", "traecode"):
+            for capacity in (2, 4):
+                with self.subTest(transport=transport, capacity=capacity):
+                    options = {
+                        **self.raw_options(f"slots-{transport}-{capacity}"),
+                        "traecode_base_url": "https://raw.example",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                        "parallel_tool_calls": False,
+                        "stream": True,
+                    }
+                    raw_model = raw_client.resolve_raw_model("glm-5.1")
+                    expected_session = (
+                        raw_client.raw_session_id(raw_model, options)
+                        if transport == "raw"
+                        else raw_client.traecode_session_id(
+                            raw_model, options, raw_client.TRAECODE_DEFAULT_FUNCTION
+                        )
+                    )
+                    captured = []
+                    clients = []
+                    responses = []
+                    state_lock = threading.Lock()
+                    tasks = []
+                    opened = []
+
+                    def send(request, stream):
+                        self.assertTrue(stream)
+                        body = request["json"]
+                        label = body["messages"][-1]["content"][0]["text"]
+                        response = ToolResponse(label)
+                        with state_lock:
+                            captured.append(body)
+                            responses.append(response)
+                        return response
+
+                    def client_factory(**_kwargs):
+                        client = OfflineRawClient(send)
+                        clients.append(client)
+                        return client
+
+                    async def open_request(label):
+                        messages = [{"role": "user", "content": label}]
+                        if transport == "raw":
+                            return await raw_client.send_raw_chat_request(
+                                messages, "glm-5.1", options
+                            )
+                        return await raw_client.send_traecode_chat_request(
+                            messages, "glm-5.1", stream=True, options=options
+                        )
+
+                    with (
+                        patch.object(trae_client, "_WEB_PARALLEL_LIMIT", capacity),
+                        patch.object(trae_client, "_WEB_SLOTS", {}),
+                        patch("src.trae_client.build_headers", return_value={}),
+                        patch("src.raw_client.httpx.Client", side_effect=client_factory),
+                        patch.object(
+                            raw_client,
+                            "resolve_raw_model_for_request",
+                            new=AsyncMock(return_value=raw_model),
+                        ),
+                        patch.object(
+                            raw_client,
+                            "resolve_traecode_model_for_request",
+                            new=AsyncMock(return_value=raw_model),
+                        ),
+                    ):
+                        try:
+                            self.assertEqual(
+                                trae_client.model_request_parallel_limit(), capacity
+                            )
+                            self.assertEqual(
+                                trae_client._web_slot("ordinary-model")._value, capacity
+                            )
+                            tasks = [
+                                asyncio.create_task(open_request(f"request-{index}"))
+                                for index in range(capacity)
+                            ]
+                            opened = list(
+                                await asyncio.wait_for(asyncio.gather(*tasks), 1.0)
+                            )
+                            self.assertEqual(len(captured), capacity)
+                            self.assertTrue(all(item.close_calls == 0 for item in responses))
+                            self.assertEqual(raw_gate_users(expected_session), capacity)
+
+                            waiters = [
+                                asyncio.create_task(open_request(f"queued-{index}"))
+                                for index in range(2)
+                            ]
+                            tasks.extend(waiters)
+                            await wait_for_condition(
+                                lambda: raw_gate_users(expected_session) == capacity + 2
+                            )
+                            self.assertTrue(all(not task.done() for task in waiters))
+                            self.assertEqual(len(captured), capacity)
+
+                            opened[0].close()
+                            opened[0].close()
+                            await wait_for_condition(
+                                lambda: sum(task.done() for task in waiters) == 1
+                            )
+                            first_waiter = next(task for task in waiters if task.done())
+                            opened.append(first_waiter.result())
+                            self.assertEqual(len(captured), capacity + 1)
+                            self.assertEqual(raw_gate_users(expected_session), capacity + 1)
+
+                            opened[1].close()
+                            opened.extend(
+                                result
+                                for result in await asyncio.wait_for(
+                                    asyncio.gather(*waiters), 1.0
+                                )
+                                if result not in opened
+                            )
+                            self.assertEqual(len(captured), capacity + 2)
+                            self.assertEqual(
+                                {body["session_id"] for body in captured},
+                                {expected_session},
+                            )
+                            self.assertEqual(
+                                {body["model_name"] for body in captured},
+                                {raw_model.raw_model_name},
+                            )
+                            results = await asyncio.gather(
+                                *(collect_tool_arguments(item) for item in opened)
+                            )
+                            for wrapped, (call_ids, arguments) in zip(opened, results):
+                                label = wrapped.response.label
+                                self.assertEqual(call_ids, [f"call_{label}"])
+                                self.assertEqual(arguments, {"path": label})
+                        finally:
+                            for task in tasks:
+                                if not task.done():
+                                    task.cancel()
+                            for result in await asyncio.gather(
+                                *tasks, return_exceptions=True
+                            ):
+                                if isinstance(result, raw_client.RawChatResponse):
+                                    result.close()
+                            for wrapped in opened:
+                                wrapped.close()
+
+                    self.assertEqual(len(clients), capacity + 2)
+                    self.assertTrue(all(client.close_calls == 1 for client in clients))
+                    self.assertTrue(all(response.close_calls == 1 for response in responses))
+                    self.assert_no_raw_session_gates()
+
+    async def test_cancelled_tool_waiter_or_worker_keeps_exact_model_slot_ownership(self):
+        for transport in ("raw", "traecode"):
+            for worker_fails in (False, True):
+                with self.subTest(transport=transport, worker_fails=worker_fails):
+                    options = {
+                        **self.raw_options(f"cancel-{transport}-{worker_fails}"),
+                        "traecode_base_url": "https://raw.example",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                        "stream": True,
+                    }
+                    raw_model = raw_client.resolve_raw_model("glm-5.1")
+                    session_id = (
+                        raw_client.raw_session_id(raw_model, options)
+                        if transport == "raw"
+                        else raw_client.traecode_session_id(
+                            raw_model, options, raw_client.TRAECODE_DEFAULT_FUNCTION
+                        )
+                    )
+                    worker_entered = threading.Event()
+                    allow_worker_return = threading.Event()
+                    clients = []
+                    responses = []
+                    sent_labels = []
+                    tasks = []
+                    opened = []
+
+                    def send(request, stream):
+                        self.assertTrue(stream)
+                        label = request["json"]["messages"][-1]["content"][0]["text"]
+                        sent_labels.append(label)
+                        if label == "blocked-worker":
+                            worker_entered.set()
+                            allow_worker_return.wait(2.0)
+                            if worker_fails:
+                                raise RuntimeError("cancelled worker failed")
+                        response = OfflineRawResponse()
+                        responses.append(response)
+                        return response
+
+                    def client_factory(**_kwargs):
+                        client = OfflineRawClient(send)
+                        clients.append(client)
+                        return client
+
+                    async def open_request(label):
+                        messages = [{"role": "user", "content": label}]
+                        if transport == "raw":
+                            return await raw_client.send_raw_chat_request(
+                                messages, "glm-5.1", options
+                            )
+                        return await raw_client.send_traecode_chat_request(
+                            messages, "glm-5.1", stream=True, options=options
+                        )
+
+                    with (
+                        patch.object(trae_client, "_WEB_PARALLEL_LIMIT", 2),
+                        patch("src.trae_client.build_headers", return_value={}),
+                        patch("src.raw_client.httpx.Client", side_effect=client_factory),
+                        patch.object(
+                            raw_client,
+                            "resolve_raw_model_for_request",
+                            new=AsyncMock(return_value=raw_model),
+                        ),
+                        patch.object(
+                            raw_client,
+                            "resolve_traecode_model_for_request",
+                            new=AsyncMock(return_value=raw_model),
+                        ),
+                    ):
+                        try:
+                            first = await open_request("held-response")
+                            opened.append(first)
+                            worker = asyncio.create_task(open_request("blocked-worker"))
+                            tasks.append(worker)
+                            await wait_for_condition(worker_entered.is_set)
+                            waiter = asyncio.create_task(open_request("cancelled-waiter"))
+                            tasks.append(waiter)
+                            await wait_for_condition(
+                                lambda: raw_gate_users(session_id) == 3
+                            )
+                            waiter.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await waiter
+                            self.assertEqual(raw_gate_users(session_id), 2)
+                            worker.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await worker
+
+                            queued = [
+                                asyncio.create_task(open_request(f"queued-{index}"))
+                                for index in range(2)
+                            ]
+                            tasks.extend(queued)
+                            await wait_for_condition(
+                                lambda: raw_gate_users(session_id) == 4
+                            )
+                            self.assertEqual(
+                                sent_labels, ["held-response", "blocked-worker"]
+                            )
+                            self.assertTrue(all(not task.done() for task in queued))
+                            self.assertEqual(clients[1].close_calls, 0)
+
+                            allow_worker_return.set()
+                            await wait_for_condition(
+                                lambda: sum(task.done() for task in queued) == 1
+                            )
+                            completed = next(task for task in queued if task.done())
+                            opened.append(completed.result())
+                            self.assertEqual(len(sent_labels), 3)
+                            self.assertEqual(clients[1].close_calls, 1)
+                            self.assertEqual(raw_gate_users(session_id), 3)
+
+                            first.close()
+                            first.close()
+                            opened.extend(
+                                result
+                                for result in await asyncio.wait_for(
+                                    asyncio.gather(*queued), 1.0
+                                )
+                                if result not in opened
+                            )
+                            self.assertEqual(len(sent_labels), 4)
+                            self.assertNotIn("cancelled-waiter", sent_labels)
+                        finally:
+                            allow_worker_return.set()
+                            for task in tasks:
+                                if not task.done():
+                                    task.cancel()
+                            for result in await asyncio.gather(
+                                *tasks, return_exceptions=True
+                            ):
+                                if isinstance(result, raw_client.RawChatResponse):
+                                    result.close()
+                            for wrapped in opened:
+                                wrapped.close()
+                            await wait_for_condition(
+                                lambda: all(client.close_calls == 1 for client in clients)
+                                and not raw_client._RAW_SESSION_GATES
+                            )
+
+                    self.assertTrue(all(response.close_calls == 1 for response in responses))
+                    self.assert_no_raw_session_gates()
 
     async def test_cancelling_during_threaded_open_closes_late_response_and_releases(self):
         entered_send = threading.Event()

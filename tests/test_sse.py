@@ -129,6 +129,55 @@ def _parse_chunks(chunks):
 
 
 class TranslateCliStreamTests(unittest.TestCase):
+    def test_openai_chunk_normalizes_nested_sets_deterministically(self):
+        chunk = sse.openai_chunk(
+            "chatcmpl-test",
+            "deepseek-v4",
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "function": {
+                            "name": "read_file",
+                            "metadata": {"capabilities": {"read", "search"}},
+                        },
+                    }
+                ]
+            },
+            usage={"labels": {"tool", "stream"}},
+        )
+
+        payload = json.loads(chunk[6:].strip())
+        metadata = payload["choices"][0]["delta"]["tool_calls"][0]["function"][
+            "metadata"
+        ]
+        self.assertEqual(metadata["capabilities"], ["read", "search"])
+        self.assertEqual(payload["usage"]["labels"], ["stream", "tool"])
+
+    def test_openai_completion_normalizes_sets_in_tool_payload(self):
+        response = sse.openai_completion(
+            "chatcmpl-test",
+            "deepseek-v4",
+            None,
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"paths": {"README.md", "pyproject.toml"}},
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(
+            response["choices"][0]["message"]["tool_calls"][0]["function"][
+                "arguments"
+            ]["paths"],
+            ["README.md", "pyproject.toml"],
+        )
+
     def test_provider_qualified_deepseek_model_matches_requested_family(self):
         sse._check_provider_model("DeepSeek-V4-Pro", "ali-deepseek-v4-pro")
 
@@ -205,9 +254,11 @@ class TranslateCliStreamTests(unittest.TestCase):
             for event in parsed
             for choice in event.get("choices", [])
         )
-        self.assertIn("位置：1", content)
-        self.assertTrue(content.endswith("ready"))
+        # Preserve the pre-Zedex raw compatibility contract: queue notices
+        # are assistant content and arrive before the first model text.
+        self.assertEqual(content, "排队中，当前位置：1\nready")
         self.assertTrue(done)
+        self.assertNotIn(": relay-keepalive\n\n", chunks)
 
     def test_ide_provider_mismatch_is_not_presented_as_requested_model(self):
         response = _LineResponse(
@@ -750,8 +801,13 @@ class TranslateCliStreamTests(unittest.TestCase):
             for event in parsed
             for choice in event.get("choices", [])
         )
-        self.assertEqual(content.count("位置：2"), 1)
-        self.assertEqual(content.count("位置：1"), 1)
+        # Duplicate positions are coalesced, but each distinct position is
+        # preserved as the raw stream's assistant status text.
+        self.assertEqual(
+            content,
+            "排队中，当前位置：2\n排队中，当前位置：1\n",
+        )
+        self.assertNotIn(": relay-keepalive\n\n", chunks)
 
     def test_ide_empty_probe_emits_nothing_before_retry_signal(self):
         response = _LineResponse(
@@ -900,9 +956,15 @@ class TranslateCliStreamTests(unittest.TestCase):
             await stream.aclose()
             return chunks
 
-        parsed, _ = _parse_chunks(asyncio.run(first_three()))
+        chunks = asyncio.run(first_three())
+        parsed, _ = _parse_chunks(chunks)
+        # A probe stream stays silent while queued, then opens with the role
+        # frame, the pending queue notice, and the first real delta.
         self.assertEqual(parsed[0]["choices"][0]["delta"], {"role": "assistant"})
-        self.assertIn("位置：1", parsed[1]["choices"][0]["delta"]["content"])
+        self.assertEqual(
+            parsed[1]["choices"][0]["delta"]["content"],
+            "排队中，当前位置：1\n",
+        )
         self.assertEqual(parsed[2]["choices"][0]["delta"]["content"], "ready")
 
     def test_ide_error_event_is_propagated(self):
@@ -1896,6 +1958,98 @@ class WebEventTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["function"]["name"], "download")
 
+    def test_interleaved_plan_sessions_keep_reused_tool_ids_isolated(self):
+        async def events():
+            # Both remote sessions reuse call-1/index 0. The first call is
+            # split around the complete second call to reproduce the upstream
+            # interleaving that previously produced invalid JSON.
+            yield "plan_item", {
+                "eventSessionId": "session-a",
+                "planItemId": "plan-a",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Read",
+                    "parameters": '{"path":"a.txt"',
+                },
+            }
+            yield "plan_item", {
+                "eventSessionId": "session-b",
+                "planItemId": "plan-b",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Write",
+                    "parameters": '{"path":"b.txt"}',
+                },
+            }
+            yield "plan_item", {
+                "eventSessionId": "session-a",
+                "planItemId": "plan-a",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Read",
+                    "parameters": "}",
+                },
+            }
+            yield "done", {}
+
+        tools = [
+            {"type": "function", "function": {"name": "Read"}},
+            {"type": "function", "function": {"name": "Write"}},
+        ]
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(
+                    events(),
+                    "deepseek-v4.1-flash",
+                    allowed_tools=tools,
+                    parallel_tool_calls=True,
+                )
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        calls = [
+            call
+            for event in parsed
+            for choice in event.get("choices", [])
+            for call in choice.get("delta", {}).get("tool_calls", [])
+        ]
+        names = {
+            call["index"]: call["function"]["name"]
+            for call in calls
+            if call.get("function", {}).get("name")
+        }
+        ids = {call["id"] for call in calls if call.get("id")}
+        fragments = {index: [] for index in names}
+        for call in calls:
+            arguments = call.get("function", {}).get("arguments", "")
+            if arguments:
+                fragments[call["index"]].append(arguments)
+        self.assertEqual(list(names.values()), ["Read", "Write"])
+        self.assertEqual(len(ids), 2)
+        by_name = {
+            names[index]: json.loads("".join(parts))
+            for index, parts in fragments.items()
+        }
+        self.assertEqual(by_name, {"Read": {"path": "a.txt"}, "Write": {"path": "b.txt"}})
+
+        result = asyncio.run(
+            sse.collect_nonstream_web(
+                events(),
+                "deepseek-v4.1-flash",
+                allowed_tools=tools,
+                parallel_tool_calls=True,
+            )
+        )
+        result_calls = result["choices"][0]["message"]["tool_calls"]
+        self.assertEqual(
+            {
+                call["function"]["name"]: json.loads(call["function"]["arguments"])
+                for call in result_calls
+            },
+            {"Read": {"path": "a.txt"}, "Write": {"path": "b.txt"}},
+        )
+
     def test_web_hyphenated_keepalive_is_ignored(self):
         async def events():
             yield "keep-alive", {"message": "heartbeat"}
@@ -2599,3 +2753,355 @@ class SummaryPrefixMergeTests(unittest.TestCase):
     def test_nonstream_summary_extends_truncated_answer(self):
         result = asyncio.run(sse.collect_nonstream_web(self._events(), "m"))
         self.assertEqual(result["choices"][0]["message"]["content"], "The file r.txt contains: ok")
+
+
+class RawUpstreamErrorEventTests(unittest.TestCase):
+    def test_error_codes_and_messages_are_preserved_without_leaking_queue_notice(self):
+        cases = (
+            (
+                {"code": 4001, "message": "We're sorry, the param is invalid."},
+                4001,
+                "We're sorry, the param is invalid.",
+            ),
+            (
+                {
+                    "error": {
+                        "code": 2001,
+                        "message": "failed to get app config: record not found",
+                    }
+                },
+                2001,
+                "failed to get app config: record not found",
+            ),
+        )
+
+        for payload, expected_code, expected_message in cases:
+            with self.subTest(code=expected_code):
+                response = _LineResponse(
+                    [
+                        "event: request_wait_in_queue",
+                        'data: {"position":2}',
+                        "event: error",
+                        "data: " + json.dumps(payload),
+                    ]
+                )
+                emitted = []
+
+                async def run():
+                    async for chunk in sse.translate_ide_stream(
+                        response, "glm-5.3", fail_on_empty=True
+                    ):
+                        emitted.append(chunk)
+
+                with self.assertRaises(sse.UpstreamEventError) as raised:
+                    asyncio.run(run())
+
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(
+                    raised.exception.upstream_message, expected_message
+                )
+                self.assertTrue(raised.exception.retryable)
+                self.assertFalse(raised.exception.observed_model_event)
+                # Queue text is held until the first model output, so it must
+                # not hide the actual pre-output failure from the dispatcher.
+                self.assertEqual(emitted, [])
+
+    def test_output_before_error_is_not_retryable(self):
+        response = _LineResponse(
+            [
+                'data: {"response":"partial answer"}',
+                "event: error",
+                'data: {"code":4001,"message":"request rejected"}',
+            ]
+        )
+        emitted = []
+
+        async def run():
+            async for chunk in sse.translate_ide_stream(
+                response, "glm-5.3", fail_on_empty=True
+            ):
+                emitted.append(chunk)
+
+        with self.assertRaises(sse.UpstreamEventError) as raised:
+            asyncio.run(run())
+
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        wire = "".join(emitted)
+        self.assertIn("partial answer", wire)
+
+    def test_usage_before_nonstream_error_is_not_retryable(self):
+        response = _LineResponse(
+            [
+                "event: token_usage",
+                'data: {"input_tokens":11,"output_tokens":0,"total_tokens":11}',
+                "event: error",
+                'data: {"code":2001,"message":"record not found"}',
+            ]
+        )
+
+        with self.assertRaises(sse.UpstreamEventError) as raised:
+            asyncio.run(
+                sse.collect_nonstream_ide(
+                    response, "glm-5.3", fail_on_empty=True
+                )
+            )
+
+        self.assertEqual(raised.exception.code, 2001)
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        self.assertEqual(raised.exception.usage["prompt_tokens"], 11)
+
+
+class EmptyResponseBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _native_response(event, payloads):
+        lines = []
+        for payload in payloads:
+            lines.extend((f"event: {event}", "data: " + json.dumps(payload)))
+        lines.append("data: [DONE]")
+        return _LineResponse(lines)
+
+    @staticmethod
+    def _remote_events(event, payloads):
+        async def events():
+            for payload in payloads:
+                yield event, payload
+            yield "done", {}
+
+        return events()
+
+    @staticmethod
+    def _content(chunks):
+        parsed, done = _parse_chunks(chunks)
+        return "".join(
+            choice.get("delta", {}).get("content", "")
+            for chunk in parsed
+            for choice in chunk.get("choices", [])
+        ), done
+
+    def test_native_whitespace_does_not_start_strict_stream(self):
+        for event, key in (("output", "response"), ("text_delta", "delta")):
+            with self.subTest(event=event):
+                emitted = []
+
+                async def run():
+                    response = self._native_response(event, [{key: " \n\t "}])
+                    async for chunk in sse.translate_ide_stream(
+                        response, "m", fail_on_empty=True
+                    ):
+                        emitted.append(chunk)
+
+                with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+                    asyncio.run(run())
+
+                self.assertTrue(raised.exception.retryable)
+                self.assertEqual(emitted, [])
+
+    def test_native_whitespace_nonstream_is_empty(self):
+        for event, key in (("output", "response"), ("translated_text", "text")):
+            with self.subTest(event=event):
+                response = self._native_response(event, [{key: " \n\t "}])
+                with self.assertRaises(sse.EmptyUpstreamResponse):
+                    asyncio.run(
+                        sse.collect_nonstream_ide(response, "m", fail_on_empty=True)
+                    )
+
+    def test_native_leading_whitespace_is_preserved_when_answer_arrives(self):
+        response = self._native_response(
+            "output", [{"response": " \n "}, {"response": " \n answer\n"}]
+        )
+        chunks = asyncio.run(
+            _collect(sse.translate_ide_stream(response, "m", fail_on_empty=True))
+        )
+        content, done = self._content(chunks)
+        self.assertEqual(content, " \n answer\n")
+        self.assertTrue(done)
+
+    def test_native_nonstream_matches_text_event_stream(self):
+        cases = (
+            ("text_delta", {"delta": "real answer"}),
+            ("translated_text", {"text": "real answer"}),
+            ("accumulated", {"content": "real answer"}),
+            ("assistant_message", {"message": {"content": "real answer"}}),
+        )
+        for event, payload in cases:
+            with self.subTest(event=event):
+                chunks = asyncio.run(
+                    _collect(
+                        sse.translate_ide_stream(
+                            self._native_response(event, [payload]),
+                            "m",
+                            fail_on_empty=True,
+                        )
+                    )
+                )
+                result = asyncio.run(
+                    sse.collect_nonstream_ide(
+                        self._native_response(event, [payload]),
+                        "m",
+                        fail_on_empty=True,
+                    )
+                )
+                content, done = self._content(chunks)
+                self.assertTrue(done)
+                self.assertEqual(content, "real answer")
+                self.assertEqual(result["choices"][0]["message"]["content"], content)
+
+    def test_native_nonstream_retains_reasoning_delta_with_answer(self):
+        response = _LineResponse(
+            [
+                "event: reasoning_delta",
+                'data: {"delta":"Inspect the file."}',
+                "event: text_delta",
+                'data: {"delta":"File verified."}',
+                "data: [DONE]",
+            ]
+        )
+        result = asyncio.run(
+            sse.collect_nonstream_ide(
+                response, "m", fail_on_empty=True, include_reasoning=True
+            )
+        )
+        message = result["choices"][0]["message"]
+        self.assertEqual(message["content"], "File verified.")
+        self.assertEqual(message["reasoning_content"], "Inspect the file.")
+
+    def test_remote_whitespace_does_not_start_strict_stream(self):
+        cases = (
+            ("message", {"content": " \n\t "}),
+            ("plan_item", {"id": "p1", "content": " \n\t "}),
+            (
+                "plan_item",
+                {"id": "p1", "thought": " \n\t ", "reasoning_content": ""},
+            ),
+            (
+                "plan_item",
+                {"id": "p1", "tool_call_info": {"name": "finish", "params": {"summary": " \n\t "}}},
+            ),
+        )
+        for event, payload in cases:
+            with self.subTest(event=event, payload=payload):
+                emitted = []
+
+                async def run():
+                    async for chunk in sse.translate_web_events(
+                        self._remote_events(event, [payload]),
+                        "m",
+                        fail_on_empty=True,
+                    ):
+                        emitted.append(chunk)
+
+                with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+                    asyncio.run(run())
+                self.assertTrue(raised.exception.retryable)
+                self.assertEqual(emitted, [])
+                with self.assertRaises(sse.EmptyUpstreamResponse):
+                    asyncio.run(
+                        sse.collect_nonstream_web(
+                            self._remote_events(event, [payload]),
+                            "m",
+                            fail_on_empty=True,
+                        )
+                    )
+
+    def test_remote_leading_whitespace_is_preserved_when_answer_arrives(self):
+        for event in ("message", "plan_item"):
+            with self.subTest(event=event):
+                payloads = [
+                    {"id": "p1", "content": " \n "},
+                    {"id": "p1", "content": " \n answer\n"},
+                ]
+                chunks = asyncio.run(
+                    _collect(
+                        sse.translate_web_events(
+                            self._remote_events(event, payloads),
+                            "m",
+                            fail_on_empty=True,
+                        )
+                    )
+                )
+                content, done = self._content(chunks)
+                self.assertEqual(content, " \n answer\n")
+                self.assertTrue(done)
+
+    def test_strict_split_reasoning_only_is_empty_without_disclosure(self):
+        payload = {"id": "p1", "thought": "", "reasoning_content": "private trace"}
+        emitted = []
+
+        async def run():
+            async for chunk in sse.translate_web_events(
+                self._remote_events("plan_item", [payload]),
+                "m",
+                fail_on_empty=True,
+            ):
+                emitted.append(chunk)
+
+        with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+            asyncio.run(run())
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        self.assertEqual(emitted, [])
+        with self.assertRaises(sse.EmptyUpstreamResponse):
+            asyncio.run(
+                sse.collect_nonstream_web(
+                    self._remote_events("plan_item", [payload]),
+                    "m",
+                    fail_on_empty=True,
+                )
+            )
+
+    def test_explicit_reasoning_only_request_keeps_its_output_contract(self):
+        payload = {"id": "p1", "thought": "", "reasoning_content": "requested trace"}
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(
+                    self._remote_events("plan_item", [payload]),
+                    "m",
+                    fail_on_empty=True,
+                    include_reasoning=True,
+                )
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        reasoning = "".join(
+            choice.get("delta", {}).get("reasoning_content", "")
+            for chunk in parsed
+            for choice in chunk.get("choices", [])
+        )
+        self.assertEqual(reasoning, "requested trace")
+        result = asyncio.run(
+            sse.collect_nonstream_web(
+                self._remote_events("plan_item", [payload]),
+                "m",
+                fail_on_empty=True,
+                include_reasoning=True,
+            )
+        )
+        self.assertEqual(
+            result["choices"][0]["message"]["reasoning_content"], reasoning
+        )
+
+    def test_strict_legacy_thought_only_keeps_answer_fallback(self):
+        payload = {"id": "p1", "thought": "The answer is 42."}
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(
+                    self._remote_events("plan_item", [payload]),
+                    "m",
+                    fail_on_empty=True,
+                )
+            )
+        )
+        content, done = self._content(chunks)
+        self.assertTrue(done)
+        self.assertEqual(content, "The answer is 42.")
+        result = asyncio.run(
+            sse.collect_nonstream_web(
+                self._remote_events("plan_item", [payload]),
+                "m",
+                fail_on_empty=True,
+            )
+        )
+        self.assertEqual(result["choices"][0]["message"]["content"], content)

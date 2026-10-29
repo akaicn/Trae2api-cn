@@ -12,7 +12,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 from .cli_client import extract_result_text as _cli_extract_text
 from .cli_client import complete_tool_call_signature as _complete_tool_call_signature
@@ -112,6 +112,43 @@ class EmptyUpstreamResponse(RuntimeError):
         self.account_quota_exhausted = bool(account_quota_exhausted)
 
 
+class UpstreamEventError(EmptyUpstreamResponse):
+    """A structured SSE ``event:error`` from a native Trae stream.
+
+    Native raw streams use HTTP 200 for both successful turns and business
+    failures.  Keep the upstream code/message available to the dispatcher
+    without retaining or logging the complete event payload.  The exception
+    remains an ``EmptyUpstreamResponse`` so a pre-output error can use the
+    existing guarded fallback path.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Any = None,
+        retryable: bool = True,
+        usage: Optional[dict] = None,
+        observed_model_event: bool = False,
+        account_quota_exhausted: bool = False,
+    ):
+        self.code = code
+        self.upstream_message = str(message or "Trae upstream returned an error event")
+        code_text = str(code).strip() if code not in (None, "") else ""
+        rendered = (
+            f"Trae upstream error {code_text}: {self.upstream_message}"
+            if code_text
+            else f"Trae upstream error: {self.upstream_message}"
+        )
+        super().__init__(
+            rendered,
+            retryable=retryable,
+            usage=usage,
+            observed_model_event=observed_model_event,
+            account_quota_exhausted=account_quota_exhausted,
+        )
+
+
 class IncompleteUpstreamResponse(EmptyUpstreamResponse):
     """Raised when an upstream stream ends without a terminal event.
 
@@ -197,6 +234,13 @@ def _capture_upstream_metadata(target: Any, payload: Any) -> None:
     turn_id = _usage_turn_id(payload)
     if turn_id:
         target["usage_turn_id"] = turn_id
+    # Queue position is retained as transport telemetry for the console and
+    # request trace; the raw stream translator may also expose the original
+    # queue notice as assistant content for legacy client compatibility.
+    if isinstance(payload, dict):
+        position = payload.get("position")
+        if isinstance(position, (int, float)) and not isinstance(position, bool):
+            target["queue_position"] = int(position)
 
 
 def _provider_model_name(payload: Any) -> str:
@@ -260,25 +304,103 @@ def _provider_model_name(payload: Any) -> str:
 
 
 def _is_account_quota_error(payload: Any) -> bool:
-    """Return whether an upstream error represents account quota exhaustion."""
+    """Return whether an upstream error is account-scoped capacity exhaustion.
+
+    Trae uses ``4008`` for a hard quota response and ``3004``/``4011``/HTTP ``429``
+    for the same account-scoped capacity window on native/remote streams.
+    These errors are emitted after ``model_config`` on some transports.  The
+    config frame proves routing metadata only; it must not make a request
+    look billable or disable the account rotation/fallback path.
+    """
 
     if not isinstance(payload, dict):
         return False
-    code = str(
-        payload.get("code")
-        or payload.get("error_code")
-        or payload.get("errorCode")
-        or ""
-    ).strip().lower()
-    text = " ".join(
+    raw_code, message = _upstream_error_details(payload)
+    code = str(raw_code or "").strip().lower()
+    text_parts = [message]
+    text_parts.extend(
         str(payload.get(key) or "")
         for key in ("message", "error", "detail", "reason")
-    ).lower()
+    )
+    text = " ".join(text_parts).lower()
     return (
-        code == "4008"
+        code in {"3004", "4008", "4011", "429"}
         or "requests have exceeded the quota" in text
         or "quota exceeded" in text
         or "exceeded the quota" in text
+        or "rate limit" in text
+        or "rate-limit" in text
+        or "too many requests" in text
+    )
+
+
+def _upstream_error_details(payload: Mapping[str, Any]) -> tuple[Any, str]:
+    """Extract only the code and human-readable message from an SSE error."""
+
+    nested = payload.get("error")
+    nested_error = nested if isinstance(nested, Mapping) else {}
+    code = next(
+        (
+            value
+            for source in (payload, nested_error)
+            for key in ("code", "error_code", "errorCode")
+            if (value := source.get(key)) not in (None, "")
+        ),
+        None,
+    )
+    message = next(
+        (
+            str(value)
+            for source in (payload, nested_error)
+            for key in ("message", "detail", "reason")
+            if (value := source.get(key)) not in (None, "")
+        ),
+        "",
+    )
+    if not message and isinstance(nested, str):
+        message = nested
+    return code, message or "Trae raw upstream returned an error event"
+
+
+def _raise_upstream_event_error(
+    payload: Mapping[str, Any],
+    *,
+    content_count: int,
+    reasoning_text: Any,
+    tool_calls: Any,
+    usage: Optional[dict],
+    upstream_metadata: Optional[dict],
+) -> None:
+    code, message = _upstream_error_details(payload)
+    error_usage = usage
+    if error_usage is None and isinstance(payload.get("usage"), dict):
+        error_usage = _map_usage(payload["usage"])
+    observed_model_event = bool(
+        content_count
+        or reasoning_text.raw
+        or tool_calls.has_calls
+        or error_usage is not None
+        or (
+            isinstance(upstream_metadata, dict)
+            and upstream_metadata.get("usage_turn_id")
+        )
+    )
+    quota_exhausted = _is_account_quota_error(payload)
+    # ``model_config`` and usage-turn ids can precede a 3004/4008/4011 error.
+    # They are setup metadata, not model output.  Keep the exception
+    # retryable so a streaming request may rotate credentials or use its
+    # configured Remote fallback before returning a 502.
+    if quota_exhausted and not (
+        content_count or reasoning_text.raw or tool_calls.has_calls or error_usage
+    ):
+        observed_model_event = False
+    raise UpstreamEventError(
+        message,
+        code=code,
+        retryable=not observed_model_event,
+        usage=error_usage,
+        observed_model_event=observed_model_event,
+        account_quota_exhausted=quota_exhausted,
     )
 
 
@@ -373,6 +495,83 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(total + 0.999))
 
 
+def _json_sort_key(value: Any) -> str:
+    """Return a stable key for values originating in unordered containers."""
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        # Values accepted by `_json_safe` are JSON-compatible after
+        # normalization.  This fallback is only used while ordering a set
+        # whose members have not yet been normalized.
+        return repr(value)
+
+
+def _json_safe(value: Any, *, _active: Optional[set[int]] = None) -> Any:
+    """Normalize stream payloads before crossing the JSON serialization edge.
+
+    Upstream adapters are expected to return JSON values, but tool metadata can
+    pass through Python sets (for example a set of capability names).  A set
+    cannot be encoded by ``json.dumps`` and previously aborted the public SSE
+    generator after the model had already started producing output.  Keep
+    mappings and scalar values intact, and represent unordered containers as
+    deterministic lists so retries and client-visible tool deltas stay stable.
+    """
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if _active is None:
+        _active = set()
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in _active:
+            raise TypeError("circular value is not JSON serializable")
+        _active.add(marker)
+        try:
+            normalized: dict[Any, Any] = {}
+            for key, item in value.items():
+                if isinstance(key, (str, int, float, bool)) or key is None:
+                    safe_key = key
+                else:
+                    # JSON object keys cannot be tuples or arbitrary objects.
+                    # Convert only the key; values retain their native shape.
+                    safe_key = _json_sort_key(_json_safe(key, _active=_active))
+                normalized[safe_key] = _json_safe(item, _active=_active)
+            return normalized
+        finally:
+            _active.remove(marker)
+    if isinstance(value, (set, frozenset)):
+        marker = id(value)
+        if marker in _active:
+            raise TypeError("circular value is not JSON serializable")
+        _active.add(marker)
+        try:
+            items = [_json_safe(item, _active=_active) for item in value]
+        finally:
+            _active.remove(marker)
+        return sorted(items, key=_json_sort_key)
+    if isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in _active:
+            raise TypeError("circular value is not JSON serializable")
+        _active.add(marker)
+        try:
+            return [_json_safe(item, _active=_active) for item in value]
+        finally:
+            _active.remove(marker)
+    # The stream boundary must remain alive even when an adapter leaks a
+    # Python-only scalar (bytes, Decimal, Enum, etc.).  Preserve the value's
+    # readable representation rather than aborting a model turn that already
+    # has public output.
+    return str(value)
+
+
 def openai_chunk(
     prefix_id: str,
     model: str,
@@ -395,7 +594,7 @@ def openai_chunk(
         chunk["error"] = error
     if provider_model_name:
         chunk["provider_model_name"] = provider_model_name
-    return "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+    return "data: " + json.dumps(_json_safe(chunk), ensure_ascii=False) + "\n\n"
 
 
 def openai_completion(
@@ -448,7 +647,7 @@ def openai_completion(
     }
     if provider_model_name:
         resp["provider_model_name"] = provider_model_name
-    return resp
+    return _json_safe(resp)
 
 
 def _map_usage(usage: Any) -> Optional[dict]:
@@ -647,6 +846,12 @@ class ToolCallAccumulator:
     def __init__(self, max_calls: Optional[int] = None):
         self._calls: dict[str, dict] = {}
         self._order: list[str] = []
+        self._correlation_keys: dict[str, str] = {}
+        self._public_keys: dict[str, str] = {}
+        # Upstream indexes correlate fragments. Public indexes identify
+        # distinct OpenAI tool calls and must be unique even when an upstream
+        # reuses index 0 for several completed calls.
+        self._source_indexes: dict[str, int] = {}
         self._indexes: dict[str, int] = {}
         self._max_calls = max_calls
 
@@ -654,10 +859,130 @@ class ToolCallAccumulator:
     def has_calls(self) -> bool:
         return bool(self._calls)
 
+    @staticmethod
+    def _has_context(call: Mapping[str, Any]) -> bool:
+        return bool(
+            call.get("_event_session_id")
+            or call.get("_plan_item_id")
+            or call.get("_correlation_key")
+        )
+
+    @classmethod
+    def _same_context(cls, left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+        # Follow-up native fragments often omit the parent session/plan
+        # fields. Treat the missing side as a wildcard; an explicit context
+        # on both sides still has to match exactly.
+        if not cls._has_context(left) or not cls._has_context(right):
+            left_id = str(left.get("_upstream_tool_call_id") or left.get("id") or "")
+            right_id = str(right.get("_upstream_tool_call_id") or right.get("id") or "")
+            if left_id and right_id and left_id != right_id:
+                return False
+            left_name = str((left.get("function") or {}).get("name") or "")
+            right_name = str((right.get("function") or {}).get("name") or "")
+            return not (left_name and right_name and left_name != right_name)
+        for field in ("_event_session_id", "_plan_item_id"):
+            left_value = str(left.get(field) or "")
+            right_value = str(right.get(field) or "")
+            if left_value or right_value:
+                if not left_value or not right_value or left_value != right_value:
+                    return False
+        left_id = str(left.get("_upstream_tool_call_id") or "")
+        right_id = str(right.get("_upstream_tool_call_id") or "")
+        if left_id and right_id and left_id != right_id:
+            return False
+        left_name = str((left.get("function") or {}).get("name") or "")
+        right_name = str((right.get("function") or {}).get("name") or "")
+        return not (left_name and right_name and left_name != right_name)
+
+    def _new_storage_key(self, call: Mapping[str, Any]) -> str:
+        correlation = str(call.get("_correlation_key") or "")
+        base = f"correlation:{correlation}" if correlation else str(call.get("id") or "call")
+        key = base
+        suffix = 2
+        while key in self._calls:
+            key = f"{base}#{suffix}"
+            suffix += 1
+        return key
+
+    def _unique_public_id(self, requested: str) -> str:
+        base = requested or "call"
+        if base not in self._public_keys:
+            return base
+        suffix = 2
+        candidate = f"{base}_{suffix}"
+        while candidate in self._public_keys:
+            suffix += 1
+            candidate = f"{base}_{suffix}"
+        return candidate
+
     def _existing_key(self, call: dict) -> Optional[str]:
+        correlation = str(call.get("_correlation_key") or "")
+        if correlation:
+            correlated_key = self._correlation_keys.get(correlation)
+            if correlated_key in self._calls:
+                return correlated_key
         key = call.get("id")
         if key in self._calls:
-            return key
+            existing = self._calls.get(key) or {}
+            if self._same_context(existing, call):
+                return key
+        if key in self._public_keys:
+            public_key = self._public_keys[str(key)]
+            existing = self._calls.get(public_key) or {}
+            if self._same_context(existing, call):
+                return public_key
+        if self._has_context(call):
+            contextual = [
+                existing_key
+                for existing_key in reversed(self._order)
+                if self._same_context(self._calls[existing_key], call)
+            ]
+            upstream_id = str(call.get("_upstream_tool_call_id") or "")
+            if upstream_id:
+                contextual = [
+                    existing_key
+                    for existing_key in contextual
+                    if str(
+                        self._calls[existing_key].get("_upstream_tool_call_id")
+                        or ""
+                    )
+                    == upstream_id
+                ]
+            requested_index = call.get("index")
+            if len(contextual) > 1 and isinstance(requested_index, int):
+                contextual = [
+                    existing_key
+                    for existing_key in contextual
+                    if self._source_indexes[existing_key] == requested_index
+                ]
+            return contextual[0] if len(contextual) == 1 else None
+        if call.get("_explicit_id") is not True:
+            # An id-less continuation with no parent metadata can still be
+            # attached when its source index/name identifies one open call.
+            requested_index = call.get("index")
+            function_name = str((call.get("function") or {}).get("name") or "")
+            candidates = [
+                existing_key
+                for existing_key in reversed(self._order)
+                if (
+                    not isinstance(requested_index, int)
+                    or self._source_indexes[existing_key] == requested_index
+                )
+                and (
+                    not function_name
+                    or str(
+                        (self._calls[existing_key].get("function") or {}).get("name")
+                        or ""
+                    )
+                    == function_name
+                )
+            ]
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                if self._closed_state(self._calls[candidate], call) != "distinct":
+                    return candidate
+        if call.get("_explicit_id") is True:
+            return None
         function = call.get("function") or {}
         requested_index = call.get("index")
         # Trae native stream: tool-call argument fragments. The first item of
@@ -668,16 +993,24 @@ class ToolCallAccumulator:
         # so index-based merge is the correct path when present.
         if call.get("_synthetic_id") or not function.get("name"):
             if isinstance(requested_index, int):
-                for existing_key, existing_index in self._indexes.items():
+                for existing_key in reversed(self._order):
+                    if self._has_context(self._calls[existing_key]):
+                        continue
+                    existing_index = self._source_indexes[existing_key]
                     if existing_index != requested_index:
                         continue
                     existing_name = (self._calls[existing_key].get("function") or {}).get(
                         "name"
                     )
-                    if not function.get("name") or function.get("name") == existing_name:
+                    if (
+                        (not function.get("name") or function.get("name") == existing_name)
+                        and self._closed_state(self._calls[existing_key], call)
+                        != "distinct"
+                    ):
                         return existing_key
             # No usable index: nameless delta fragments are ordered, so merge
             # into the latest open delta call (upstream order == merge order).
+                return None
             if call.get("_synthetic_id") and not function.get("name"):
                 last_key = self._order[-1] if self._order else None
                 if last_key is not None:
@@ -689,17 +1022,6 @@ class ToolCallAccumulator:
                     ):
                         return last_key
                 return None
-        if isinstance(requested_index, int) and (
-            call.get("_synthetic_id") or not function.get("name")
-        ):
-            for existing_key, existing_index in self._indexes.items():
-                if existing_index != requested_index:
-                    continue
-                existing_name = (self._calls[existing_key].get("function") or {}).get(
-                    "name"
-                )
-                if not function.get("name") or function.get("name") == existing_name:
-                    return existing_key
         return None
 
     @staticmethod
@@ -729,7 +1051,7 @@ class ToolCallAccumulator:
             or same_index
         ):
             return "conflict"
-        return ""
+        return "distinct"
 
     def prepare(self, calls: Any) -> list[dict]:
         if not isinstance(calls, list):
@@ -741,13 +1063,33 @@ class ToolCallAccumulator:
                 continue
             function = call.get("function") or {}
             existing_key = self._existing_key(call)
+            if (
+                existing_key is None
+                and call.get("_explicit_id") is True
+                and not function.get("name")
+                and str(function.get("arguments") or "").strip()
+            ):
+                raise InvalidNativeToolArguments(
+                    "Trae upstream returned tool arguments for an unknown call "
+                    "without a function name",
+                    retryable=False,
+                    observed_model_event=True,
+                )
             if existing_key is not None:
                 existing = self._calls[existing_key]
                 existing_function = existing.get("function") if existing else None
                 if not function.get("name") and isinstance(existing_function, dict):
                     function["name"] = existing_function["name"]
-                call["id"] = existing_key
+                call["id"] = existing["id"]
                 call["_synthetic_id"] = existing.get("_synthetic_id") is True
+                if call.get("_explicit_id") is not True:
+                    upstream_id = str(
+                        existing.get("_upstream_tool_call_id")
+                        or existing.get("id")
+                        or ""
+                    )
+                    if upstream_id:
+                        call["_upstream_tool_call_id"] = upstream_id
             prepared.append(call)
         return prepared
 
@@ -761,7 +1103,7 @@ class ToolCallAccumulator:
                 continue
             function = call["function"]
             call_id = call["id"]
-            key = self._existing_key(call) or call_id
+            key = self._existing_key(call) or self._new_storage_key(call)
             if key not in self._calls and not function.get("name"):
                 # 匹配不到任何已有调用的无 name 帧：只有以 { [ 开头才是新调用
                 # 起点；孤立的 } ] 空串是上游并发流的遗留闭合帧，直接丢弃。
@@ -775,8 +1117,8 @@ class ToolCallAccumulator:
                     continue
             existing = self._calls.get(key)
             if existing is not None:
-                call_id = key
-                call["id"] = key
+                call_id = existing["id"]
+                call["id"] = call_id
             if not function.get("name"):
                 existing_function = existing.get("function") if existing else None
                 if not isinstance(existing_function, dict) or not existing_function.get(
@@ -818,6 +1160,8 @@ class ToolCallAccumulator:
                     continue
                 for existing_key in self._order:
                     existing = self._calls[existing_key]
+                    if not self._same_context(existing, call):
+                        continue
                     if not existing.get("_synthetic_id"):
                         continue
                     existing_function = existing.get("function") or {}
@@ -827,7 +1171,10 @@ class ToolCallAccumulator:
                         existing.get("_explicit_index") is True
                         and call.get("_explicit_index") is True
                     )
-                    same_index = both_indexed and self._indexes[existing_key] == requested_index
+                    same_index = (
+                        both_indexed
+                        and self._source_indexes[existing_key] == requested_index
+                    )
                     if both_indexed and not same_index:
                         continue
                     previous_args = str(existing_function.get("arguments") or "")
@@ -843,9 +1190,21 @@ class ToolCallAccumulator:
             if key not in self._calls:
                 if self._max_calls is not None and len(self._order) >= self._max_calls:
                     continue
-                index = requested_index if isinstance(requested_index, int) else len(self._order)
+                call_id = self._unique_public_id(str(call.get("id") or "call"))
+                call["id"] = call_id
+                source_index = (
+                    requested_index
+                    if isinstance(requested_index, int)
+                    else len(self._order)
+                )
+                index = len(self._order)
                 self._calls[key] = call
                 self._order.append(key)
+                correlation = str(call.get("_correlation_key") or "")
+                if correlation:
+                    self._correlation_keys[correlation] = key
+                self._public_keys[call_id] = key
+                self._source_indexes[key] = source_index
                 self._indexes[key] = index
                 deltas.append({
                     "index": index,
@@ -895,8 +1254,9 @@ class ToolCallAccumulator:
                             )
                             continue
                         new_key = call_id + ":" + str(len(self._order))
+                        public_id = self._unique_public_id(new_key)
                         self._calls[new_key] = {
-                            "id": new_key,
+                            "id": public_id,
                             "type": "function",
                             "function": {
                                 "name": current_name or previous["name"],
@@ -905,13 +1265,25 @@ class ToolCallAccumulator:
                             "_synthetic_id": True,
                             "_arguments_mode": "delta",
                             "_source_index": call.get("_source_index", 0),
+                            "_event_session_id": call.get("_event_session_id", ""),
+                            "_plan_item_id": call.get("_plan_item_id", ""),
+                            "_correlation_key": call.get("_correlation_key", ""),
                         }
                         self._order.append(new_key)
+                        self._source_indexes[new_key] = (
+                            requested_index
+                            if isinstance(requested_index, int)
+                            else len(self._order) - 1
+                        )
                         self._indexes[new_key] = len(self._order) - 1
+                        correlation = str(call.get("_correlation_key") or "")
+                        if correlation:
+                            self._correlation_keys[correlation] = new_key
+                        self._public_keys[public_id] = new_key
                         deltas.append(
                             {
                                 "index": self._indexes[new_key],
-                                "id": new_key,
+                                "id": public_id,
                                 "type": "function",
                                 "function": {
                                     "name": current_name or previous["name"],
@@ -954,17 +1326,27 @@ class ToolCallAccumulator:
         """Replace the aggregated calls (used after repair/split)."""
         self._calls = {}
         self._order = []
+        self._correlation_keys = {}
+        self._public_keys = {}
+        self._source_indexes = {}
         self._indexes = {}
         for idx, c in enumerate(calls):
-            cid = str(c.get("id") or f"call_repair_{idx}")
-            self._calls[cid] = c
-            self._order.append(cid)
-            call_index = c.get("index")
-            if not isinstance(call_index, int):
-                call_index = idx
-            else:
-                c.setdefault("index", call_index)
-            self._indexes[cid] = call_index
+            cid = self._unique_public_id(str(c.get("id") or f"call_repair_{idx}"))
+            c["id"] = cid
+            key = self._new_storage_key(c)
+            self._calls[key] = c
+            self._order.append(key)
+            correlation = str(c.get("_correlation_key") or "")
+            if correlation:
+                self._correlation_keys[correlation] = key
+            self._public_keys[cid] = key
+            source_index = c.get("index")
+            if not isinstance(source_index, int):
+                source_index = c.get("_source_index")
+            if not isinstance(source_index, int):
+                source_index = idx
+            self._source_indexes[key] = source_index
+            self._indexes[key] = idx
 
 
 def _repair_json_arguments(arguments: str) -> str:
@@ -1036,18 +1418,16 @@ def _split_json_stream(text: str):
 
 
 def _ensure_native_tool_arguments(
-    calls: list[dict], usage: Any = None
+    calls: list[dict], usage: Any = None, *, strict: bool = False
 ) -> list[dict]:
     """Validate/repair/split malformed native delta tool arguments."""
     repaired_any = False
     kept: list[dict] = []
     for call in calls:
-        if call.get("_arguments_mode") != "delta":
-            kept.append(call)
-            continue
         function = call.get("function") or {}
         arguments = function.get("arguments")
-        if not arguments:
+        if arguments is None or not str(arguments).strip():
+            function["arguments"] = "{}"
             kept.append(call)
             continue
         try:
@@ -1111,20 +1491,112 @@ def _ensure_native_tool_arguments(
             str(arguments)[:200],
         )
         repaired_any = True
+        if strict:
+            raise InvalidNativeToolArguments(
+                "Trae upstream returned invalid JSON arguments for tool "
+                f"{function.get('name') or '?'}",
+                retryable=False,
+                usage=usage,
+                observed_model_event=True,
+            )
     if repaired_any:
         logger.warning("[repair] repaired/split/dropped unusable tool call(s) this turn")
     return kept
 
 
+def _payload_context(data: Mapping[str, Any]) -> tuple[str, str]:
+    """Extract the remote event/plan identity used for tool correlation."""
+
+    session_id = ""
+    for key in (
+        "eventSessionId",
+        "event_session_id",
+        "sessionId",
+        "session_id",
+    ):
+        value = data.get(key)
+        if value not in (None, ""):
+            session_id = str(value)
+            break
+    plan_id = ""
+    for key in ("planItemId", "plan_item_id", "planId", "plan_id"):
+        value = data.get(key)
+        if value not in (None, ""):
+            plan_id = str(value)
+            break
+    # Some Web responses put the plan identity only in ``id``. Restrict this
+    # fallback to plan-shaped/tool payloads so ordinary OpenAI completion ids
+    # do not accidentally become correlation namespaces.
+    if not plan_id and (
+        "tool_call_info" in data
+        or "toolCallInfo" in data
+        or "thought" in data
+        or "plan_item" in data
+        or "planItem" in data
+    ):
+        value = data.get("id")
+        if value not in (None, ""):
+            plan_id = str(value)
+    return session_id, plan_id
+
+
+def _annotate_tool_call_context(
+    call: Mapping[str, Any], session_id: str, plan_id: str
+) -> dict:
+    annotated = dict(call)
+    if session_id:
+        annotated.setdefault("_event_session_id", session_id)
+    if plan_id:
+        annotated.setdefault("_plan_item_id", plan_id)
+    function = annotated.get("function")
+    function = function if isinstance(function, Mapping) else {}
+    upstream_id = str(
+        annotated.get("_upstream_tool_call_id")
+        or annotated.get("toolCallId")
+        or annotated.get("tool_call_id")
+        or annotated.get("id")
+        or ""
+    )
+    name = str(function.get("name") or annotated.get("name") or "")
+    if session_id or plan_id:
+        annotated["_correlation_key"] = json.dumps(
+            [session_id, plan_id, upstream_id, name],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return annotated
+
+
 def _calls_from_payload(data: Any) -> list[dict]:
     if not isinstance(data, dict):
         return []
-    calls = _extract_tool_calls(data)
+    session_id, plan_id = _payload_context(data)
+    calls = [
+        _annotate_tool_call_context(call, session_id, plan_id)
+        for call in _extract_tool_calls(data)
+    ]
     tool_info = data.get("tool_call_info")
+    if not isinstance(tool_info, dict):
+        tool_info = data.get("toolCallInfo")
     if isinstance(tool_info, dict):
         item = dict(tool_info)
-        item.setdefault("id", tool_info.get("tool_call_id") or data.get("id"))
+        item.setdefault(
+            "id",
+            tool_info.get("tool_call_id")
+            or tool_info.get("toolCallId")
+            or data.get("id"),
+        )
+        item.setdefault(
+            "name",
+            tool_info.get("toolCallName")
+            or tool_info.get("tool_call_name")
+            or tool_info.get("name"),
+        )
+        item["_event_session_id"] = session_id
+        item["_plan_item_id"] = plan_id
         call = _normalize_tool_call(item, index=len(calls))
+        if call:
+            call = _annotate_tool_call_context(call, session_id, plan_id)
         # ``extract_tool_calls`` now understands top-level ``tool_call_info``
         # natively.  Keep this compatibility fallback for older/partial
         # payloads, but do not append the same call a second time when the
@@ -1135,6 +1607,10 @@ def _calls_from_payload(data: Any) -> list[dict]:
             call
             and any(
                 str(existing.get("id") or "") == str(call.get("id") or "")
+                and (
+                    not call.get("_correlation_key")
+                    or existing.get("_correlation_key") == call.get("_correlation_key")
+                )
                 or (
                     call_signature
                     and call_signature == _tool_call_signature(existing)
@@ -1208,12 +1684,13 @@ def _filter_tool_calls(
         if selected and name != selected:
             continue
         call_id = str(call.get("id") or "")
+        identity = str(call.get("_correlation_key") or call_id)
         is_delta = call.get("_arguments_mode") == "delta"
         if not is_delta:
-            if call_id and call_id in seen:
+            if identity and identity in seen:
                 continue
-            if call_id:
-                seen.add(call_id)
+            if identity:
+                seen.add(identity)
         filtered.append(call)
         if parallel_tool_calls is False:
             break
@@ -1316,6 +1793,42 @@ def _emit_tool_deltas(
         openai_chunk(prefix_id, model, {"tool_calls": [delta]})
         for delta in accumulator.add(calls)
     ]
+
+
+def _emit_complete_tool_calls(
+    prefix_id: str,
+    model: str,
+    calls: list[dict],
+) -> list[str]:
+    """Emit validated calls with one unique public index per logical call."""
+
+    chunks: list[str] = []
+    for index, call in enumerate(calls):
+        function = call.get("function") or {}
+        chunks.append(
+            openai_chunk(
+                prefix_id,
+                model,
+                {
+                    "tool_calls": [
+                        {
+                            "index": index,
+                            "id": str(call.get("id") or f"call_{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": str(function.get("name") or ""),
+                                "arguments": str(
+                                    function.get("arguments")
+                                    if function.get("arguments") is not None
+                                    else "{}"
+                                ),
+                            },
+                        }
+                    ]
+                },
+            )
+        )
+    return chunks
 
 
 def _visible_text(text: Any) -> str:
@@ -1547,6 +2060,8 @@ async def translate_ide_stream(
     terminal_event_pending = False
     started = not fail_on_empty
     pending_queue_chunks: list[str] = []
+    # Preserve formatting without committing an otherwise empty probe stream.
+    pending_text = ""
 
     if started:
         yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -1594,12 +2109,20 @@ async def translate_ide_stream(
         terminal_event_pending = False
         _capture_upstream_metadata(upstream_metadata, obj)
         if event_type == "error":
-            raise RuntimeError(
-                str(obj.get("message") or obj.get("error") or "Trae raw upstream returned an error event")
+            _raise_upstream_event_error(
+                obj,
+                content_count=content_count,
+                reasoning_text=reasoning_text,
+                tool_calls=tool_calls,
+                usage=final_usage,
+                upstream_metadata=upstream_metadata,
             )
         if event_type == "request_wait_in_queue" or obj.get("position") is not None:
             position = obj.get("position", 0)
             if position != last_queue_position:
+                # Preserve the original Trae raw contract: queue notices are
+                # assistant content.  Probe streams hold the notice until the
+                # first real model event so an empty probe still stays empty.
                 queue_chunk = openai_chunk(
                     prefix_id,
                     model,
@@ -1611,6 +2134,9 @@ async def translate_ide_stream(
                 else:
                     pending_queue_chunks.append(queue_chunk)
                 last_queue_position = position
+                logger.info(
+                    "upstream queue position model=%s position=%s", model, position
+                )
             continue
         if event_type == "token_usage":
             final_usage = _map_usage(obj.get("usage") or obj)
@@ -1622,7 +2148,20 @@ async def translate_ide_stream(
             _check_provider_model(model, reported_provider)
 
         reasoning = _payload_reasoning_text(obj)
+        if not reasoning and event_type == "reasoning_delta":
+            reasoning = _payload_text_delta(obj)
         raw_response = obj.get("response") if isinstance(obj.get("response"), str) else ""
+        # TraeCode's native llm_raw_chat emits incremental ``text_delta`` /
+        # ``translated_text`` events instead of the legacy cumulative
+        # ``response`` snapshots.  Feed those events through the same
+        # accumulator; old output frames remain unchanged.
+        if not raw_response and event_type in {
+            "text_delta",
+            "translated_text",
+            "accumulated",
+            "assistant_message",
+        }:
+            raw_response = _payload_text_delta(obj)
         embedded_reasoning, visible_response = _split_embedded_reasoning(raw_response)
         reasoning_delta, reasoning_calls = reasoning_text.add(reasoning)
         if embedded_reasoning:
@@ -1636,10 +2175,8 @@ async def translate_ide_stream(
         if _contains_completed_tool_repeat(calls, completed_tool_signatures):
             saw_completed_repeat = True
 
-        tool_chunks = list(
-            _emit_tool_deltas(
-                prefix_id,
-                model,
+        tool_calls.add(
+            _filter_for_accumulator(
                 tool_calls,
                 calls,
                 allowed_tools,
@@ -1648,17 +2185,10 @@ async def translate_ide_stream(
                 completed_tool_signatures,
             )
         )
-        if tool_chunks and not started:
-            started = True
-            yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            for pending in pending_queue_chunks:
-                yield pending
-            pending_queue_chunks.clear()
-        for chunk in tool_chunks:
-            yield chunk
 
-        text_delta = response_delta
-        if text_delta:
+        pending_text += response_delta
+        if pending_text and response_text.visible.strip():
+            text_delta, pending_text = pending_text, ""
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -1688,10 +2218,8 @@ async def translate_ide_stream(
     final_calls = reasoning_calls + response_calls
     if _contains_completed_tool_repeat(final_calls, completed_tool_signatures):
         saw_completed_repeat = True
-    final_tool_chunks = list(
-        _emit_tool_deltas(
-            prefix_id,
-            model,
+    tool_calls.add(
+        _filter_for_accumulator(
             tool_calls,
             final_calls,
             allowed_tools,
@@ -1700,17 +2228,10 @@ async def translate_ide_stream(
             completed_tool_signatures,
         )
     )
-    if final_tool_chunks and not started:
-        started = True
-        yield openai_chunk(prefix_id, model, {"role": "assistant"})
-        for pending in pending_queue_chunks:
-            yield pending
-        pending_queue_chunks.clear()
-    for chunk in final_tool_chunks:
-        yield chunk
 
-    final_text_delta = response_delta
-    if final_text_delta:
+    pending_text += response_delta
+    if pending_text and response_text.visible.strip():
+        final_text_delta, pending_text = pending_text, ""
         if not started:
             started = True
             yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -1724,24 +2245,13 @@ async def translate_ide_stream(
     reasoning_summary = (
         compact_reasoning_text(reasoning_text.raw) if include_reasoning else ""
     )
-    if reasoning_summary:
-        if not started:
-            started = True
-            yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            for pending in pending_queue_chunks:
-                yield pending
-            pending_queue_chunks.clear()
-        yield openai_chunk(
-            prefix_id,
-            model,
-            {"reasoning_content": reasoning_summary},
-        )
 
     if terminal_event_pending:
         saw_terminal = True
     if not saw_terminal and require_terminal:
         observed_model_event = bool(
             content_count
+            or reasoning_text.raw
             or tool_calls.has_calls
             or final_usage is not None
             or provider_model_name
@@ -1758,8 +2268,33 @@ async def translate_ide_stream(
             observed_model_event=observed_model_event,
         )
     tool_calls.set_calls(
-        _ensure_native_tool_arguments(tool_calls.calls(), final_usage)
+        _ensure_native_tool_arguments(
+            tool_calls.calls(), final_usage, strict=True
+        )
     )
+    if reasoning_summary:
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
+        yield openai_chunk(
+            prefix_id,
+            model,
+            {"reasoning_content": reasoning_summary},
+        )
+    if tool_calls.has_calls:
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
+        for chunk in _emit_complete_tool_calls(
+            prefix_id, model, tool_calls.calls()
+        ):
+            yield chunk
     if content_count == 0 and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
@@ -1780,14 +2315,16 @@ async def translate_ide_stream(
         )
         yield "data: [DONE]\n\n"
         return
+    has_visible_content = bool(response_text.visible.strip())
     if (
         fail_on_empty
-        and content_count == 0
+        and not has_visible_content
         and not tool_calls.has_calls
         and not reasoning_summary
     ):
         observed_model_event = bool(
             final_usage is not None
+            or reasoning_text.raw
             or provider_model_name
             or (
                 isinstance(upstream_metadata, dict)
@@ -2026,6 +2563,43 @@ def _payload_reasoning_text(data: Any) -> str:
     return ""
 
 
+def _payload_text_delta(data: Any) -> str:
+    """Extract TraeCode ``text_delta``/``accumulated`` payload text.
+
+    Older Trae/TraeWork streams expose cumulative text under ``response``.
+    TraeCode's native llm_raw_chat stream can instead send ``text_delta`` or
+    ``translated_text`` events with a ``delta``/``text``/``content`` field.
+    Keep this parser deliberately narrow so arbitrary metadata is never
+    surfaced as assistant content.
+    """
+
+    if not isinstance(data, dict):
+        return ""
+    for key in ("delta", "text_delta", "textDelta", "text", "content", "response"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            nested = _payload_text_delta(value)
+            if nested:
+                return nested
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    nested = _payload_text_delta(item)
+                    if nested:
+                        parts.append(nested)
+            if parts:
+                return "".join(parts)
+    message = data.get("message")
+    if isinstance(message, dict):
+        return _payload_text_delta(message)
+    return ""
+
+
 def _web_plan_has_split_reasoning(data: dict) -> bool:
     """Current remote plan items carry reasoning in ``reasoning_content``.
 
@@ -2090,6 +2664,16 @@ def _web_finish_summary(data: dict) -> str:
         if isinstance(params, dict):
             return str(params.get("summary") or "")
     return ""
+
+
+def _web_plan_state_key(data: Mapping[str, Any], fallback_index: int) -> str:
+    session_id, plan_id = _payload_context(data)
+    if not plan_id:
+        value = data.get("id")
+        plan_id = str(value) if value not in (None, "") else f"plan-{fallback_index}"
+    return json.dumps(
+        [session_id, plan_id], ensure_ascii=False, separators=(",", ":")
+    )
 
 
 def _web_message_text(data: dict) -> str:
@@ -2190,7 +2774,7 @@ async def translate_web_events(
             continue
         if event == "plan_item":
             emitted_tool = False
-            pid = str(data.get("id") or f"plan-{len(reasoning_order)}")
+            pid = _web_plan_state_key(data, len(reasoning_order))
             plan_reasoning = _web_plan_reasoning(data)
             if not _web_plan_has_split_reasoning(data) and plan_reasoning:
                 legacy_plan_reasoning = True
@@ -2232,18 +2816,22 @@ async def translate_web_events(
             for chunk in plan_chunks:
                 emitted_tool = True
                 yield chunk
-            if emitted_tool and allowed_tools is not None:
+            if (
+                emitted_tool
+                and allowed_tools is not None
+                and parallel_tool_calls is False
+            ):
                 break
             if content_delta:
-                if not started:
-                    started = True
-                    yield openai_chunk(prefix_id, model, {"role": "assistant"})
                 plan_streamed_text += content_delta
                 merged_text = _merge_plan_message_text(
                     plan_streamed_text, message_visible_text
                 )
                 public_delta = _cli_text_delta(streamed_text, merged_text)
-                if public_delta:
+                if public_delta and (public_delta.strip() or streamed_text.strip()):
+                    if not started:
+                        started = True
+                        yield openai_chunk(prefix_id, model, {"role": "assistant"})
                     streamed_text += public_delta
                     yield openai_chunk(prefix_id, model, {"content": public_delta})
             summary = _web_finish_summary(data)
@@ -2285,7 +2873,7 @@ async def translate_web_events(
                     plan_streamed_text, message_visible_text
                 )
                 message_delta = _cli_text_delta(streamed_text, merged_text)
-                if message_delta:
+                if message_delta and (message_delta.strip() or streamed_text.strip()):
                     if not started:
                         started = True
                         yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -2330,15 +2918,15 @@ async def translate_web_events(
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
             yield chunk
         if content_delta:
-            if not started:
-                started = True
-                yield openai_chunk(prefix_id, model, {"role": "assistant"})
             plan_streamed_text += content_delta
             merged_text = _merge_plan_message_text(
                 plan_streamed_text, message_visible_text
             )
             public_delta = _cli_text_delta(streamed_text, merged_text)
-            if public_delta:
+            if public_delta and (public_delta.strip() or streamed_text.strip()):
+                if not started:
+                    started = True
+                    yield openai_chunk(prefix_id, model, {"role": "assistant"})
                 streamed_text += public_delta
                 yield openai_chunk(prefix_id, model, {"content": public_delta})
 
@@ -2363,7 +2951,7 @@ async def translate_web_events(
     )
     if message_delta or merged_text:
         public_delta = _cli_text_delta(streamed_text, merged_text)
-        if public_delta:
+        if public_delta and (public_delta.strip() or streamed_text.strip()):
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -2410,13 +2998,13 @@ async def translate_web_events(
     # Do not present a web agent's remote tool result as the external client's
     # tool result. The API client owns execution and the following turn.
     if not tool_calls.has_calls:
-        if not streamed_text and final_summary:
+        if not streamed_text.strip() and final_summary.strip():
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
             streamed_text += final_summary
             yield openai_chunk(prefix_id, model, {"content": final_summary})
-        elif final_summary:
+        elif final_summary.strip():
             summary = final_summary.rstrip()
             streamed_head = streamed_text.strip()
             if streamed_head and summary.startswith(streamed_head):
@@ -2434,11 +3022,12 @@ async def translate_web_events(
                 yield openai_chunk(prefix_id, model, {"content": "\n\n" + final_summary})
 
     if (
-        not streamed_text
+        not streamed_text.strip()
         and not tool_calls.has_calls
         and reasoning_summary
         and not include_reasoning
         and not legacy_plan_reasoning
+        and not fail_on_empty
     ):
         # Split layout with reasoning but no answer: keep the trace in the
         # dedicated reasoning channel instead of presenting it as content.
@@ -2450,10 +3039,11 @@ async def translate_web_events(
         )
         include_reasoning = True
     if (
-        not streamed_text
+        not streamed_text.strip()
         and not tool_calls.has_calls
         and reasoning_summary
         and not include_reasoning
+        and legacy_plan_reasoning
     ):
         # Older remote variants place the final answer only in ``thought``.
         # Return a bounded fallback instead of the complete trace or an empty
@@ -2480,7 +3070,12 @@ async def translate_web_events(
         )
         yield "data: [DONE]\n\n"
         return
-    if fail_on_empty and not streamed_text and not tool_calls.has_calls and not saw_reasoning_output:
+    if (
+        fail_on_empty
+        and not streamed_text.strip()
+        and not tool_calls.has_calls
+        and not saw_reasoning_output
+    ):
         quota_exhausted = _is_account_quota_error(error_event)
         # ``model_config`` is emitted before a Trae 4008 error.  It identifies
         # the selected provider, but it is not model output and must not make
@@ -2527,7 +3122,11 @@ async def translate_web_events(
             )
             yield "data: [DONE]\n\n"
             return
-        if not tool_calls.has_calls and not streamed_text and not saw_reasoning_output:
+        if (
+            not tool_calls.has_calls
+            and not streamed_text.strip()
+            and not saw_reasoning_output
+        ):
             yield openai_chunk(
                 prefix_id,
                 model,
@@ -2847,8 +3446,13 @@ async def collect_nonstream_ide(
         terminal_event_pending = False
         _capture_upstream_metadata(upstream_metadata, obj)
         if event_type == "error":
-            raise RuntimeError(
-                str(obj.get("message") or obj.get("error") or "Trae raw upstream returned an error event")
+            _raise_upstream_event_error(
+                obj,
+                content_count=len(full),
+                reasoning_text=reasoning_text,
+                tool_calls=tool_calls,
+                usage=usage,
+                upstream_metadata=upstream_metadata,
             )
         if event_type == "token_usage":
             usage = _map_usage(obj.get("usage") or obj)
@@ -2858,7 +3462,16 @@ async def collect_nonstream_ide(
             provider_model_name = reported_provider
             _check_provider_model(model, reported_provider)
         reasoning = _payload_reasoning_text(obj)
+        if not reasoning and event_type == "reasoning_delta":
+            reasoning = _payload_text_delta(obj)
         raw_response = obj.get("response") if isinstance(obj.get("response"), str) else ""
+        if not raw_response and event_type in {
+            "text_delta",
+            "translated_text",
+            "accumulated",
+            "assistant_message",
+        }:
+            raw_response = _payload_text_delta(obj)
         embedded_reasoning, visible_response = _split_embedded_reasoning(raw_response)
         reasoning_delta, reasoning_calls = reasoning_text.add(reasoning)
         if embedded_reasoning:
@@ -2935,8 +3548,10 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
-    tool_calls.set_calls(_ensure_native_tool_arguments(tool_calls.calls(), usage))
-    if not full and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
+    tool_calls.set_calls(
+        _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=True)
+    )
+    if not full.strip() and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
             retryable=False,
@@ -2946,9 +3561,10 @@ async def collect_nonstream_ide(
     _ensure_required_tool_call(
         tool_choice, tool_calls.has_calls, tool_calls.calls()
     )
-    if fail_on_empty and not full and not reasoning_summary and not tool_calls.has_calls:
+    if fail_on_empty and not full.strip() and not reasoning_summary and not tool_calls.has_calls:
         observed_model_event = bool(
             usage is not None
+            or reasoning_text.raw
             or provider_model_name
             or (
                 isinstance(upstream_metadata, dict)
@@ -2961,7 +3577,7 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
-    if not full and not reasoning_summary and not tool_calls.has_calls:
+    if not full.strip() and not reasoning_summary and not tool_calls.has_calls:
         full = "(trae upstream returned an empty response)"
     if usage is None:
         usage = {
@@ -3023,7 +3639,7 @@ async def collect_nonstream_web(
             usage = _map_usage(data.get("usage") or data)
             continue
         if event == "plan_item":
-            pid = str(data.get("id") or f"plan-{len(reasoning_order)}")
+            pid = _web_plan_state_key(data, len(reasoning_order))
             reasoning_state = reasoning_states.setdefault(
                 pid, ProtocolTextAccumulator()
             )
@@ -3051,7 +3667,11 @@ async def collect_nonstream_web(
                 completed_tool_signatures,
             )
             tool_calls.add(calls)
-            if calls and allowed_tools is not None:
+            if (
+                calls
+                and allowed_tools is not None
+                and parallel_tool_calls is False
+            ):
                 break
             summary = _web_finish_summary(data)
             if summary:
@@ -3080,14 +3700,15 @@ async def collect_nonstream_web(
                     completed_tool_signatures,
                 )
                 tool_calls.add(filtered_calls)
-                if filtered_calls and allowed_tools is not None:
+                if (
+                    filtered_calls
+                    and allowed_tools is not None
+                    and parallel_tool_calls is False
+                ):
                     break
         if event == "done":
             final_reason = _payload_finish_reason(data) or final_reason
             break
-    if error_event:
-        raise RuntimeError(f"trae {error_event.get('code','')}: {error_event.get('message','')}")
-
     for state in reasoning_states.values():
         _, calls = state.finalize()
         tool_calls.add(
@@ -3156,6 +3777,35 @@ async def collect_nonstream_web(
         final_summary = filtered_summary or (
             summary_text if not content and not has_plan_reasoning else ""
         )
+    reasoning_raw = "\n".join(
+        reasoning_states[key].raw for key in reasoning_order if reasoning_states[key].raw
+    )
+    if error_event is not None:
+        code, message = _upstream_error_details(error_event)
+        if usage is None:
+            usage = _map_usage(error_event.get("usage"))
+            nested_error = error_event.get("error")
+            if usage is None and isinstance(nested_error, Mapping):
+                usage = _map_usage(nested_error.get("usage"))
+        observed_model_event = bool(
+            content.strip()
+            or final_summary.strip()
+            or reasoning_raw
+            or tool_calls.has_calls
+            or usage is not None
+        )
+        # Preserve output evidence before the dispatcher decides whether this
+        # failed turn may be replayed on another account or through Work.
+        raise UpstreamEventError(
+            message,
+            code=code,
+            retryable=not observed_model_event,
+            usage=usage,
+            observed_model_event=observed_model_event,
+            account_quota_exhausted=(
+                _is_account_quota_error(error_event) or "parallel" in message.lower()
+            ),
+        )
     # A finish summary can carry the only client tool call. Extract it before
     # validating a required/named choice, otherwise a valid summary call is
     # reported as a missing tool and the non-stream request fails.
@@ -3169,9 +3819,6 @@ async def collect_nonstream_web(
             content = final_summary.strip()
         elif final_summary and not content.rstrip().endswith(final_summary.rstrip()):
             content = content.rstrip() + "\n\n" + final_summary
-    reasoning_raw = "\n".join(
-        reasoning_states[key].raw for key in reasoning_order if reasoning_states[key].raw
-    )
     reasoning_summary = compact_reasoning_text(reasoning_raw)
     public_reasoning = reasoning_summary if include_reasoning else ""
     if (
@@ -3180,6 +3827,7 @@ async def collect_nonstream_web(
         and reasoning_summary
         and not include_reasoning
         and not legacy_plan_reasoning
+        and not fail_on_empty
     ):
         # Split layout: never promote the reasoning trace into content.
         public_reasoning = reasoning_summary
@@ -3189,33 +3837,23 @@ async def collect_nonstream_web(
         and not tool_calls.has_calls
         and reasoning_summary
         and not include_reasoning
+        and legacy_plan_reasoning
     ):
         # Compatibility fallback for remote versions that return the final
         # answer only through plan_item.thought.  Keep it compact rather than
         # exposing the complete working trace.
         content = reasoning_summary
     if fail_on_empty and not content and not public_reasoning and not tool_calls.has_calls:
-        quota_exhausted = _is_account_quota_error(error_event)
-        # A provider/model metadata event is not output.  In particular,
-        # Trae sends it immediately before a 4008 quota error; treating it as
-        # activity prevents the dispatcher from rotating credentials.
         observed_model_event = bool(
             usage is not None
             or reasoning_raw
-            or (provider_model_name and not quota_exhausted)
+            or provider_model_name
         )
-        message = "Trae remote upstream returned no text or tool call"
-        if error_event:
-            message = (
-                f"Trae remote upstream error: {error_event.get('code', '')}: "
-                f"{error_event.get('message', '')}"
-            )
         raise EmptyUpstreamResponse(
-            message,
+            "Trae remote upstream returned no text or tool call",
             retryable=not observed_model_event,
             usage=usage,
             observed_model_event=observed_model_event,
-            account_quota_exhausted=quota_exhausted,
         )
     if not content and not public_reasoning and not tool_calls.has_calls:
         content = "(trae upstream returned an empty response)"

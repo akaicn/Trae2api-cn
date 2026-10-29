@@ -8,15 +8,19 @@ filesystem, shell, edit, and other tools remain owned by the API caller.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import copy
 import hashlib
 import json
 import logging
 import os
+import secrets
 import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
 
@@ -26,24 +30,63 @@ from .cli_client import (
     strip_tool_call_blocks,
     tool_result_is_failed,
 )
-
-
+from . import images
 logger = logging.getLogger(__name__)
 
 
-# ``llm_raw_chat`` is the text-only transport used by TraeWork.  Unlike the
-# legacy llm_utils endpoint it binds the selected model through both the body
-# and the Extra header, and it rejects OpenAI tool fields in the JSON body.
+# ``RAW_CHAT_ENDPOINT`` is the legacy TraeWork raw transport.  It is kept
+# separate from TraeCode's CustomModel/body contract below: TraeCode's
+# ``llm_raw_chat`` request does not use the old ``llm_utils_chat`` auxiliary
+# path or the legacy ``Extra`` model-lock envelope by default.
 RAW_CHAT_ENDPOINT = "/api/ide/v2/llm_raw_chat"
 RAW_APP_ID = "7b3f9dc2-8a4e-5c6d-2f1b-9e4a3c5b7df0"
 RAW_IDE_VERSION = "3.3.67"
 RAW_IDE_VERSION_CODE = "20260206"
 RAW_IDE_FUNCTION = "chat"
 
+# TraeCode CN (the current desktop IDE) shares the llm_raw_chat route with
+# TraeWork, but it is a different protocol contract.  In particular, the
+# model/function binding is carried in the JSON body and the current IDE does
+# not rely on TraeWork's ``Extra`` header.  Keep these constants separate from
+# the legacy raw transport above so a Work request cannot accidentally inherit
+# TraeCode's app id or function selector.
+TRAECODE_RAW_CHAT_ENDPOINT = "/api/ide/v2/llm_raw_chat"
+TRAECODE_RAW_CHAT_FALLBACK_ENDPOINT = "/api/ide/v1/llm_raw_chat"
+TRAECODE_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
+TRAECODE_DEFAULT_GATEWAY = (
+    os.environ.get("TRAE_CODE_BASE_URL")
+    or "https://trae-api-cn.mchost.guru"
+).rstrip("/")
+TRAECODE_IDE_VERSION = os.environ.get("TRAE_CODE_IDE_VERSION", "3.4.4")
+TRAECODE_IDE_VERSION_CODE = os.environ.get(
+    "TRAE_CODE_IDE_VERSION_CODE", "20260212"
+)
+TRAECODE_DEFAULT_FUNCTION = "chat_v3"
+TRAECODE_SOLO_FUNCTIONS = {
+    "solo_agent",
+    "solo_coder",
+    "solo_builder",
+    "solo_agent_lite",
+    "solo_work_lite",
+    "solo_agent_remote",
+    "solo_work_remote",
+}
+TRAECODE_IDE_FUNCTIONS = {"chat_v3", "builder_v3", "builder_with_mcp_v3"}
+_TRAECODE_PROTECTED_HEADERS = {
+    "authorization",
+    "x-cloudide-token",
+    "x-ide-token",
+    "x-uid",
+    "x-app-id",
+    "x-app-function",
+    "x-ide-function",
+    "extra",
+}
+
 
 @dataclass
 class _RawSessionGate:
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    slots: threading.BoundedSemaphore
     users: int = 0
 
 
@@ -61,24 +104,71 @@ def _unregister_raw_session_gate(session_id: str, gate: _RawSessionGate) -> None
             _RAW_SESSION_GATES.pop(session_id, None)
 
 
-async def _acquire_raw_session_gate(session_id: str) -> Callable[[], None]:
-    """Serialize streams that share Trae's model-bound raw conversation."""
+async def _acquire_raw_session_gate(
+    session_id: str,
+    account_id: str = "",
+    token: str = "",
+    reservation_id: str = "",
+) -> Callable[[], None]:
+    """Acquire one model slot for a raw request.
+
+    Persisted accounts share the entitlement-backed pool used by Web, Remote,
+    and legacy IDE transports.  The per-session semaphore remains only for
+    unregistered/single-token integrations, where no account entitlement is
+    available.
+    """
+
+    from . import trae_client
+
+    canonical_account = auth.resolve_model_account_id(account_id)
+    if not canonical_account:
+        # A few direct callers provide only the bound JWT.  Resolve its
+        # immutable billing identity before falling back to the legacy gate.
+        canonical_account = auth.resolve_model_account_id(
+            _jwt_identity(str(token or ""))
+        )
+    if canonical_account:
+        try:
+            timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+        except (TypeError, ValueError):
+            timeout = 60.0
+        slot_lease_token = await trae_client.acquire_web_slot(
+            canonical_account,
+            timeout=max(0.0, timeout),
+            reservation_id=reservation_id,
+        )
+        released = False
+        release_guard = threading.Lock()
+
+        def release_account_slot() -> None:
+            nonlocal released
+            with release_guard:
+                if released:
+                    return
+                released = True
+            trae_client.release_web_slot_owned(
+                canonical_account, slot_lease_token
+            )
+
+        return release_account_slot
 
     with _RAW_SESSION_GATES_LOCK:
         gate = _RAW_SESSION_GATES.get(session_id)
         if gate is None:
-            gate = _RawSessionGate()
+            gate = _RawSessionGate(
+                threading.BoundedSemaphore(trae_client.model_request_parallel_limit())
+            )
             _RAW_SESSION_GATES[session_id] = gate
         gate.users += 1
 
     acquired = False
     try:
-        while not gate.lock.acquire(blocking=False):
+        while not gate.slots.acquire(blocking=False):
             await asyncio.sleep(_RAW_SESSION_GATE_POLL_SECONDS)
         acquired = True
     except BaseException:
         if acquired:
-            gate.lock.release()
+            gate.slots.release()
         _unregister_raw_session_gate(session_id, gate)
         raise
 
@@ -92,7 +182,7 @@ async def _acquire_raw_session_gate(session_id: str) -> Callable[[], None]:
                 return
             released = True
         try:
-            gate.lock.release()
+            gate.slots.release()
         finally:
             _unregister_raw_session_gate(session_id, gate)
 
@@ -106,6 +196,18 @@ class RawModel:
     display_name: str
     config_source: int = 1
     provider: str = ""
+
+
+class TraeCodeRateLimitError(RuntimeError):
+    """An HTTP limit that requires account rotation instead of gateway fallback."""
+
+    def __init__(self, status_code: int, code: Any, detail: str):
+        self.status_code = status_code
+        self.code = code
+        super().__init__(
+            f"TraeCode raw chat rate limit {code} (HTTP {status_code})"
+            + (f": {detail}" if detail else "")
+        )
 
 
 @dataclass
@@ -144,13 +246,1330 @@ class RawChatResponse:
         self.close()
 
 
+def _traecode_option(options: Optional[Mapping[str, Any]], *names: str, default: Any = None) -> Any:
+    """Read a TraeCode-specific option without sharing legacy raw defaults."""
+
+    options = options or {}
+    for name in names:
+        if name in options and options[name] is not None:
+            return options[name]
+    return default
+
+
+def _jwt_identity(token: str) -> str:
+    """Return an immutable account id from a valid JWT payload when present."""
+
+    parts = str(token or "").strip().split(".")
+    if len(parts) != 3 or not parts[0] or not parts[1]:
+        return ""
+
+    def decode(segment: str) -> Any:
+        padding = "=" * (-len(segment) % 4)
+        return json.loads(base64.urlsafe_b64decode(segment + padding))
+
+    try:
+        header = decode(parts[0])
+        payload = decode(parts[1])
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        return ""
+    if not isinstance(header, Mapping) or not isinstance(payload, Mapping):
+        return ""
+
+    candidates: list[Any] = []
+    for container_name in ("data", "user", "account"):
+        container = payload.get(container_name)
+        if not isinstance(container, Mapping):
+            continue
+        candidates.extend(
+            container.get(name)
+            for name in (
+                "id",
+                "sub",
+                "user_id",
+                "userId",
+                "uid",
+                "biz_user_id",
+                "bizUserId",
+            )
+        )
+    # Match the relay's account selector: Trae's nested ``data.id`` is the
+    # billing identity, while top-level ``sub`` can describe a login subject.
+    candidates.extend(
+        payload.get(name)
+        for name in (
+            "user_id",
+            "userId",
+            "sub",
+            "uid",
+            "biz_user_id",
+            "bizUserId",
+        )
+    )
+    for candidate in candidates:
+        if isinstance(candidate, bool) or not isinstance(candidate, (str, int)):
+            continue
+        identity = str(candidate).strip()
+        if identity:
+            return identity
+    return ""
+
+
+def _traecode_mapping(value: Any) -> Optional[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str) and value.strip().startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if isinstance(parsed, Mapping):
+            return parsed
+    return None
+
+
+def _traecode_context_value(
+    options: Optional[Mapping[str, Any]], *names: str, default: Any = None
+) -> Any:
+    """Read a known client value from the account-bound Trae context."""
+
+    options = options or {}
+    containers: list[Mapping[str, Any]] = [options]
+    for key in (
+        "client_context",
+        "clientContext",
+        "common_params",
+        "commonParams",
+        "native_common_params",
+        "streamlined_common_params",
+        "streamlinedCommonParams",
+        "native_streamlined_common_params",
+        "provider_specific",
+        "providerSpecificData",
+    ):
+        container = _traecode_mapping(options.get(key))
+        if container is not None:
+            containers.append(container)
+    # These are the only nested client envelopes observed in the 3.4.4
+    # request chain. Keep the search bounded so arbitrary request data cannot
+    # become a header by coincidence.
+    for container in list(containers):
+        for key in (
+            "userParams",
+            "user_params",
+            "deviceInfo",
+            "device_info",
+            "clientInfo",
+            "client_info",
+            "commonParams",
+            "common_params",
+            "streamlinedCommonParams",
+            "streamlined_common_params",
+            "headers",
+            "header",
+        ):
+            nested = _traecode_mapping(container.get(key))
+            if nested is not None:
+                containers.append(nested)
+    for container in containers:
+        for name in names:
+            if name in container and container[name] is not None:
+                return container[name]
+    return default
+
+
+def _encoded_header_value(value: Any) -> str:
+    """Match JavaScript's encodeURIComponent used by risk-control headers."""
+
+    # Direct 3.4.4 clients already send these values encoded. Normalize once
+    # before replay so a proxy hop never turns ``%20`` into ``%2520``.
+    return quote(unquote(str(value)), safe="-_.!~*'()")
+
+
+def _authorized_services_header(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if isinstance(value, (list, tuple, set, frozenset)):
+        services = [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, (set, frozenset)):
+            services.sort()
+        return ",".join(services)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+_TRAECODE_RAW_V2_OPTION_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("message", ("message",)),
+    ("is_custom_model", ("is_custom_model", "isCustomModel")),
+    ("provider", ("provider",)),
+    ("Request", ("Request", "request")),
+    (
+        "encrypted_model_params",
+        ("encrypted_model_params", "encryptedModelParams"),
+    ),
+    ("user_input", ("user_input", "userInput")),
+    ("request_type", ("request_type", "requestType")),
+    ("metadata", ("metadata",)),
+    ("queue_id", ("queue_id", "queueId")),
+    ("request_seq", ("request_seq", "requestSeq")),
+    ("mode_type", ("mode_type", "modeType")),
+    ("chat_mode", ("chat_mode", "chatMode")),
+    ("access_type", ("access_type", "accessType")),
+    ("image_config", ("image_config", "imageConfig")),
+    (
+        "estimate_prompt_tokens",
+        ("estimate_prompt_tokens", "estimatePromptTokens"),
+    ),
+    ("slash_command", ("slash_command", "slashCommand")),
+    ("message_origin", ("message_origin", "messageOrigin")),
+    ("reasoning_effort", ("reasoning_effort", "reasoningEffort")),
+    ("retry_times", ("retry_times", "retryTimes")),
+    ("queue_retry", ("queue_retry", "queueRetry")),
+    ("video_config", ("video_config", "videoConfig")),
+    (
+        "connect_check_param",
+        ("connect_check_param", "connectCheckParam"),
+    ),
+    (
+        "user_selected_model_name",
+        ("user_selected_model_name", "userSelectedModelName"),
+    ),
+    (
+        "reasoning_effort_level",
+        ("reasoning_effort_level", "reasoningEffortLevel"),
+    ),
+    (
+        "estimated_token_usage",
+        ("estimated_token_usage", "estimatedTokenUsage"),
+    ),
+    (
+        "custom_model_uniq_id",
+        ("custom_model_uniq_id", "customModelUniqId"),
+    ),
+    ("provider_context", ("provider_context", "providerContext")),
+    ("biz_context", ("biz_context", "bizContext")),
+    ("extra_info", ("extra_info", "extraInfo")),
+    ("use_fast_request", ("use_fast_request", "useFastRequest")),
+)
+
+
+def _normalize_traecode_function(value: Any, *, solo: bool = False) -> str:
+    """Return a validated ``raw_chat_function`` for the TraeCode gateway."""
+
+    requested = str(value or "").strip().lower()
+    if not requested:
+        return "solo_agent" if solo else TRAECODE_DEFAULT_FUNCTION
+    if requested in TRAECODE_SOLO_FUNCTIONS or requested in TRAECODE_IDE_FUNCTIONS:
+        return requested
+    # A UI can send a mode name instead of the native enum.  Keep this
+    # mapping local to the protocol adapter so the public mode names do not
+    # leak into the wire payload.
+    if requested in {"ide", "chat", "chat_v3"}:
+        return "chat_v3"
+    if requested in {"solo", "agent", "solo-agent", "solo_agent"}:
+        return "solo_agent"
+    if requested in {"builder", "builder-v3"}:
+        return "builder_v3"
+    if requested in {"coder", "solo-coder"}:
+        return "solo_coder"
+    raise ValueError(f"Unsupported TraeCode raw_chat_function: {value}")
+
+
+def traecode_raw_chat_function(
+    options: Optional[Mapping[str, Any]] = None,
+    *,
+    solo: bool = False,
+) -> str:
+    """Resolve the TraeCode IDE/SOLO protocol function.
+
+    The dispatcher can pass either the exact enum in
+    ``_traecode_raw_chat_function`` or a public mode via ``_traecode_mode``.
+    Unlike the old ``llm_utils_chat`` path, this selector is written into the
+    model request body and therefore determines the upstream product chain.
+    """
+
+    options = options or {}
+    explicit = _traecode_option(
+        options,
+        "_traecode_raw_chat_function",
+        "traecode_raw_chat_function",
+        "raw_chat_function",
+        "rawChatFunction",
+        default=None,
+    )
+    if explicit is None:
+        explicit = _traecode_option(
+            options,
+            "_traecode_mode",
+            "traecode_mode",
+            "mode",
+            default=None,
+        )
+    return _normalize_traecode_function(explicit, solo=solo)
+
+
+def _traecode_model_from_raw(raw_model: RawModel) -> RawModel:
+    """Use TraeCode's provider model id rather than TraeWork's ``__v2`` id."""
+
+    # TraeWork's raw catalogue uses ids such as ``glm-5__v2``.  TraeCode's
+    # CustomModel model_name is the provider/config id (``glm-5.1``), while
+    # callers may still explicitly provide a provider id when required.
+    provider_name = raw_model.raw_model_name
+    if provider_name.endswith("__v2"):
+        provider_name = raw_model.config_name
+    return RawModel(
+        config_name=raw_model.config_name,
+        raw_model_name=provider_name,
+        display_name=raw_model.display_name,
+        config_source=raw_model.config_source,
+        provider=raw_model.provider,
+    )
+
+
+def resolve_traecode_model(
+    model: str, options: Optional[Mapping[str, Any]] = None
+) -> RawModel:
+    """Resolve a public model id to TraeCode ``CustomModel`` fields.
+
+    This synchronous resolver intentionally uses only the local alias table.
+    ``resolve_traecode_model_for_request`` below may enrich unknown models from
+    the live account model list before a request is sent.
+    """
+
+    options = options or {}
+    config_name = _traecode_option(
+        options,
+        "traecode_config_name",
+        "traeCodeConfigName",
+        "trae_raw_config_name",
+        "traeRawConfigName",
+        "config_name",
+        "configName",
+        default=None,
+    )
+    provider_name = _traecode_option(
+        options,
+        "traecode_model_name",
+        "traeCodeModelName",
+        "trae_raw_model_name",
+        "traeRawModelName",
+        "raw_model_name",
+        "rawModelName",
+        default=None,
+    )
+    display_name = _traecode_option(
+        options,
+        "display_name",
+        "displayName",
+        "display_model_name",
+        "displayModelName",
+        "model_name",
+        "modelName",
+        default=None,
+    )
+    config_source = _traecode_option(
+        options,
+        "traecode_config_source",
+        "traeCodeConfigSource",
+        "config_source",
+        "configSource",
+        default=None,
+    )
+    try:
+        config_source = (
+            int(config_source)
+            if config_source is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        config_source = None
+    resolved = resolve_raw_model(model, options)
+    if config_name:
+        resolved = RawModel(
+            str(config_name),
+            str(provider_name or resolved.raw_model_name),
+            str(display_name or resolved.display_name),
+            config_source or resolved.config_source,
+            str(_traecode_option(options, "provider", default=None) or resolved.provider),
+        )
+    else:
+        resolved = _traecode_model_from_raw(resolved)
+        if provider_name or display_name or config_source:
+            resolved = RawModel(
+                resolved.config_name,
+                str(provider_name or resolved.raw_model_name),
+                str(display_name or resolved.display_name),
+                config_source or resolved.config_source,
+                str(_traecode_option(options, "provider", default=None) or resolved.provider),
+            )
+    return resolved
+
+
+async def resolve_traecode_model_for_request(
+    model: str, options: Optional[Mapping[str, Any]] = None
+) -> RawModel:
+    """Resolve TraeCode model fields, consulting the live config when needed."""
+
+    options = options or {}
+    explicit = any(
+        _traecode_option(options, key, default=None) is not None
+        for key in (
+            "traecode_config_name",
+            "traeCodeConfigName",
+            "traecode_model_name",
+            "traeCodeModelName",
+            "traecode_config_source",
+            "traeCodeConfigSource",
+            "trae_raw_config_name",
+            "trae_raw_model_name",
+            "config_name",
+            "model_name",
+        )
+    )
+    resolved = resolve_traecode_model(model, options)
+    if explicit:
+        return resolved
+    # TraeCode IDE/Solo uses a different provider-id namespace from the
+    # legacy TraeWork raw transport.  When the dispatcher selected a native
+    # function, consult the account-bound ``get_detail_param`` catalog first;
+    # it returns exact ids such as ``glm-5__dev``.  Falling through to the
+    # legacy resolver here would send ``glm-5__v2`` and the gateway reports a
+    # misleading 4011/4023 error.
+    native_function = _traecode_option(
+        options,
+        "_traecode_raw_chat_function",
+        "traecode_raw_chat_function",
+        "raw_chat_function",
+        default=None,
+    )
+    if native_function:
+        try:
+            from . import trae_client
+
+            token = str(options.get("_auth_token") or auth.get_token() or "").strip()
+            bound_user_id = str(
+                options.get("_auth_user_id")
+                or options.get("_billing_id")
+                or options.get("_account_id")
+                or ""
+            ).strip()
+            provider_specific = options.get("provider_specific")
+            if provider_specific is None and "providerSpecificData" in options:
+                provider_specific = options.get("providerSpecificData")
+            max_mode = bool(
+                _traecode_option(
+                    options,
+                    "trae_max_mode",
+                    "max_mode",
+                    "max",
+                    default=False,
+                )
+            )
+            live = await trae_client.resolve_traecode_model_config(
+                model,
+                token_override=token,
+                user_id_override=bound_user_id,
+                provider_specific=(
+                    dict(provider_specific)
+                    if isinstance(provider_specific, Mapping)
+                    else None
+                ),
+                max_mode=max_mode,
+                raw_chat_function=str(native_function),
+            )
+            if isinstance(live, Mapping):
+                return RawModel(
+                    config_name=str(
+                        live.get("config_name")
+                        or live.get("name")
+                        or resolved.config_name
+                    ),
+                    raw_model_name=str(
+                        live.get("raw_model_name")
+                        or live.get("model_name")
+                        or resolved.raw_model_name
+                    ),
+                    display_name=str(
+                        live.get("display_name")
+                        or live.get("display_model_name")
+                        or resolved.display_name
+                    ),
+                    config_source=int(
+                        live.get("config_source") or resolved.config_source or 1
+                    ),
+                    provider=str(live.get("provider") or resolved.provider or ""),
+                )
+        except Exception as exc:
+            logger.warning(
+                "traecode live model config lookup failed for %s: %s",
+                model,
+                exc,
+            )
+    # The existing async resolver knows how to query Trae's model catalogue.
+    # Reuse it for unknown/new models, then normalize the legacy ``__v2``
+    # suffix away because TraeCode's CustomModel uses provider model ids.
+    try:
+        upstream = await resolve_raw_model_for_request(model, options)
+    except Exception as exc:
+        logger.warning("traecode model config lookup failed for %s: %s", model, exc)
+        return resolved
+    upstream = _traecode_model_from_raw(upstream)
+    resolved = _traecode_model_from_raw(resolved)
+    # Live account configs can reuse a public/config name while selecting a
+    # different provider model id or config source. Merge their non-empty
+    # fields individually instead of discarding the whole live mapping unless
+    # config_name happens to differ.
+    return RawModel(
+        config_name=upstream.config_name or resolved.config_name,
+        raw_model_name=upstream.raw_model_name or resolved.raw_model_name,
+        display_name=upstream.display_name or resolved.display_name,
+        config_source=upstream.config_source or resolved.config_source,
+        provider=upstream.provider or resolved.provider,
+    )
+
+
+def traecode_session_id(
+    model: RawModel,
+    options: Optional[Mapping[str, Any]] = None,
+    raw_chat_function: str = TRAECODE_DEFAULT_FUNCTION,
+) -> str:
+    """Return a stable account/model/function-bound TraeCode conversation id."""
+
+    options = options or {}
+    explicit = _traecode_option(
+        options,
+        "_traecode_session_id",
+        "traecode_session_id",
+        "session_id",
+        "sessionId",
+        default=None,
+    )
+    if explicit:
+        return str(explicit)
+    account_identity = str(
+        options.get("_billing_id")
+        or options.get("_auth_user_id")
+        or options.get("_account_id")
+        or ""
+    ).strip()
+    if not account_identity:
+        token = str(options.get("_auth_token") or "")
+        account_identity = (
+            "token:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+            if token
+            else "default"
+        )
+    material = "\x1f".join(
+        (account_identity, model.config_name, model.raw_model_name, raw_chat_function)
+    )
+    return str(uuid.UUID(hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]))
+
+
+def _traecode_content_blocks(content: Any) -> list[dict[str, Any]]:
+    """Normalize OpenAI/Anthropic content into TraeCode text/media blocks."""
+
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        if isinstance(content, Mapping):
+            return [copy.deepcopy(dict(content))]
+        return [{"type": "text", "text": str(content)}]
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, str):
+            blocks.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, Mapping):
+            blocks.append({"type": "text", "text": str(part)})
+            continue
+        block = copy.deepcopy(dict(part))
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type in {"input_text", "text"}:
+            text = block.get("text")
+            if not isinstance(text, str):
+                text = block.get("content")
+            block["type"] = "text"
+            block["text"] = text if isinstance(text, str) else renderer_block_text(block)
+            block.pop("value", None)
+        elif block_type == "image_url":
+            # Keep OpenAI image_url blocks intact; the native TraeCode adapter
+            # accepts these alongside text and the existing image helper can
+            # still describe unsupported media at the caller boundary.
+            block["type"] = "image_url"
+        blocks.append(block)
+    return blocks
+
+
+def _traecode_tool_calls(message: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Preserve native OpenAI tool-call correlation for TraeCode history."""
+
+    calls: list[Any] = []
+    raw_calls = message.get("tool_calls")
+    if isinstance(raw_calls, list):
+        calls.extend(raw_calls)
+    legacy = message.get("function_call")
+    if isinstance(legacy, Mapping):
+        calls.append(legacy)
+    calls.extend(_renderer_tool_use_blocks(message.get("content")))
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for call in calls:
+        if not isinstance(call, Mapping):
+            continue
+        function = call.get("function") or call.get("function_call")
+        function = function if isinstance(function, Mapping) else call
+        name = str(function.get("name") or call.get("name") or "").strip()
+        if not name:
+            continue
+        call_id = str(
+            call.get("id")
+            or call.get("tool_call_id")
+            or call.get("toolCallId")
+            or f"call_{len(result)}"
+        )
+        if call_id in seen:
+            continue
+        seen.add(call_id)
+        arguments = function.get("arguments")
+        if arguments is None:
+            arguments = function.get("input", function.get("parameters", {}))
+        if not isinstance(arguments, str):
+            arguments = json.dumps(
+                arguments, ensure_ascii=False, separators=(",", ":"), default=str
+            )
+        result.append(
+            {
+                "id": call_id,
+                "type": str(call.get("type") or "function"),
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
+    return result
+
+
+def _traecode_tool_definitions(tools: Any) -> list[dict[str, Any]]:
+    """Keep OpenAI function schemas object-shaped for TraeCode."""
+
+    if not isinstance(tools, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            continue
+        function = tool.get("function")
+        function = function if isinstance(function, Mapping) else tool
+        name = str(function.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        parameters = function.get("parameters")
+        if parameters is None:
+            parameters = function.get("input_schema") or function.get("inputSchema") or {}
+        if isinstance(parameters, str):
+            try:
+                parameters = json.loads(parameters)
+            except (TypeError, ValueError):
+                parameters = {"type": "object"}
+        fn: dict[str, Any] = {
+            "name": name,
+            "description": str(function.get("description") or ""),
+            "parameters": copy.deepcopy(parameters),
+        }
+        if "strict" in function:
+            fn["strict"] = bool(function.get("strict"))
+        result.append({"type": "function", "function": fn})
+    return result
+
+
+def build_traecode_messages(
+    messages: list[dict[str, Any]], options: Optional[Mapping[str, Any]] = None
+) -> list[dict[str, Any]]:
+    """Convert caller messages to the TraeCode ``ChatMessageData`` shape."""
+
+    if not messages:
+        raise ValueError("messages cannot be empty")
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        role = str(message.get("role") or "user").strip().lower()
+        if role == "developer":
+            role = "system"
+        elif role == "function":
+            role = "tool"
+        elif role not in {"system", "user", "assistant", "tool"}:
+            role = "user"
+        item: dict[str, Any] = {"role": role}
+        content = message.get("content")
+        blocks = _traecode_content_blocks(content)
+        if blocks:
+            item["content"] = blocks
+        if role == "assistant":
+            tool_calls = _traecode_tool_calls(message)
+            if tool_calls:
+                item["tool_calls"] = tool_calls
+            elif isinstance(message.get("function_call"), Mapping):
+                legacy = _traecode_tool_calls({"tool_calls": [message["function_call"]]})
+                if legacy:
+                    item["function_call"] = legacy[0]["function"]
+        elif role == "tool":
+            if message.get("tool_call_id") is not None:
+                item["tool_call_id"] = str(message["tool_call_id"])
+            if message.get("name") is not None:
+                item["name"] = str(message["name"])
+        # Empty assistant turns are meaningful when they carry tool_calls;
+        # empty system/user turns are just malformed OpenAI history.
+        if not blocks and role in {"system", "user"} and not item.get("tool_calls"):
+            continue
+        result.append(item)
+    if not result:
+        raise ValueError("messages cannot be empty")
+    return result
+
+
+def build_traecode_chat_body(
+    messages: list[dict[str, Any]],
+    model: str,
+    stream: bool = True,
+    options: Optional[Mapping[str, Any]] = None,
+    *,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build TraeCode CN's IDE/SOLO ``llm_raw_chat`` request body.
+
+    The body intentionally lives beside, rather than inside,
+    :func:`build_raw_chat_body`: TraeWork's raw protocol has six fixed fields,
+    while TraeCode carries ``raw_chat_function`` and ``config_source`` in the
+    ``CustomModel`` envelope and can use native OpenAI tool fields.
+    """
+
+    options = options or {}
+    solo = bool(
+        _traecode_option(options, "_traecode_solo", "traecode_solo", "solo", default=False)
+    )
+    function = traecode_raw_chat_function(options, solo=solo)
+    resolved = resolve_traecode_model(model, options)
+    sid = str(session_id or traecode_session_id(resolved, options, function))
+    native_tools = bool(
+        _traecode_option(
+            options,
+            "_traecode_native_tools",
+            "traecode_native_tools",
+            default=False,
+        )
+    )
+    tools = options.get("tools") if "tools" in options else options.get("_inherited_tools")
+    body_messages = (
+        build_traecode_messages(messages, options)
+        if native_tools
+        else build_raw_messages(messages, options)
+    )
+    body: dict[str, Any] = {
+        "config_name": resolved.config_name,
+        "model_name": resolved.raw_model_name,
+        "conversation_id": sid,
+        "session_id": sid,
+        # TraeCode's client always opens the SSE path; non-stream API callers
+        # are aggregated by the relay after the upstream stream closes.
+        "stream": bool(_traecode_option(options, "_traecode_wire_stream", default=True)),
+        "raw_chat_function": function,
+        "config_source": int(resolved.config_source or 1),
+        "messages": body_messages,
+    }
+    # Trae 3.4.4 expanded the shared Work/Code raw-v2 DTO. Only copy fields
+    # explicitly supplied by the caller: defaults for queueing, effort, and
+    # client mode belong to the selected upstream model configuration.
+    for wire_name, aliases in _TRAECODE_RAW_V2_OPTION_FIELDS:
+        value = _traecode_option(options, *aliases, default=None)
+        if value is not None:
+            body[wire_name] = copy.deepcopy(value)
+    if native_tools and isinstance(tools, list) and tools:
+        converted_tools = _traecode_tool_definitions(tools)
+        if converted_tools:
+            body["tools"] = converted_tools
+            choice = options.get("tool_choice")
+            if choice is not None:
+                body["tool_choice"] = copy.deepcopy(choice)
+            if options.get("parallel_tool_calls") is not None:
+                body["parallel_tool_calls"] = bool(options["parallel_tool_calls"])
+    return body
+
+
+def build_traecode_headers(
+    base_url: str,
+    token: str,
+    raw_model: RawModel,
+    request_id: str,
+    options: Optional[Mapping[str, Any]] = None,
+    *,
+    session_id: str = "",
+    raw_chat_function: str = TRAECODE_DEFAULT_FUNCTION,
+) -> dict[str, str]:
+    """Build the TraeCode CN header set without leaking TraeWork ``Extra``."""
+
+    options = options or {}
+    bound_user_id = _traecode_option(
+        options,
+        "_auth_user_id",
+        "auth_user_id",
+        "_billing_id",
+        "billing_id",
+        "_account_id",
+        "account_id",
+        default=None,
+    )
+    # Session options can outlive a credential refresh or account rotation.
+    # When the token is a real JWT its immutable identity is authoritative;
+    # opaque legacy tokens retain the existing explicit-binding fallback.
+    user_id = str(_jwt_identity(token) or bound_user_id or auth.get_user_id() or "")
+    try:
+        from . import trae_client
+
+        headers = dict(
+            trae_client.build_headers(
+                token_override=token,
+                user_id_override=user_id,
+            )
+        )
+    except Exception:
+        headers = {}
+
+    def put(name: str, value: Any) -> None:
+        for key in list(headers):
+            if key.lower() == name.lower():
+                del headers[key]
+        headers[name] = str(value)
+
+    version = str(
+        _traecode_option(
+            options,
+            "traecode_ide_version",
+            "traeCodeIdeVersion",
+            "ide_version",
+            "ideVersion",
+            default=None,
+        )
+        or os.environ.get("TRAE_CODE_IDE_VERSION")
+        or TRAECODE_IDE_VERSION
+    )
+    version_code = str(
+        _traecode_option(
+            options,
+            "traecode_ide_version_code",
+            "traeCodeIdeVersionCode",
+            "ide_version_code",
+            "ideVersionCode",
+            default=None,
+        )
+        or os.environ.get("TRAE_CODE_IDE_VERSION_CODE")
+        or TRAECODE_IDE_VERSION_CODE
+    )
+    app_id = str(
+        _traecode_option(
+            options,
+            "traecode_app_id",
+            "traeCodeAppId",
+            "app_id",
+            "appId",
+            default=None,
+        )
+        or os.environ.get("TRAE_CODE_APP_ID")
+        or TRAECODE_APP_ID
+    )
+    trace_id = secrets.token_hex(16)
+    put("Authorization", f"Cloud-IDE-JWT {token}")
+    put("X-Cloudide-Token", token)
+    put("X-Ide-Token", token)
+    put("Content-Type", "application/json")
+    put("Accept", "text/event-stream")
+    put("Connection", "keep-alive")
+    put("X-App-Id", app_id)
+    put(
+        "X-App-Version",
+        _traecode_context_value(
+            options,
+            "app_version",
+            "appVersion",
+            default="default",
+        ),
+    )
+    put("X-App-Version-Code", version_code)
+    put("X-Ide-Version", version)
+    put("X-Ide-Version-Code", version_code)
+    put(
+        "X-Ide-Version-Type",
+        _traecode_context_value(
+            options,
+            "ide_version_type",
+            "ideVersionType",
+            "version_type",
+            "versionType",
+            default="stable",
+        ),
+    )
+    put(
+        "X-Plugin-Channel",
+        _traecode_context_value(
+            options,
+            "plugin_channel",
+            "pluginChannel",
+            "channel",
+            default="desktop",
+        ),
+    )
+    put("X-App-Function", raw_chat_function)
+    put("X-Ide-Function", raw_chat_function)
+    put("X-Request-Id", request_id)
+    put("X-Custom-Trace-Id", trace_id)
+    put("X-Flow-Traceparent", f"04-{trace_id}-{secrets.token_hex(8)}-01")
+    put(
+        "request-traffic-type",
+        _traecode_context_value(
+            options,
+            "request_traffic_type",
+            "requestTrafficType",
+            default="prod",
+        ),
+    )
+
+    risk_headers = (
+        (
+            "X-Device-Cpu",
+            ("cpu", "device_cpu", "deviceCpu"),
+        ),
+        (
+            "X-Device-Id",
+            (
+                "guaranteedDeviceId",
+                "guaranteed_device_id",
+                "device_id",
+                "deviceId",
+            ),
+        ),
+        ("X-Machine-Id", ("machine_id", "machineId")),
+        ("X-Device-Brand", ("device_model", "deviceModel", "device_brand")),
+        ("X-Device-Type", ("os_name", "osName", "device_type", "deviceType")),
+        ("X-Os-Version", ("os_version", "osVersion")),
+    )
+    for header_name, aliases in risk_headers:
+        value = _traecode_context_value(options, *aliases, default=None)
+        if value not in (None, ""):
+            put(header_name, _encoded_header_value(value))
+
+    web_id = _traecode_context_value(options, "web_id", "webId", default=None)
+    if web_id not in (None, ""):
+        put("X-Web-Id", web_id)
+
+    ppe_env = _traecode_context_value(
+        options,
+        "ppe_env_name",
+        "ppeEnvName",
+        "tt_env",
+        "ttEnv",
+        "x_tt_env",
+        default=None,
+    )
+    if ppe_env not in (None, ""):
+        put("X-Tt-Env", ppe_env)
+        put(
+            "X-Use-Ppe",
+            _traecode_context_value(
+                options,
+                "use_ppe",
+                "usePpe",
+                "x_use_ppe",
+                default="1",
+            ),
+        )
+
+    authorized_services = _authorized_services_header(
+        _traecode_context_value(
+            options,
+            "authorized_services",
+            "authorizedServices",
+            "trae_authorized_services",
+            default=None,
+        )
+    )
+    if authorized_services:
+        put("X-Trae-Authorized-Services", authorized_services)
+    if user_id:
+        put("X-Uid", user_id)
+    else:
+        for key in list(headers):
+            if key.lower() == "x-uid":
+                del headers[key]
+    # TraeCode's current IDE chain models selection in CustomModel/body.  An
+    # explicit compatibility switch can add the legacy Extra envelope for
+    # older gateways without making it part of the default protocol.
+    if session_id and _traecode_option(options, "_traecode_include_extra", default=False):
+        extra = {
+            "agent_loop_id": session_id,
+            "api_host": base_url,
+            "api_key": token,
+            "base_url": f"{base_url}/trae-cli/api/v1/llm/proxy",
+            "config_name": raw_model.config_name,
+            "config_source": raw_model.config_source,
+            "display_name": raw_model.display_name,
+            "model_name": raw_model.raw_model_name,
+            "real_api_key": "",
+            "real_base_url": "",
+            "session_id": session_id,
+            "user_prompt_submit_id": session_id,
+        }
+        put("Extra", json.dumps(extra, ensure_ascii=True, separators=(",", ":")))
+    else:
+        for key in list(headers):
+            if key.lower() == "extra":
+                del headers[key]
+    custom_headers = _traecode_option(options, "headers", "traecode_headers", default={})
+    if isinstance(custom_headers, Mapping):
+        for key, value in custom_headers.items():
+            if str(key).strip().lower() in _TRAECODE_PROTECTED_HEADERS:
+                logger.warning(
+                    "ignored TraeCode custom override for protected header %s",
+                    key,
+                )
+                continue
+            put(str(key), value)
+    return headers
+
+
+def resolve_traecode_base_url(options: Optional[Mapping[str, Any]] = None) -> str:
+    """Resolve the TraeCode model gateway host, stripping stale API paths."""
+
+    options = options or {}
+    configured = _traecode_option(
+        options,
+        "traecode_base_url",
+        "traeCodeBaseUrl",
+        "model_base_url",
+        "base_url",
+        "baseURL",
+        default=None,
+    )
+    base = (
+        configured
+        or os.environ.get("TRAE_CODE_BASE_URL")
+        or os.environ.get("TRAE_MODEL_API_HOST")
+    )
+    if not base:
+        # ``TRAE_API_HOST`` is normally the OAuth/entitlement host
+        # (api.trae.cn).  Only reuse it when it is already a model gateway;
+        # otherwise it would turn a valid raw request into an auth-host 404.
+        candidate = str(os.environ.get("TRAE_API_HOST") or "").strip()
+        if "mchost.guru" in candidate or "trae-api-" in candidate:
+            base = candidate
+    if not base:
+        base = TRAECODE_DEFAULT_GATEWAY
+    base = str(base).rstrip("/")
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parsed = urlsplit(base)
+        path = parsed.path.rstrip("/")
+        known_prefixes = ("/api/remote", "/api/agent", "/api/ide", "/trae-cli")
+        if any(path.startswith(prefix) for prefix in known_prefixes):
+            base = urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")
+    except ValueError:
+        pass
+    return base
+
+
+def resolve_traecode_base_urls(
+    options: Optional[Mapping[str, Any]] = None,
+) -> list[str]:
+    """Return the TraeCode gateway candidates in request order.
+
+    The desktop client receives ``trae-api-cn.mchost.guru`` from boot config;
+    ttnet may internally dispatch that hostname to ``api5-normal``.  A relay
+    cannot reproduce that client-side dispatch table, so retry the known
+    alternate host when the configured gateway rejects the HTTP request.
+    Custom gateways remain isolated and are never replaced by these presets.
+    """
+
+    options = options or {}
+    primary = resolve_traecode_base_url(options)
+    if not primary:
+        return []
+    configured = _traecode_option(
+        options,
+        "traecode_base_url",
+        "traeCodeBaseUrl",
+        "model_base_url",
+        "base_url",
+        "baseURL",
+        default=None,
+    )
+    env_configured = (
+        os.environ.get("TRAE_CODE_BASE_URL")
+        or os.environ.get("TRAE_MODEL_API_HOST")
+    )
+    explicit = str(configured or env_configured or "").strip()
+    if explicit and not _traecode_option(
+        options, "_traecode_gateway_fallback", default=True
+    ):
+        return [primary]
+    known = (
+        "https://trae-api-cn.mchost.guru",
+        "https://api5-normal.mchost.guru",
+    )
+    normalized = primary.rstrip("/")
+    if normalized not in known:
+        return [primary]
+    return [primary] + [candidate for candidate in known if candidate != normalized]
+
+
+async def send_traecode_chat_request(
+    messages: list[dict[str, Any]],
+    model: str,
+    stream: bool = True,
+    options: Optional[dict[str, Any]] = None,
+) -> RawChatResponse:
+    """Send a TraeCode IDE/SOLO raw request with v1 endpoint fallback.
+
+    ``RawChatResponse`` deliberately matches the legacy raw transport wrapper,
+    so the existing SSE translator can consume both protocols while callers
+    choose the protocol explicitly via ``_traecode_raw_chat_function``.
+    """
+
+    options = dict(options or {})
+    token = str(options.get("_auth_token") or "").strip()
+    if not token:
+        await auth.maybe_refresh()
+        token = str(auth.get_token() or "").strip()
+    if not token:
+        raise RuntimeError("No Cloud-IDE-JWT token available for TraeCode raw chat")
+
+    base_urls = resolve_traecode_base_urls(options)
+    if not base_urls:
+        raise RuntimeError("No TraeCode model gateway configured")
+    solo = bool(_traecode_option(options, "_traecode_solo", "traecode_solo", "solo", default=False))
+    raw_chat_function = traecode_raw_chat_function(options, solo=solo)
+    raw_model = await resolve_traecode_model_for_request(model, options)
+    session_id = traecode_session_id(raw_model, options, raw_chat_function)
+    body_options = dict(options)
+    body_options.setdefault("_traecode_solo", solo)
+    body_options.setdefault("_traecode_raw_chat_function", raw_chat_function)
+    body_options.setdefault("_traecode_wire_stream", True)
+    # ``build_traecode_chat_body`` is also a public synchronous helper.  Feed
+    # it the result of the async/live resolver explicitly so a model catalog
+    # entry such as ``config_name=deepseek-v4.1-flash`` cannot be replaced by
+    # the offline alias resolver (or by the provider default, often Kimi).
+    body_options.setdefault("traecode_config_name", raw_model.config_name)
+    body_options.setdefault("traecode_model_name", raw_model.raw_model_name)
+    body_options.setdefault("display_name", raw_model.display_name)
+    body_options.setdefault("config_source", raw_model.config_source)
+    body = build_traecode_chat_body(
+        messages,
+        model,
+        stream,
+        body_options,
+        session_id=session_id,
+    )
+    request_id = str(uuid.uuid4())
+    headers = build_traecode_headers(
+        base_urls[0],
+        token,
+        raw_model,
+        request_id,
+        options,
+        session_id=session_id,
+        raw_chat_function=raw_chat_function,
+    )
+    logger.info(
+        "traecode raw request id=%s gateways=%s endpoint=%s function=%s model=%s messages=%d tools=%d",
+        str(options.get("_relay_request_id") or request_id),
+        ",".join(base_urls),
+        TRAECODE_RAW_CHAT_ENDPOINT,
+        raw_chat_function,
+        raw_model.raw_model_name,
+        len(body.get("messages") or []),
+        len(_traecode_tool_definitions(options.get("tools") or options.get("_inherited_tools"))),
+    )
+
+    release_session = await _acquire_raw_session_gate(
+        session_id,
+        str(options.get("_account_id") or ""),
+        token,
+        str(options.get("_account_slot_reservation_id") or ""),
+    )
+    timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
+    endpoints = [TRAECODE_RAW_CHAT_ENDPOINT]
+    if bool(_traecode_option(options, "_traecode_allow_v1_fallback", default=True)):
+        endpoints.append(TRAECODE_RAW_CHAT_FALLBACK_ENDPOINT)
+
+    def open_stream() -> RawChatResponse:
+        """Open v2/v1 synchronously and own all resources on the worker thread.
+
+        ``httpx.Client.send`` cannot be cancelled safely once a socket is in
+        flight. Keeping client creation, fallback, and cleanup in this worker
+        means a cancelled public request never closes the client or releases
+        the model gate while the worker still owns it.
+        """
+
+        client: Optional[httpx.Client] = None
+        response: Optional[httpx.Response] = None
+        detail = ""
+        try:
+            client = httpx.Client(timeout=timeout, http2=False)
+            for base_url in base_urls:
+                request_headers = headers
+                if base_url != base_urls[0]:
+                    # Keep the model/session envelope identical while
+                    # updating the host-dependent compatibility headers.
+                    request_headers = build_traecode_headers(
+                        base_url,
+                        token,
+                        raw_model,
+                        request_id,
+                        options,
+                        session_id=session_id,
+                        raw_chat_function=raw_chat_function,
+                    )
+                for endpoint in endpoints:
+                    try:
+                        request = client.build_request(
+                            "POST",
+                            base_url + endpoint,
+                            headers=request_headers,
+                            json=body,
+                        )
+                        response = client.send(request, stream=True)
+                    except httpx.RequestError as exc:
+                        detail = str(exc)[:800]
+                        logger.warning(
+                            "traecode raw transport failed id=%s base=%s endpoint=%s error=%s",
+                            str(options.get("_relay_request_id") or request_id),
+                            base_url,
+                            endpoint,
+                            detail,
+                        )
+                        continue
+                    if response.status_code == 200:
+                        return RawChatResponse(
+                            response=response,
+                            client=client,
+                            auth_token=token,
+                            release_session=release_session,
+                        )
+                    status_code = response.status_code
+                    detail = ""
+                    rate_limit_code = 429 if status_code == 429 else None
+                    try:
+                        # Read the body before closing it so the connection can
+                        # be reused for the next host/path candidate.
+                        try:
+                            response.read()
+                            detail = response.text[:800]
+                        except httpx.RequestError as exc:
+                            detail = str(exc)[:800]
+                        if rate_limit_code is None:
+                            try:
+                                payload = response.json()
+                            except (httpx.ResponseNotRead, ValueError):
+                                payload = None
+                            if isinstance(payload, Mapping):
+                                nested = payload.get("error")
+                                sources = [payload]
+                                if isinstance(nested, Mapping):
+                                    sources.append(nested)
+                                rate_limit_code = next(
+                                    (
+                                        source[key]
+                                        for source in sources
+                                        for key in ("code", "error_code", "errorCode")
+                                        if str(source.get(key, "")).strip()
+                                        == "3004"
+                                    ),
+                                    None,
+                                )
+                    finally:
+                        response.close()
+                        response = None
+                    logger.warning(
+                        "traecode raw endpoint failed id=%s base=%s endpoint=%s status=%s detail=%s",
+                        str(options.get("_relay_request_id") or request_id),
+                        base_url,
+                        endpoint,
+                        status_code,
+                        detail,
+                    )
+                    if rate_limit_code is not None:
+                        # Every candidate uses the same credential, so probing
+                        # another host/path only repeats an account-level limit.
+                        raise TraeCodeRateLimitError(
+                            status_code, rate_limit_code, detail
+                        )
+            raise RuntimeError(
+                "TraeCode raw chat request failed on "
+                + ", ".join(
+                    f"{base}{endpoint}"
+                    for base in base_urls
+                    for endpoint in endpoints
+                )
+                + (f": {detail}" if detail else "")
+            )
+        except BaseException:
+            if response is not None:
+                response.close()
+            if client is not None:
+                client.close()
+            release_session()
+            raise
+
+    try:
+        open_task = asyncio.create_task(asyncio.to_thread(open_stream))
+    except BaseException:
+        release_session()
+        raise
+
+    try:
+        # Shield the worker just like the legacy raw path. If the public
+        # request is cancelled while headers are pending, the worker keeps
+        # ownership of the client and session gate until it completes.
+        return await asyncio.shield(open_task)
+    except asyncio.CancelledError:
+        def close_cancelled_open(task: asyncio.Task[RawChatResponse]) -> None:
+            try:
+                pending_response = task.result()
+            except BaseException:
+                # ``open_stream`` releases the gate on every internal error.
+                # The release closure is idempotent, so this is safe for
+                # cancellation races where the worker has already failed.
+                release_session()
+                return
+            try:
+                pending_response.close()
+            except Exception as exc:
+                logger.warning("traecode cancelled response cleanup failed: %s", exc)
+
+        open_task.add_done_callback(close_cancelled_open)
+        raise
+    except BaseException:
+        # ``open_stream`` owns cleanup for worker failures. Keep this
+        # idempotent fallback for task/executor setup errors.
+        release_session()
+        raise
 _KNOWN_MODELS = {
     # These names are the exact raw ids used by TraeWork's bundled client.
     "auto": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
     "coding": RawModel("glm-5.1", "glm-5__v2", "GLM-5.1"),
-    # The raw transport uses the shared GLM v2 model id even though the
-    # public config is glm-5.2 (captured TraeWork Extra/body contract).
-    "glm-5.2": RawModel("glm-5.2", "glm-5__v2", "GLM-5.2"),
+    # GLM-5.2 has its own raw provider id.  ``glm-5__v2`` belongs to the
+    # GLM-5.1/coding config; sending it for GLM-5.2 lets the upstream bind the
+    # session to its default provider (observed as an unexpected Kimi model).
+    "glm-5.2": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
     # glm-5.3 is resolved against the account model list when available.
     "glm-5.3": RawModel("glm-5.3", "glm-5.3", "GLM-5.3"),
     "glm-5.1": RawModel("glm-5.1", "glm-5__v2", "GLM-5.1"),
@@ -182,8 +1601,8 @@ _KNOWN_MODELS = {
 
 
 _DISPLAY_MODEL_ALIASES = {
-    # Trae's web UI labels are not always the config names expected by
-    # llm_utils_chat. Keep an offline fallback for the current CN labels.
+    # Trae's web UI labels are not always the config names expected by the
+    # raw transport. Keep an offline fallback for current CN labels.
     "deepseek-v4-pro 正式版": "DeepSeek-V4-Pro-Official",
     "deepseek-v4-flash 正式版": "DeepSeek-V4-Flash-Official",
     "seed-2.1-pro": "Doubao-Seed-2.1-Pro",
@@ -403,9 +1822,54 @@ def raw_session_id(
 
 
 def resolve_raw_base_url(options: Optional[Mapping[str, Any]] = None) -> str:
+    """Resolve the TraeWork raw gateway host.
+
+    The settings API stores the selected native gateway separately as
+    ``model_base_url``.  Prefer that value when present; otherwise honor the
+    Work-specific environment and retain the legacy diagnostic raw base.
+    """
+
     options = options or {}
-    configured = _option(options, "base_url", "baseURL")
-    base = configured or os.environ.get("TRAE_RAW_BASE_URL")
+    mode = str(
+        _option(options, "_upstream_mode", "_trae_mode", "upstream_mode", default="")
+        or ""
+    ).strip().lower()
+    configured_model = _option(
+        options,
+        "model_base_url",
+        "modelBaseUrl",
+        "traework_base_url",
+        "traeWorkBaseUrl",
+    )
+    configured_raw = _option(
+        options,
+        "raw_base_url",
+        "rawBaseUrl",
+        "work_base_url",
+        "workBaseUrl",
+        "base_url",
+        "baseURL",
+    )
+    work_mode = mode in {"work", "work-agent", "traework", "traework-native", "native"}
+    if work_mode:
+        # ``model_base_url`` is the persisted model gateway for the Work
+        # product. Keep it scoped to Work so a stale shared setting cannot
+        # redirect a Trae raw/enterprise request to the TraeCode host.
+        base = (
+            configured_model
+            or configured_raw
+            or os.environ.get("TRAE_WORK_BASE_URL")
+            or os.environ.get("TRAE_MODEL_API_HOST")
+            or os.environ.get("TRAE_RAW_BASE_URL")
+        )
+    else:
+        # Raw/diagnostic mode has its own gateway override. Explicit raw
+        # options always win, while Work/TraeCode environment variables are
+        # deliberately ignored to avoid cross-product host contamination.
+        base = (
+            configured_raw
+            or os.environ.get("TRAE_RAW_BASE_URL")
+        )
     if not base:
         api_host = os.environ.get("TRAE_API_HOST") or ""
         if not api_host:
@@ -413,13 +1877,38 @@ def resolve_raw_base_url(options: Optional[Mapping[str, Any]] = None) -> str:
                 api_host = str(getattr(auth.get_auth(), "host", "") or "")
             except Exception:
                 api_host = ""
-        # www/api.trae.com.cn is the account/auth host and returns 404 for
-        # llm_utils_chat. Only reuse TRAE_API_HOST when it already names the
-        # model gateway used by the Trae client.
+        # www/api.trae.com.cn is the account/auth host and is not a model
+        # gateway. Only reuse TRAE_API_HOST when it already names the model
+        # gateway used by the Trae client.
         if "mchost.guru" in api_host or "trae-api-" in api_host:
             base = api_host
     base = base or "https://trae-api-cn.mchost.guru"
-    return str(base).rstrip("/")
+    return _strip_raw_gateway_path(str(base))
+
+
+def _strip_raw_gateway_path(value: str) -> str:
+    """Strip known API paths from a configured native gateway URL."""
+
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return text
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    path = parsed.path.rstrip("/")
+    known_prefixes = (
+        "/api/remote",
+        "/api/ide",
+        "/api/agent",
+        "/trae-cli",
+        "/api/v1/commercial",
+    )
+    if any(path.startswith(prefix) for prefix in known_prefixes):
+        path = ""
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
 
 def _mapping_value(value: Any, *names: str) -> Any:
@@ -618,12 +2107,46 @@ def _content_to_text(content: Any) -> str:
                 nested = renderer_block_text(block)
                 if nested:
                     parts.append(nested)
-            elif block.get("type") in ("image", "image_url", "file"):
-                parts.append(f"[Unsupported {block.get('type')} input omitted]")
+            elif images.is_image_part(block) or str(block.get("type") or "") == "image":
+                converted = images.to_renderer_block(block)
+                parts.append(images.describe(converted) if converted else "[image omitted]")
+            elif block.get("type") == "file":
+                parts.append("[Unsupported file input omitted]")
         return "\n".join(part for part in parts if part)
     if isinstance(content, Mapping):
         return json.dumps(content, ensure_ascii=False, default=str)
     return str(content)
+
+
+def _without_native_images(content: Any) -> Any:
+    """Drop image parts that :func:`_native_image_blocks` forwards natively."""
+
+    if not isinstance(content, list):
+        return content
+    kept: list[Any] = []
+    for part in content:
+        if isinstance(part, Mapping):
+            if images.is_image_part(part) or str(part.get("type") or "") == "image":
+                continue
+        kept.append(part)
+    return kept
+
+
+def _native_image_blocks(content: Any) -> list[dict[str, Any]]:
+    """Return renderer media blocks for any images in one message's content."""
+
+    if not isinstance(content, list):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, Mapping):
+            continue
+        if not images.is_image_part(part) and str(part.get("type") or "") != "image":
+            continue
+        converted = images.to_renderer_block(part)
+        if converted:
+            blocks.append(converted)
+    return blocks
 
 
 def _normalized_tools(tools: Any) -> list[dict[str, Any]]:
@@ -1390,7 +2913,12 @@ def build_raw_messages(
                 if candidate not in (None, "", [], {}):
                     content = candidate
                     break
-        text = _content_to_text(content)
+        image_blocks = _native_image_blocks(content)
+        # The native content channel already carries the media block, so the
+        # flattened text must not repeat a placeholder for the same image.
+        text = _content_to_text(
+            _without_native_images(content) if image_blocks else content
+        )
         renderer_results = _renderer_tool_result_blocks(content)
         # ZCode may replay a truncated relay history preamble as assistant
         # text.  Forwarding that residue to Trae makes the model echo it again
@@ -1430,7 +2958,15 @@ def build_raw_messages(
                 text = "\n\n".join(part for part in (text, call_context) if part)
         native_message: dict[str, Any] = {"role": role}
         if text:
-            native_message["content"] = [{"type": "text", "text": text}]
+            native_message["content"] = [
+                {"type": "text", "text": text},
+                *image_blocks,
+            ]
+        elif image_blocks:
+            # A message whose only payload is an image still has to reach the
+            # multimodal model; the raw transport carries media as renderer
+            # ``image_url`` blocks beside (or instead of) text.
+            native_message["content"] = image_blocks
         elif role in ("system", "user"):
             continue
         if role == "assistant" and not text:
@@ -1652,7 +3188,12 @@ async def send_raw_chat_request(
     )
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
 
-    release_session = await _acquire_raw_session_gate(upstream_session_id)
+    release_session = await _acquire_raw_session_gate(
+        upstream_session_id,
+        str(options.get("_account_id") or ""),
+        token,
+        str(options.get("_account_slot_reservation_id") or ""),
+    )
 
     def open_stream() -> RawChatResponse:
         client: Optional[httpx.Client] = None
@@ -1706,8 +3247,8 @@ async def send_raw_chat_request(
     except asyncio.CancelledError:
         # ``to_thread`` cannot cancel a synchronous httpx send already in
         # progress. Close the response as soon as it materializes so the
-        # model-bound gate is still released without allowing an overlapping
-        # request on the same raw conversation.
+        # occupied model-request slot is not made available before the worker
+        # has finished using the raw conversation.
         def close_cancelled_open(task: asyncio.Task[RawChatResponse]) -> None:
             try:
                 wrapped = task.result()

@@ -2,14 +2,23 @@
 """web_login.py - Trae CN Relay 本地授权回调监听器
 
 使用方式:
-  python web_login.py [--relay http://127.0.0.1:8000] [--port 8765]
+  python web_login.py [--relay http://<relay-host>:<port>] [--port 8765]
+
+--relay 的取值优先级（一般不需要手动填写）:
+  1. 命令行 --relay
+  2. 环境变量 TRAE_RELAY_URL
+  3. 从 relay 网页端「下载授权助手」时自动写入的部署地址
+  4. http://127.0.0.1:8000（本机默认部署）
 
 依赖: 仅用 Python 标准库。
 """
 
 import argparse
 import http.server
+import ipaddress
 import json
+import os
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -17,13 +26,71 @@ import uuid
 import webbrowser
 from pathlib import Path
 
+# ---- 部署默认值（由中转站下载接口按当前部署自动生成，手动运行也可用 --relay 覆盖）
+DEFAULT_RELAY_URL = "http://127.0.0.1:8000"
+DEFAULT_LISTENER_PORT = 8765
+DEFAULT_CLIENT_ID = "ono9krqynydwx5"
+DEFAULT_AUTH_URL = "https://www.trae.cn/authorization"
+
+
+def normalize_relay_url(value: str) -> str:
+    """Normalize a relay base URL, including an optional reverse-proxy prefix."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "http://" + raw
+    if len(raw) > 200 or any(
+        ord(char) < 32 or ord(char) > 126 or char in "!%\"'`$<>|&;(){}*?# ,\\"
+        for char in raw
+    ):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    if "@" in parsed.netloc or parsed.netloc.endswith(":") or parsed.query or parsed.fragment:
+        return ""
+    if port is not None and not 1 <= port <= 65535:
+        return ""
+    host = parsed.hostname.lower()
+    if ":" in host:
+        try:
+            host = f"[{ipaddress.IPv6Address(host)}]"
+        except ValueError:
+            return ""
+    elif not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", host):
+        return ""
+    path = parsed.path.rstrip("/")
+    if path and (
+        not re.fullmatch(r"/[A-Za-z0-9._~/-]*", path)
+        or any(part in (".", "..") for part in path.split("/"))
+    ):
+        return ""
+    netloc = f"{host}:{port}" if port is not None else host
+    return f"{parsed.scheme}://{netloc}{path}"
+
+
+def default_relay_url() -> str:
+    for candidate in (
+        os.environ.get("TRAE_RELAY_URL", ""),
+        DEFAULT_RELAY_URL,
+    ):
+        normalized = normalize_relay_url(candidate)
+        if normalized:
+            return normalized
+    return normalize_relay_url(DEFAULT_RELAY_URL) or "http://127.0.0.1:8000"
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Trae CN Relay 本地授权回调监听器")
-    parser.add_argument("--relay", default="http://127.0.0.1:8000", help="Relay 地址")
-    parser.add_argument("--port", type=int, default=8765, help="本地监听端口")
-    parser.add_argument("--client-id", default="ono9krqynydwx5", help="Trae Client ID")
-    parser.add_argument("--auth-url", default="https://www.trae.cn/authorization", help="Trae 授权 URL")
+    parser.add_argument("--relay", default=default_relay_url(), help="Relay 地址")
+    parser.add_argument("--port", type=int, default=DEFAULT_LISTENER_PORT, help="本地监听端口")
+    parser.add_argument("--client-id", default=DEFAULT_CLIENT_ID, help="Trae Client ID")
+    parser.add_argument("--auth-url", default=DEFAULT_AUTH_URL, help="Trae 授权 URL")
     parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     return parser.parse_args()
 
@@ -64,7 +131,7 @@ def parse_oauth_params(query: dict) -> dict:
     if not token and refresh:
         exchange = exchange_refresh_token(
             refresh_token=refresh,
-            client_id=client_id or "ono9krqynydwx5",
+            client_id=client_id or getattr(RelayAuthHandler, "client_id", DEFAULT_CLIENT_ID),
             host=host,
         )
         if exchange.get("token"):
@@ -196,9 +263,9 @@ def forward_to_relay(relay_url: str, creds: dict) -> tuple[bool, str]:
 
 
 class RelayAuthHandler(http.server.BaseHTTPRequestHandler):
-    relay_url = "http://192.168.5.246:8000"
-    client_id = "ono9krqynydwx5"
-    auth_url = "https://www.trae.cn/authorization"
+    relay_url = DEFAULT_RELAY_URL
+    client_id = DEFAULT_CLIENT_ID
+    auth_url = DEFAULT_AUTH_URL
 
     def log_message(self, fmt, *args):
         pass  # 不输出请求日志
@@ -231,6 +298,8 @@ code {{background:#252836;padding:1px 6px;border-radius:4px;font-size:12px}}
     def _index_page(self) -> str:
         port = self.server.server_address[1]
         relay = self.relay_url
+        client_id_js = json.dumps(self.client_id, ensure_ascii=False).replace("<", "\\u003c")
+        auth_url_js = json.dumps(self.auth_url, ensure_ascii=False).replace("<", "\\u003c")
         return self._html(f"""
 <h1>Trae CN Relay 授权</h1>
 <p>
@@ -257,12 +326,12 @@ function buildAuthUrl(){{
   var mid = randomHex(32), did = randomDigits(19), tid = state.traceId;
   var p = new URLSearchParams({{
     login_version:'1',auth_from:'solo',login_channel:'native_ide',plugin_version:'2.3.24254',
-    auth_type:'local',client_id:'{self.client_id}',redirect:'0',login_trace_id:tid,
+    auth_type:'local',client_id:{client_id_js},redirect:'0',login_trace_id:tid,
     auth_callback_url:cb,machine_id:mid,device_id:did,x_device_id:did,x_machine_id:mid,
     x_device_brand:'Mac14,7',x_device_type:'mac',x_os_version:'macOS 26.4.1',x_env:'',
     x_app_version:'0.1.7',x_app_type:'stable',hide_saas_login:'true'
   }});
-  return '{self.auth_url}?'+p.toString();
+  return {auth_url_js}+'?'+p.toString();
 }}
 function startAuth(){{
   state.traceId = uuid();
@@ -337,9 +406,9 @@ function showMsg(id,text,ok){{ var el=document.getElementById(id);el.textContent
         self._send_html(html)
 
     def _oauth_result_page(self, success: bool, message: str, login_trace_id: str = "") -> str:
-        safe_msg = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
         safe_msg = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
-        safe_trace = login_trace_id.replace("&", "&amp;").replace("<", "&lt;")
+        js_message = json.dumps(message, ensure_ascii=False).replace("<", "\\u003c")
+        js_trace = json.dumps(login_trace_id, ensure_ascii=False).replace("<", "\\u003c")
         return self._html(f"""
 <div class="msg {'msg-ok' if success else 'msg-err'}">
   <h2 style="margin:0 0 8px;font-size:16px">{"成功" if success else "失败"}</h2>
@@ -349,8 +418,8 @@ function showMsg(id,text,ok){{ var el=document.getElementById(id);el.textContent
 (function(){{
   try {{
     if (!window.opener) return;
-    var msg = {{ type:'trae-relay-web-login', success:{"true" if success else "false"}, error:null, loginTraceId:'{safe_trace}' }};
-    if (!{str(success).lower()}) msg.error = '{safe_msg}';
+    var msg = {{ type:'trae-relay-web-login', success:{"true" if success else "false"}, error:null, loginTraceId:{js_trace} }};
+    if (!{str(success).lower()}) msg.error = {js_message};
     window.opener.postMessage(msg, '*');
   }} catch(e){{}}
   setTimeout(function(){{ window.close(); }}, {800 if success else 4000});
@@ -371,7 +440,11 @@ function showMsg(id,text,ok){{ var el=document.getElementById(id);el.textContent
 
 def main():
     args = parse_args()
-    relay = args.relay.rstrip("/")
+    relay = normalize_relay_url(args.relay)
+    if not relay:
+        raise SystemExit("Relay 地址无效，请从当前部署重新下载授权助手。")
+    if not 1 <= args.port <= 65535:
+        raise SystemExit("本机监听端口必须介于 1 和 65535。")
     port = args.port
     client_id = args.client_id
     auth_url = args.auth_url

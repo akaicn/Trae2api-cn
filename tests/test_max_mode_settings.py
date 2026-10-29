@@ -127,7 +127,12 @@ class MaxModeApiTests(unittest.TestCase):
         configs = {
             "glm-5.3": {
                 "max_mode": True,
-                "context_window_size": {"default": 200000, "max": [1000000]},
+                "context_window_size": {
+                    "default": 200000,
+                    "max": [200000, 1000000],
+                },
+                "prompt_max_tokens": 936000,
+                "max_tokens": 64000,
             },
             "kimi-k2.7-code": {"max_mode": False},
         }
@@ -175,6 +180,8 @@ class MaxModeTraceTests(unittest.TestCase):
             "config_source": 1,
             "max_mode": True,
             "context_window_size": {"default": 200000, "max": [1000000]},
+            "prompt_max_tokens": 936000,
+            "max_tokens": 64000,
         }
 
         async def run():

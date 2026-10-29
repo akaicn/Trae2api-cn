@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+from .model_limits import descriptor_reasoning_config
+
 LEVEL_ORDER = ("light", "high", "extra_high")
 
 _ALIASES = {
@@ -30,6 +32,9 @@ _ALIASES = {
     "very_high": "extra_high",
     "max": "extra_high",
     "maximum": "extra_high",
+    # Public API callers commonly use ``ultra`` for the highest setting.
+    # Trae's native model schema calls the same tier ``extra_high``.
+    "ultra": "extra_high",
 }
 
 
@@ -80,8 +85,8 @@ def requested_level(options: Optional[Mapping[str, Any]]) -> str:
 def supported_levels(custom_model: Optional[Mapping[str, Any]]) -> list[str]:
     if not isinstance(custom_model, Mapping):
         return []
-    config = custom_model.get("reasoning_effort_config")
-    if not isinstance(config, Mapping) or not config.get("support_thinking"):
+    config = descriptor_reasoning_config(custom_model)
+    if not config or config.get("support_thinking") is not True:
         return []
     options = config.get("options") or []
     levels = [normalize_level(item) for item in options if normalize_level(item)]

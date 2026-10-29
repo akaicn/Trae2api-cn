@@ -12,6 +12,7 @@ relay to execute commands on this machine.
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import logging
@@ -572,7 +573,8 @@ def strip_think_tags(text: str) -> str:
 
 
 _TEXT_TOOL_BLOCK_RE = re.compile(
-    r"<(?P<tag>opencode_tool_call|tool_use|tool_call|tool_cell|invoke|bash|read|write|edit|glob|grep|task)>"
+    r"<(?P<tag>opencode_tool_call|toolcall|tool_use|tool_call|tool_cell|invoke|bash|read|write|edit|glob|grep|task)"
+    r"(?P<attrs>\s+[^>]*)?>"
     r"(?P<body>[\s\S]*?)</(?P=tag)>",
     flags=re.IGNORECASE,
 )
@@ -581,8 +583,13 @@ _OPENCODE_BAD_CLOSE_RE = re.compile(
     r"\s*</arg_value>\s*[\"'`]*\s*", flags=re.IGNORECASE
 )
 _NAMED_TOOL_BLOCK_RE = re.compile(
-    r"<(?P<tag>tool_call|tool_cell|invoke)\s+name=[\"'](?P<name>[^\"']+)[\"']\s*>"
+    r"<(?P<tag>toolcall|tool_call|tool_cell|invoke)\s+name=[\"'](?P<name>[^\"']+)[\"']\s*>"
     r"(?P<body>[\s\S]*?)</(?P=tag)>",
+    flags=re.IGNORECASE,
+)
+_SELF_CLOSING_TOOL_BLOCK_RE = re.compile(
+    r"<(?P<tag>opencode_tool_call|toolcall|tool_use|tool_call|tool_cell|invoke)"
+    r"(?P<attrs>\s+[^>]*)?\s*/>",
     flags=re.IGNORECASE,
 )
 _KIMI_TOOL_PARAMETER_RE = re.compile(
@@ -620,6 +627,25 @@ _CLIENT_TOOL_HISTORY_CALL_LINE_RE = re.compile(
     flags=re.IGNORECASE | re.MULTILINE,
 )
 _TOOL_USE_TAG_RE = re.compile(r"<(?P<tag>[A-Za-z_][A-Za-z0-9_-]*)>\s*([\s\S]*?)\s*</(?P=tag)>", re.IGNORECASE)
+
+_GENERIC_TEXT_TOOL_TAGS = {
+    "opencode_tool_call",
+    "toolcall",
+    "tool_use",
+    "tool_call",
+    "tool_cell",
+    "invoke",
+}
+_ARG_KEY_VALUE_RE = re.compile(
+    r"(?:<arg_key>\s*)?([^<>\r\n]+?)\s*</arg_key>\s*"
+    r"<arg_value(?:\s+[^>]*)?>\s*([\s\S]*?)\s*</arg_value>",
+    flags=re.IGNORECASE,
+)
+_TOOL_ATTRIBUTE_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*"
+    r"(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
+    flags=re.IGNORECASE,
+)
 
 
 def _project_internal_protocol(text: str) -> tuple[str, list[int]]:
@@ -1083,14 +1109,34 @@ def _string_or_empty(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _json_default(value: Any) -> Any:
+    """Keep tool arguments JSON-shaped when adapters leak Python values."""
+
+    if isinstance(value, (set, frozenset)):
+        return sorted(value, key=repr)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _stringify_tool_arguments(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=_json_default,
+        )
     if value is None:
         return "{}"
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default,
+    )
 
 
 def _stable_tool_id(name: str, arguments: str, index: int = 0) -> str:
@@ -1156,7 +1202,11 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
         explicit_id = explicit_id is True
     name = (
         _string_or_empty(function.get("name"))
+        or _string_or_empty(function.get("toolCallName"))
+        or _string_or_empty(function.get("tool_call_name"))
         or _string_or_empty(raw.get("name"))
+        or _string_or_empty(raw.get("toolCallName"))
+        or _string_or_empty(raw.get("tool_call_name"))
         or _string_or_empty(raw.get("tool_name"))
         or _string_or_empty(raw.get("server_name"))
         or _string_or_empty(fallback_name)
@@ -1186,9 +1236,14 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
             key: value
             for key, value in raw.items()
             if key not in {
-                "id", "type", "name", "tool_name", "server_name", "index",
+                "id", "type", "name", "tool_name", "toolCallName",
+                "tool_call_name", "server_name", "index",
                 "function", "function_call", "functionCall",
                 "tool_call_id", "toolCallId",
+                "eventSessionId", "event_session_id", "sessionId",
+                "session_id", "planItemId", "plan_item_id",
+                "_event_session_id", "_plan_item_id",
+                "_correlation_key", "_upstream_tool_call_id",
             }
         }
     arguments_text = _stringify_tool_arguments(arguments)
@@ -1209,6 +1264,42 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
         "_explicit_index": raw.get("_explicit_index") is True
         or isinstance(raw.get("index"), int),
     }
+    event_session_id = (
+        _string_or_empty(raw.get("_event_session_id"))
+        or _string_or_empty(raw.get("eventSessionId"))
+        or _string_or_empty(raw.get("event_session_id"))
+        or _string_or_empty(raw.get("sessionId"))
+        or _string_or_empty(raw.get("session_id"))
+        or _string_or_empty(function.get("eventSessionId"))
+        or _string_or_empty(function.get("event_session_id"))
+        or _string_or_empty(function.get("sessionId"))
+        or _string_or_empty(function.get("session_id"))
+    )
+    plan_item_id = (
+        _string_or_empty(raw.get("_plan_item_id"))
+        or _string_or_empty(raw.get("planItemId"))
+        or _string_or_empty(raw.get("plan_item_id"))
+        or _string_or_empty(function.get("planItemId"))
+        or _string_or_empty(function.get("plan_item_id"))
+    )
+    upstream_tool_call_id = (
+        _string_or_empty(raw.get("_upstream_tool_call_id")) or raw_id
+    )
+    if event_session_id:
+        result["_event_session_id"] = event_session_id
+    if plan_item_id:
+        result["_plan_item_id"] = plan_item_id
+    if upstream_tool_call_id:
+        result["_upstream_tool_call_id"] = upstream_tool_call_id
+    correlation_key = _string_or_empty(raw.get("_correlation_key"))
+    if not correlation_key and (event_session_id or plan_item_id):
+        correlation_key = json.dumps(
+            [event_session_id, plan_item_id, upstream_tool_call_id, name],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    if correlation_key:
+        result["_correlation_key"] = correlation_key
     arguments_mode = raw.get("_arguments_mode")
     if arguments_mode in {"delta", "snapshot"}:
         result["_arguments_mode"] = arguments_mode
@@ -1279,8 +1370,9 @@ def deduplicate_tool_calls(calls: list[dict]) -> list[dict]:
     snapshots: dict[str, int] = {}
     for call in calls:
         call_id = str(call.get("id") or "")
+        identity = str(call.get("_correlation_key") or call_id)
         signature = complete_tool_call_signature(call)
-        previous = completed.get(call_id) if call_id else None
+        previous = completed.get(identity) if identity else None
         if previous is not None and signature:
             if signature != complete_tool_call_signature(previous):
                 logger.warning(
@@ -1291,8 +1383,8 @@ def deduplicate_tool_calls(calls: list[dict]) -> list[dict]:
         # can be legitimate nested JSON, so leave assembly to the accumulator.
         if call.get("_arguments_mode") == "delta":
             kept.append(call)
-        elif call_id and call_id in snapshots:
-            previous_index = snapshots[call_id]
+        elif identity and identity in snapshots:
+            previous_index = snapshots[identity]
             previous_call = kept[previous_index]
             previous_args = str((previous_call.get("function") or {}).get("arguments") or "")
             current_args = str((call.get("function") or {}).get("arguments") or "")
@@ -1301,11 +1393,11 @@ def deduplicate_tool_calls(calls: list[dict]) -> list[dict]:
             ):
                 kept[previous_index] = call
         else:
-            if call_id:
-                snapshots[call_id] = len(kept)
+            if identity:
+                snapshots[identity] = len(kept)
             kept.append(call)
-        if call_id and signature:
-            completed[call_id] = call
+        if identity and signature:
+            completed[identity] = call
     return kept
 
 
@@ -1577,19 +1669,118 @@ def completed_tool_signatures(messages: Any) -> set[str]:
     return protected
 
 
+def _tool_json_candidates(raw: str) -> list[Any]:
+    """Return strict and narrowly repaired JSON values from tool text."""
+
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    candidates: list[str] = [text]
+    for match in re.finditer(r"[\{\[]", text):
+        start = match.start()
+        end = _find_json_end(text, start)
+        if end >= 0:
+            candidates.append(text[start:end])
+    for candidate in list(candidates):
+        repaired = re.sub(r",\s*([}\]])", r"\1", candidate)
+        if repaired != candidate:
+            candidates.append(repaired)
+    values: list[Any] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = candidate.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            value = json.loads(key)
+        except (TypeError, ValueError):
+            try:
+                # ZedeX accepts single-quoted JSON-like objects. Literal eval
+                # is safe for this narrow data-only conversion.
+                value = ast.literal_eval(key)
+            except (SyntaxError, ValueError, TypeError, MemoryError):
+                continue
+        if isinstance(value, (dict, list)):
+            values.append(value)
+    return values
+
+
+def _tool_attribute_values(attrs: str) -> tuple[str, dict[str, str]]:
+    """Parse ``name="Tool" path="..."`` attributes from tool text."""
+
+    name = ""
+    fields: dict[str, str] = {}
+    for match in _TOOL_ATTRIBUTE_RE.finditer(str(attrs or "")):
+        key = match.group(1).strip()
+        value = next(
+            (part for part in match.groups()[1:] if part is not None),
+            "",
+        )
+        if key.lower() == "name":
+            name = value.strip()
+        elif key.lower() not in {"id", "type"}:
+            fields[key] = value
+    return name, fields
+
+
+def _merge_tool_arguments(call: dict, fields: Mapping[str, Any]) -> dict:
+    """Merge opening-tag attributes into a normalized tool call."""
+
+    function = call.get("function")
+    if not isinstance(function, dict) or not fields:
+        return call
+    raw_arguments = function.get("arguments") or "{}"
+    try:
+        arguments = json.loads(raw_arguments)
+    except (TypeError, ValueError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    arguments.update(dict(fields))
+    function["arguments"] = json.dumps(
+        arguments, ensure_ascii=False, separators=(",", ":")
+    )
+    return call
+
+
 def _parse_text_tool_body(body: str, fallback_name: str = "", index: int = 0) -> Optional[dict]:
     raw = body.strip()
     if not raw:
         return None
     # Preferred format: a JSON object with name/tool and input/arguments.
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        parsed = None
-    if isinstance(parsed, dict):
-        call = normalize_tool_call(parsed, index=index, fallback_name=fallback_name)
-        if call:
-            return call
+    # Accept trailing commas, single quotes, and a short prose prefix.
+    for parsed in _tool_json_candidates(raw):
+        if isinstance(parsed, dict):
+            call = normalize_tool_call(parsed, index=index, fallback_name=fallback_name)
+            if call:
+                return call
+
+    # ZedeX-compatible ``arg_key``/``arg_value`` form:
+    # ``Read path</arg_key><arg_value>a.txt</arg_value>``.
+    arg_matches = list(_ARG_KEY_VALUE_RE.finditer(raw))
+    if arg_matches:
+        fields: dict[str, str] = {}
+        embedded_name = ""
+        for match in arg_matches:
+            key_text = match.group(1).strip()
+            value = match.group(2).strip()
+            if not key_text:
+                continue
+            # Some model builds omit the opening ``<arg_key>`` and put
+            # ``ToolName argumentName</arg_key>`` in the first field.
+            if not embedded_name and " " in key_text:
+                embedded_name, key_text = key_text.split(None, 1)
+            fields[key_text] = value
+        name = fallback_name if fallback_name.lower() not in _GENERIC_TEXT_TOOL_TAGS else ""
+        if not name:
+            prefix = re.sub(r"<[^>]+>", " ", raw[: arg_matches[0].start()]).strip()
+            name = embedded_name or (prefix.split() or [""])[0]
+        if name and fields:
+            return normalize_tool_call(
+                {"name": name, "arguments": fields},
+                index=index,
+            )
 
     # Trae XML format: <tool_name>Read</tool_name><input>{...}</input>.
     name_match = re.search(r"<(?:tool_name|server_name|name)>\s*([^<]+?)\s*</(?:tool_name|server_name|name)>", raw, re.I)
@@ -1613,6 +1804,30 @@ def _parse_text_tool_body(body: str, fallback_name: str = "", index: int = 0) ->
             index=index,
         )
 
+    # Attribute-style body, e.g. ``Read path="a.txt"``.  The same parser is
+    # also used for attributes captured from the opening XML tag below.
+    attr_name, attr_fields = _tool_attribute_values(raw)
+    if attr_name:
+        if attr_fields:
+            return normalize_tool_call(
+                {"name": attr_name, "arguments": attr_fields},
+                index=index,
+            )
+    else:
+        _, bare_fields = _tool_attribute_values(raw)
+        if bare_fields:
+            first_word = (raw.split(None, 1) or [""])[0].strip()
+            bare_name = (
+                first_word
+                if first_word and "=" not in first_word
+                else fallback_name
+            )
+            if bare_name and bare_name.lower() not in _GENERIC_TEXT_TOOL_TAGS:
+                return normalize_tool_call(
+                    {"name": bare_name, "arguments": bare_fields},
+                    index=index,
+                )
+
     # Named XML fields, e.g. <command>dir</command> or <filePath>x</filePath>.
     if name:
         fields: dict[str, str] = {}
@@ -1624,7 +1839,7 @@ def _parse_text_tool_body(body: str, fallback_name: str = "", index: int = 0) ->
             if value:
                 fields[key] = value
         for field_match in re.finditer(
-            r"<(?:arg|parameter)\s+name=[\"']([^\"']+)[\"']\s*>\s*([\s\S]*?)\s*</(?:arg|parameter)>",
+            r"<(?:arg|parameter|param)\s+name=[\"']([^\"']+)[\"']\s*>\s*([\s\S]*?)\s*</(?:arg|parameter|param)>",
             raw,
             re.I,
         ):
@@ -1672,6 +1887,35 @@ def _recover_malformed_opencode_tool_blocks(
     return recovered
 
 
+def _inside_unclosed_text_tool_block(text: str, index: int) -> bool:
+    """Whether ``index`` is inside an unmatched serialized tool tag."""
+
+    prefix = str(text[:index] or "")
+    opens = list(
+        re.finditer(
+            r"<(?:opencode_tool_call|toolcall|tool_use|tool_call|tool_cell|invoke)"
+            r"(?:\s+[^>]*)?>",
+            prefix,
+            re.IGNORECASE,
+        )
+    )
+    if not opens:
+        return False
+    for opening in reversed(opens):
+        tag_match = re.match(r"<([A-Za-z_][A-Za-z0-9_-]*)", opening.group(0))
+        if not tag_match:
+            continue
+        tag = tag_match.group(1)
+        closing = re.search(
+            rf"</{re.escape(tag)}\s*>",
+            prefix[opening.end() :],
+            re.IGNORECASE,
+        )
+        if closing is None:
+            return True
+    return False
+
+
 def extract_text_tool_calls(content: Any) -> list[dict]:
     """Extract tool calls encoded in Trae's text/XML fallback formats."""
     text = _strip_internal_wait_residue(_content_to_text(content))
@@ -1688,11 +1932,46 @@ def extract_text_tool_calls(content: Any) -> list[dict]:
         occupied.append((start, end))
     for match in _TEXT_TOOL_BLOCK_RE.finditer(text):
         tag = match.group("tag").lower()
-        call = _parse_text_tool_body(match.group("body"), fallback_name=tag, index=len(calls))
+        attrs = match.group("attrs") or ""
+        attr_name, attr_fields = _tool_attribute_values(attrs)
+        if attr_name:
+            # Attribute-style tags carry the complete call in the opening
+            # element, optionally with an additional JSON/XML body.
+            call = _parse_text_tool_body(
+                match.group("body"),
+                fallback_name=attr_name,
+                index=len(calls),
+            )
+            if call is None:
+                call = normalize_tool_call(
+                    {"name": attr_name, "arguments": attr_fields or {}},
+                    index=len(calls),
+                )
+            if call and attr_fields:
+                call = _merge_tool_arguments(call, attr_fields)
+            if call:
+                calls.append(call)
+                occupied.append((match.start(), match.end()))
+            continue
+        fallback = attr_name or tag
+        call = _parse_text_tool_body(
+            match.group("body"),
+            fallback_name=fallback,
+            index=len(calls),
+        )
+        if call and attr_fields:
+            call = _merge_tool_arguments(call, attr_fields)
+        elif not call and attr_name and attr_fields:
+            call = normalize_tool_call(
+                {"name": attr_name, "arguments": attr_fields},
+                index=len(calls),
+            )
         if call:
             calls.append(call)
             occupied.append((match.start(), match.end()))
     for match in _NAMED_TOOL_BLOCK_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in occupied):
+            continue
         call = _parse_text_tool_body(match.group("body"), fallback_name=match.group("name"), index=len(calls))
         if call:
             calls.append(call)
@@ -1701,6 +1980,18 @@ def extract_text_tool_calls(content: Any) -> list[dict]:
         call = _parse_text_tool_body(
             match.group("body"),
             fallback_name=match.group("name"),
+            index=len(calls),
+        )
+        if call:
+            calls.append(call)
+            occupied.append((match.start(), match.end()))
+
+    for match in _SELF_CLOSING_TOOL_BLOCK_RE.finditer(text):
+        attr_name, attr_fields = _tool_attribute_values(match.group("attrs") or "")
+        if not attr_name or not attr_fields:
+            continue
+        call = normalize_tool_call(
+            {"name": attr_name, "arguments": attr_fields},
             index=len(calls),
         )
         if call:
@@ -1720,6 +2011,35 @@ def extract_text_tool_calls(content: Any) -> list[dict]:
         call = _parse_text_tool_body(match.group(1), index=len(calls))
         if call:
             calls.append(call)
+
+    # Mixed prose + JSON fallback used by ZedeX.  Restrict this to objects
+    # with an explicit tool name and argument container so ordinary answer
+    # JSON is not accidentally exposed as a client tool invocation.
+    for match in re.finditer(r"[\{\[]", text):
+        start = match.start()
+        if any(left <= start < right for left, right in occupied):
+            continue
+        if _inside_unclosed_text_tool_block(text, start):
+            continue
+        end = _find_json_end(text, start)
+        if end < 0:
+            continue
+        raw_json = text[start:end]
+        for parsed in _tool_json_candidates(raw_json):
+            if not isinstance(parsed, dict):
+                continue
+            name = parsed.get("name") or parsed.get("tool_name")
+            has_arguments = any(
+                key in parsed
+                for key in ("input", "params", "parameters", "arguments", "args")
+            )
+            if not isinstance(name, str) or not name.strip() or not has_arguments:
+                continue
+            call = normalize_tool_call(parsed, index=len(calls))
+            if call:
+                calls.append(call)
+                occupied.append((start, end))
+                break
 
     deduped: dict[str, dict] = {}
     for call in calls:
@@ -1826,8 +2146,35 @@ def _iter_native_tool_calls(result: dict) -> list[dict]:
             if candidates:
                 break
 
+    event_session_id = ""
+    for key in ("eventSessionId", "event_session_id", "sessionId", "session_id"):
+        value = result.get(key)
+        if value not in (None, ""):
+            event_session_id = str(value)
+            break
+    plan_item_id = ""
+    for key in ("planItemId", "plan_item_id", "planId", "plan_id"):
+        value = result.get(key)
+        if value not in (None, ""):
+            plan_item_id = str(value)
+            break
+    if not plan_item_id and (
+        "tool_call_info" in result
+        or "toolCallInfo" in result
+        or "thought" in result
+    ):
+        value = result.get("id")
+        if value not in (None, ""):
+            plan_item_id = str(value)
+
     calls: list[dict] = []
     for index, candidate in enumerate(candidates):
+        if isinstance(candidate, Mapping) and (event_session_id or plan_item_id):
+            candidate = dict(candidate)
+            if event_session_id:
+                candidate.setdefault("_event_session_id", event_session_id)
+            if plan_item_id:
+                candidate.setdefault("_plan_item_id", plan_item_id)
         call = normalize_tool_call(candidate, index=index)
         if call:
             calls.append(call)
@@ -1856,6 +2203,7 @@ def strip_tool_call_blocks(content: Any) -> str:
     text = _strip_internal_wait_residue(text)
     text = _TEXT_TOOL_BLOCK_RE.sub("", text)
     text = _NAMED_TOOL_BLOCK_RE.sub("", text)
+    text = _SELF_CLOSING_TOOL_BLOCK_RE.sub("", text)
     text = _KIMI_TOOL_PARAMETER_RE.sub("", text)
     recovered = _recover_malformed_opencode_tool_blocks(text, [])
     for _call, start, end in reversed(recovered):

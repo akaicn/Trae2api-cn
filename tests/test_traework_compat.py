@@ -1,3 +1,4 @@
+import base64
 import json
 import asyncio
 import unittest
@@ -5,6 +6,14 @@ import uuid
 from unittest.mock import patch
 
 from src import traework_compat
+
+
+def _jwt(payload):
+    def segment(value):
+        raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f'{segment({"alg": "none", "typ": "JWT"})}.{segment(payload)}.signature'
 
 
 def _parse_custom_sse(frames):
@@ -289,6 +298,101 @@ class TraeWorkCompatTests(unittest.TestCase):
         self.assertEqual(request.model, "glm-5.2")
         self.assertEqual(request.options["trae_raw_config_name"], "glm-5.2")
         self.assertEqual(request.options["trae_raw_model_name"], "glm-5.2__dev")
+
+    def test_normalize_inbound_preserves_trae344_raw_v2_fields_and_function(self):
+        metadata = {"trace": {"source": "client"}}
+        request = traework_compat.normalize_inbound_request(
+            {
+                "config_name": "glm-5.2",
+                "model_name": "glm-5.2__dev",
+                "raw_chat_function": "chat_v3",
+                "messages": [{"role": "user", "content": "hello"}],
+                "is_custom_model": False,
+                "Request": {"client_info": {"version": "3.4.4"}},
+                "metadata": metadata,
+                "request_seq": 0,
+                "estimate_prompt_tokens": False,
+                "queue_retry": False,
+                "reasoning_effort_level": "high",
+                "unknown_scheduler_state": {"drop": True},
+            },
+            headers={
+                "Authorization": "Cloud-IDE-JWT jwt-a",
+                "x-ide-token": "jwt-a",
+                "x-device-cpu": "AMD%20Ryzen",
+                "x-ide-version": "3.4.4",
+                "x-ide-version-code": "20260212",
+            },
+            path="/api/ide/v2/llm_raw_chat",
+        )
+
+        self.assertEqual(request.options["_traecode_raw_chat_function"], "chat_v3")
+        self.assertEqual(request.options["_traework_upstream_mode"], "raw")
+        self.assertFalse(request.options["is_custom_model"])
+        self.assertEqual(request.options["request_seq"], 0)
+        self.assertFalse(request.options["estimate_prompt_tokens"])
+        self.assertFalse(request.options["queue_retry"])
+        self.assertEqual(request.options["reasoning_effort_level"], "high")
+        self.assertNotIn("unknown_scheduler_state", request.options)
+        self.assertEqual(request.options["_auth_token"], "jwt-a")
+        self.assertEqual(request.options["traecode_ide_version"], "3.4.4")
+        self.assertEqual(request.options["traecode_ide_version_code"], "20260212")
+        self.assertEqual(request.options["client_context"]["cpu"], "AMD%20Ryzen")
+
+    def test_normalize_inbound_rejects_mismatched_cloud_ide_tokens(self):
+        with self.assertRaisesRegex(ValueError, "same account"):
+            traework_compat.normalize_inbound_request(
+                {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "raw_chat_function": "chat_v3",
+                },
+                headers={
+                    "Authorization": "Cloud-IDE-JWT jwt-a",
+                    "x-ide-token": "jwt-b",
+                },
+                path="/api/ide/v2/llm_raw_chat",
+            )
+
+    def test_normalize_inbound_accepts_refreshed_jwts_for_same_account(self):
+        authorization_token = _jwt(
+            {"data": {"id": "same-account"}, "issued_at": 1}
+        )
+        ide_token = _jwt(
+            {"data": {"id": "same-account"}, "issued_at": 2}
+        )
+        request = traework_compat.normalize_inbound_request(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "raw_chat_function": "chat_v3",
+            },
+            headers={
+                "Authorization": f"Cloud-IDE-JWT {authorization_token}",
+                "x-ide-token": ide_token,
+                "x-cloudide-token": ide_token,
+            },
+            path="/api/ide/v2/llm_raw_chat",
+        )
+
+        self.assertEqual(request.options["_auth_token"], authorization_token)
+        self.assertEqual(request.options["_auth_user_id"], "same-account")
+
+    def test_normalize_inbound_validates_x_cloudide_token_identity(self):
+        authorization_token = _jwt({"data": {"id": "account-a"}})
+        cloudide_token = _jwt({"data": {"id": "account-b"}})
+        with self.assertRaisesRegex(ValueError, "same account"):
+            traework_compat.normalize_inbound_request(
+                {
+                    "messages": [
+                        {"role": "user", "content": "hello"}
+                    ],
+                    "raw_chat_function": "chat_v3",
+                },
+                headers={
+                    "Authorization": f"Cloud-IDE-JWT {authorization_token}",
+                    "x-cloudide-token": cloudide_token,
+                },
+                path="/api/ide/v2/llm_raw_chat",
+            )
 
     def test_nested_options_keep_specific_values(self):
         request = traework_compat.normalize_inbound_request(
@@ -672,7 +776,7 @@ class TraeWorkCompatTests(unittest.TestCase):
         self.assertEqual("".join(item.get("reasoning_delta", "") for item in outputs), "Inspect files.")
         self.assertEqual(done["reasoning_content"], "Inspect files.")
 
-    def test_connectivity_response_reports_tool_and_reasoning_capabilities(self):
+    def test_connectivity_response_reports_tool_without_inventing_capabilities(self):
         response = traework_compat.connectivity_response(
             {"custom_model": {"config_name": "glm-5.3"}}
         )
@@ -683,7 +787,10 @@ class TraeWorkCompatTests(unittest.TestCase):
         self.assertFalse(response["model"]["is_preset"])
         self.assertTrue(response["model"]["is_custom_base_url"])
         self.assertTrue(response["model"]["features"]["tool_calls"]["enable"])
-        self.assertTrue(response["model"]["features"]["reasoning"]["enable"])
+        self.assertNotIn("reasoning", response["model"]["features"])
+        self.assertNotIn("context_window_size", response["model"])
+        self.assertNotIn("prompt_max_tokens", response["model"])
+        self.assertNotIn("max_tokens", response["model"])
 
     def test_connectivity_response_overrides_matching_upstream_preset_identity(self):
         response = traework_compat.connectivity_response(
@@ -695,6 +802,10 @@ class TraeWorkCompatTests(unittest.TestCase):
                     "is_preset": True,
                     "is_custom_base_url": False,
                     "upstream_marker": "preserved",
+                    "multimodal": True,
+                    "reasoning_effort_config": {"options": ["high"]},
+                    "context_window_size": {"max": 1000000},
+                    "features": {"reasoning": {"enable": True}},
                 }
             ],
         )
@@ -705,6 +816,12 @@ class TraeWorkCompatTests(unittest.TestCase):
         self.assertFalse(selected["is_preset"])
         self.assertTrue(selected["is_custom_base_url"])
         self.assertEqual(selected["upstream_marker"], "preserved")
+        self.assertTrue(selected["multimodal"])
+        self.assertEqual(selected["reasoning_effort_config"], {"options": ["high"]})
+        self.assertEqual(selected["context_window_size"], {"max": 1000000})
+        self.assertTrue(selected["features"]["reasoning"]["enable"])
+        self.assertTrue(selected["features"]["tool_calls"]["enable"])
+        self.assertEqual(response["model"], selected)
 
     def test_connectivity_response_preserves_custom_model_identity_fields(self):
         response = traework_compat.connectivity_response(

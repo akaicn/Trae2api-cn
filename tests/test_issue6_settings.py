@@ -12,6 +12,11 @@ from src import main as main_module
 
 
 class Issue6SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.api_keys = patch.object(main_module, "API_KEYS", [])
+        self.api_keys.start()
+        self.addCleanup(self.api_keys.stop)
+
     def test_settings_api_round_trip_preserves_shared_url_preset_identity(self):
         """IDE/Work presets must survive the settings API, not just the UI."""
 
@@ -91,6 +96,19 @@ class Issue6SettingsTests(unittest.TestCase):
                 self.assertEqual(work.json()["settings"]["endpoint_id"], "agent")
                 self.assertEqual(main_module.UPSTREAM_MODE, "work-agent")
 
+                current_work = client.post(
+                    "/api/settings",
+                    json={
+                        "web_base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+                        "upstream_mode": "work",
+                        "endpoint_id": "work",
+                    },
+                )
+                self.assertEqual(current_work.status_code, 200)
+                self.assertEqual(saved["endpoint_id"], "work")
+                self.assertEqual(saved["upstream_mode"], "work")
+                self.assertEqual(main_module.UPSTREAM_MODE, "work")
+
                 # A stale URL/mode must not silently overwrite the selected
                 # preset and turn Work Agent back into the Remote preset.
                 mismatch = client.post(
@@ -109,7 +127,7 @@ class Issue6SettingsTests(unittest.TestCase):
             else:
                 os.environ["UPSTREAM_MODE"] = old_env_mode
 
-    def test_solo_preset_points_to_the_verified_llm_utils_chat_url(self):
+    def test_solo_preset_points_to_the_verified_traecode_chat_url(self):
         solo = next(
             item
             for item in main_module.UPSTREAM_ENDPOINT_PRESETS
@@ -157,6 +175,9 @@ class Issue6SettingsTests(unittest.TestCase):
 
         for preset_id, expected_path in (
             ("remote", "/api/remote/v1/chat_sessions"),
+            ("work", "/api/remote/v1/chat_sessions"),
+            ("solo", "/api/agent/v3/llm_utils_chat"),
+            ("ide", "/api/agent/v3/llm_utils_chat"),
             ("agent", "/api/remote/v1/chat_sessions"),
         ):
             preset = next(
@@ -166,7 +187,69 @@ class Issue6SettingsTests(unittest.TestCase):
             )
             self.assertEqual(preset["endpoint_path"], expected_path)
             self.assertTrue(preset["endpoint_url"].endswith(expected_path))
-            self.assertNotIn("model_base_url", preset)
+            if preset_id in {"ide", "solo"}:
+                self.assertEqual(
+                    preset["model_base_url"], "https://trae-api-cn.mchost.guru"
+                )
+            else:
+                self.assertNotIn("model_base_url", preset)
+
+    def test_saving_custom_remote_base_updates_the_live_remote_client(self):
+        saved = {}
+        original_base = main_module.WEB_BASE
+        old_env_base = os.environ.get("TRAE_WEB_BASE_URL")
+
+        def save_settings(**values):
+            saved.update(values)
+
+        def get_settings():
+            return {
+                "web_base_url": saved.get("web_base_url", ""),
+                "upstream_mode": saved.get("upstream_mode", ""),
+                "endpoint_id": saved.get("endpoint_id", ""),
+                "model_base_url": saved.get("model_base_url", ""),
+                "relay_port": 0,
+            }
+
+        try:
+            with (
+                patch.object(main_module.auth, "set_relay_settings", side_effect=save_settings),
+                patch.object(main_module.auth, "get_settings", side_effect=get_settings),
+                patch.object(main_module, "WEB_BASE", "https://old.example/api/remote/v1"),
+                patch.dict(
+                    os.environ,
+                    {
+                        "RELAY_API_KEYS": "",
+                        "TRAE_WEB_BASE_URL": "https://old.example/api/remote/v1",
+                    },
+                    clear=False,
+                ),
+            ):
+                client = TestClient(main_module.app)
+                response = client.post(
+                    "/api/settings",
+                    json={
+                        "web_base_url": "https://custom.example/api/remote/v1",
+                        "upstream_mode": "remote",
+                        "endpoint_id": "",
+                    },
+                )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    main_module.WEB_BASE,
+                    "https://custom.example/api/remote/v1",
+                )
+                self.assertEqual(
+                    os.environ["TRAE_WEB_BASE_URL"],
+                    "https://custom.example/api/remote/v1",
+                )
+        finally:
+            main_module.WEB_BASE = original_base
+            if old_env_base is None:
+                os.environ.pop("TRAE_WEB_BASE_URL", None)
+            else:
+                os.environ["TRAE_WEB_BASE_URL"] = old_env_base
 
     def test_selecting_ide_preset_persists_remote_base_and_gateway(self):
         """The settings API must apply both bases, not a bare shared domain."""
@@ -302,6 +385,30 @@ class Issue6SettingsTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(saved["endpoint_id"], "")
+
+                # The current UI sends an empty endpoint_id for the custom
+                # entry.  It must explicitly select Remote rather than leave
+                # the previously selected IDE tier active.
+                saved.update(
+                    {
+                        "web_base_url": "https://custom.example/v1",
+                        "upstream_mode": "ide",
+                        "endpoint_id": "ide",
+                    }
+                )
+                response = client.post(
+                    "/api/settings",
+                    json={
+                        "web_base_url": "https://custom.example/v1",
+                        "model_base_url": "",
+                        "upstream_mode": "",
+                        "endpoint_id": "",
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(saved["endpoint_id"], "")
+                self.assertEqual(saved["upstream_mode"], "remote")
+                self.assertEqual(saved["model_base_url"], "")
         finally:
             main_module.UPSTREAM_MODE = old_mode
 
@@ -378,7 +485,9 @@ class Issue6SettingsTests(unittest.TestCase):
                 requested_mode=mode,
                 requested_endpoint=mode,
                 actual_mode=mode,
-                actual_endpoint="remote-work" if mode == "work-agent" else "ide",
+                actual_endpoint=(
+                    "remote-work" if mode in {"work", "work-agent"} else "ide"
+                ),
                 fallback_used=False,
             )
             return JSONResponse(
@@ -387,7 +496,11 @@ class Issue6SettingsTests(unittest.TestCase):
 
         with patch.object(main_module, "_dispatch_chat", new=fake_dispatch):
             client = TestClient(main_module.app)
-            for endpoint, actual in (("ide", "ide"), ("work-agent", "remote-work")):
+            for endpoint, actual in (
+                ("ide", "ide"),
+                ("work", "remote-work"),
+                ("work-agent", "remote-work"),
+            ):
                 with self.subTest(endpoint=endpoint):
                     response = client.post(
                         "/api/model-test",
@@ -404,7 +517,10 @@ class Issue6SettingsTests(unittest.TestCase):
                     self.assertEqual(body["actual_endpoint"], actual)
                     self.assertFalse(body["fallback_used"])
 
-        self.assertEqual([item["_upstream_mode"] for item in seen], ["ide", "work-agent"])
+        self.assertEqual(
+            [item["_upstream_mode"] for item in seen],
+            ["ide", "work", "work-agent"],
+        )
         self.assertTrue(all(item["_disable_upstream_fallback"] for item in seen))
 
     def test_model_test_returns_endpoint_fallback_diagnostics(self):
@@ -418,7 +534,7 @@ class Issue6SettingsTests(unittest.TestCase):
                 fallback_used=True,
                 fallback_target="remote",
                 failed_endpoint="ide",
-                fallback_reason="ide: llm_utils_chat is unavailable",
+                fallback_reason="ide: TraeCode llm_raw_chat is unavailable",
             )
             return JSONResponse(
                 {
@@ -449,7 +565,7 @@ class Issue6SettingsTests(unittest.TestCase):
         self.assertTrue(body["fallback_used"])
         self.assertEqual(body["fallback_target"], "remote")
         self.assertEqual(body["failed_endpoint"], "ide")
-        self.assertIn("llm_utils_chat", body["fallback_reason"])
+        self.assertIn("llm_raw_chat", body["fallback_reason"])
 
     def test_endpoint_markup_uses_mode_when_raw_and_ide_share_url(self):
         state = auth.AuthState(source="web-login")
@@ -487,7 +603,7 @@ class Issue6SettingsTests(unittest.TestCase):
             html = main_module._web_login_html()
 
         self.assertIn(
-            '<option value="ide" selected>IDE Agent / llm_utils_chat</option>',
+            '<option value="ide" selected>TraeCode IDE / llm_utils_chat（solo_work_lite）</option>',
             html,
         )
         self.assertNotIn(
@@ -495,9 +611,18 @@ class Issue6SettingsTests(unittest.TestCase):
             html,
         )
         self.assertIn(
-            '<option value="solo">Solo / api/agent/v3/llm_utils_chat</option>',
+            '<option value="solo">TraeCode Solo / llm_utils_chat（solo_work_lite）</option>',
             html,
         )
+        self.assertIn(
+            '<option value="work">TraeWork / chat_sessions（Work tier）</option>',
+            html,
+        )
+        preview = self._extract_js_function(html, "endpointPreviewText")
+        self.assertIn("solo_work_remote", preview)
+        self.assertIn("/api/remote/v1')+'/chat_sessions", preview)
+        self.assertIn("/api/agent/v3/llm_utils_chat", preview)
+        self.assertIn("/api/ide/v2/llm_raw_chat", preview)
         self.assertNotIn(
             '<option value="raw" selected>IDE Raw / llm_raw_chat</option>',
             html,
@@ -690,7 +815,7 @@ class Issue6SettingsTests(unittest.TestCase):
             html = main_module._web_login_html()
 
         self.assertIn(
-            '<option value="ide" selected>IDE Agent / llm_utils_chat</option>',
+            '<option value="ide" selected>TraeCode IDE / llm_utils_chat（solo_work_lite）</option>',
             html,
         )
         self.assertNotIn(
@@ -795,6 +920,152 @@ class Issue6SettingsTests(unittest.TestCase):
                 os.environ.pop("TRAE_WEB_BASE_URL", None)
             else:
                 os.environ["TRAE_WEB_BASE_URL"] = old_base
+
+    def test_legacy_work_agent_settings_render_as_current_work_preset(self):
+        state = auth.AuthState(source="web-login")
+        settings = {
+            "endpoint_id": "agent",
+            "upstream_mode": "work-agent",
+            "web_base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+        }
+        with (
+            patch.object(main_module.auth, "get_auth", return_value=state),
+            patch.object(main_module.auth, "list_accounts", return_value=[]),
+            patch.object(
+                main_module.auth,
+                "get_polling_status",
+                return_value={"enabled": False, "mode": "round-robin"},
+            ),
+            patch.object(main_module.auth, "get_settings", return_value=settings),
+            patch.object(
+                main_module.auth,
+                "get_max_mode_settings",
+                return_value={"enabled": False, "models": ""},
+            ),
+            patch.object(
+                main_module.auth,
+                "get_auto_route_settings",
+                return_value={"enabled": False},
+            ),
+            patch.object(
+                main_module.auth,
+                "get_auto_checkin_settings",
+                return_value={"enabled": False, "time": "08:30"},
+            ),
+            patch.object(main_module, "UPSTREAM_MODE", "work-agent"),
+        ):
+            html = main_module._web_login_html()
+
+        self.assertIn(
+            '<option value="work" selected>TraeWork / chat_sessions（Work tier）</option>',
+            html,
+        )
+        self.assertNotIn(
+            '<option value="__saved" selected>https://trae-api-cn.mchost.guru/api/remote/v1</option>',
+            html,
+        )
+
+    def test_startup_preserves_custom_model_gateway(self):
+        """A custom IDE/Solo gateway must survive endpoint restoration."""
+
+        original_mode = main_module.UPSTREAM_MODE
+        original_base = main_module.WEB_BASE
+        old_mode = os.environ.get("UPSTREAM_MODE")
+        old_base = os.environ.get("TRAE_WEB_BASE_URL")
+        old_model_base = os.environ.get("TRAE_MODEL_API_HOST")
+        persisted = {
+            "endpoint_id": "ide",
+            "upstream_mode": "ide",
+            "web_base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+            "model_base_url": "https://custom-model.example",
+        }
+
+        try:
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_settings",
+                    return_value=dict(persisted),
+                ),
+                patch.object(main_module.auth, "set_relay_settings") as save,
+                patch.object(main_module, "UPSTREAM_MODE", "remote"),
+                patch.object(
+                    main_module,
+                    "WEB_BASE",
+                    "https://old.example",
+                ),
+            ):
+                settings = main_module._restore_persisted_relay_settings()
+
+            self.assertEqual(settings["model_base_url"], "https://custom-model.example")
+            self.assertEqual(
+                os.environ["TRAE_MODEL_API_HOST"],
+                "https://custom-model.example",
+            )
+            save.assert_not_called()
+        finally:
+            main_module.UPSTREAM_MODE = original_mode
+            main_module.WEB_BASE = original_base
+            if old_mode is None:
+                os.environ.pop("UPSTREAM_MODE", None)
+            else:
+                os.environ["UPSTREAM_MODE"] = old_mode
+            if old_base is None:
+                os.environ.pop("TRAE_WEB_BASE_URL", None)
+            else:
+                os.environ["TRAE_WEB_BASE_URL"] = old_base
+            if old_model_base is None:
+                os.environ.pop("TRAE_MODEL_API_HOST", None)
+            else:
+                os.environ["TRAE_MODEL_API_HOST"] = old_model_base
+
+    def test_startup_preserves_explicitly_cleared_model_gateway(self):
+        """An explicit empty gateway must not resurrect the preset host."""
+
+        original_mode = main_module.UPSTREAM_MODE
+        original_base = main_module.WEB_BASE
+        old_mode = os.environ.get("UPSTREAM_MODE")
+        old_base = os.environ.get("TRAE_WEB_BASE_URL")
+        old_model_base = os.environ.get("TRAE_MODEL_API_HOST")
+        persisted = {
+            "endpoint_id": "ide",
+            "upstream_mode": "ide",
+            "web_base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+            "model_base_url": "",
+        }
+
+        try:
+            os.environ["TRAE_MODEL_API_HOST"] = "https://stale-model.example"
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_settings",
+                    return_value=dict(persisted),
+                ),
+                patch.object(main_module.auth, "set_relay_settings") as save,
+                patch.object(main_module, "UPSTREAM_MODE", "remote"),
+                patch.object(main_module, "WEB_BASE", "https://old.example"),
+            ):
+                settings = main_module._restore_persisted_relay_settings()
+
+            self.assertEqual(settings["model_base_url"], "")
+            self.assertNotIn("TRAE_MODEL_API_HOST", os.environ)
+            save.assert_not_called()
+        finally:
+            main_module.UPSTREAM_MODE = original_mode
+            main_module.WEB_BASE = original_base
+            if old_mode is None:
+                os.environ.pop("UPSTREAM_MODE", None)
+            else:
+                os.environ["UPSTREAM_MODE"] = old_mode
+            if old_base is None:
+                os.environ.pop("TRAE_WEB_BASE_URL", None)
+            else:
+                os.environ["TRAE_WEB_BASE_URL"] = old_base
+            if old_model_base is None:
+                os.environ.pop("TRAE_MODEL_API_HOST", None)
+            else:
+                os.environ["TRAE_MODEL_API_HOST"] = old_model_base
 
     def test_relay_env_update_is_partial_and_keeps_other_keys(self):
         with tempfile.TemporaryDirectory() as tmp:

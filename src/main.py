@@ -11,8 +11,8 @@ main.py - Trae CN Relay 中转站
   UPSTREAM_MODE=raw  - 直连 Trae 原生 chat 协议（direct 为别名）
   UPSTREAM_MODE=remote/9router - 只用 9router 风格 remote 会话
   UPSTREAM_MODE=web  - 只用旧版 CN remote 会话（兼容保留）
-  UPSTREAM_MODE=ide  - 只用 IDE Agent /api/agent/v3/llm_utils_chat
-  UPSTREAM_MODE=solo - 只用 Trae SOLO /api/agent/v3/llm_utils_chat
+  UPSTREAM_MODE=ide  - TraeCode IDE /api/agent/v3/llm_utils_chat
+  UPSTREAM_MODE=solo - TraeCode SOLO /api/agent/v3/llm_utils_chat
   UPSTREAM_MODE=traework-native - Windows helper 承载 TraeWork ai-agent.dll
 """
 
@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 import dotenv
 
@@ -53,11 +54,13 @@ import anyio
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from fastapi.responses import FileResponse
 
 from . import (
+    anthropic_api,
     auth,
     cli_client,
+    continuation,
+    images,
     raw_client,
     responses_api,
     trae_client,
@@ -65,7 +68,25 @@ from . import (
     traework_compat,
     traework_native_bridge,
 )
-from .model_limits import clamp_max_completion_tokens
+from .auth_helper import (
+    SUPPORTED_KINDS as HELPER_KINDS,
+    RelayURLError,
+    candidate_hosts as _helper_candidate_hosts,
+    file_name as _helper_file_name,
+    media_type as _helper_media_type,
+    normalize_listener_port as _normalize_listener_port,
+    normalize_relay_url as _normalize_relay_url,
+    pick_relay_url as _pick_relay_url,
+    render as _render_auth_helper,
+)
+from .model_limits import (
+    MULTIMODAL_FALLBACK_ORDER,
+    clamp_max_completion_tokens,
+    configured_multimodal_model,
+    descriptor_max_context,
+    descriptor_multimodal,
+    descriptor_supports_max_mode,
+)
 from .sse import (
     EmptyUpstreamResponse,
     ModelProviderMismatch,
@@ -86,7 +107,8 @@ PORT = int(os.environ.get("PORT", "8000"))
 API_KEYS = [k.strip() for k in os.environ.get("RELAY_API_KEYS", "").split(",") if k.strip()]
 UPSTREAM_MODE = (os.environ.get("UPSTREAM_MODE", "remote") or "remote").lower()
 _VALID_UPSTREAM_MODES = (
-    "remote", "raw", "direct", "auto", "web", "ide", "solo", "work-agent",
+    "remote", "raw", "direct", "auto", "web", "ide", "solo", "work",
+    "work-agent",
     "9router", "trae-remote", "cli", "traework-native",
     "native", "traework",
 )
@@ -138,13 +160,49 @@ def _restore_persisted_relay_settings() -> dict:
     if web_base:
         WEB_BASE = web_base
         os.environ["TRAE_WEB_BASE_URL"] = web_base
+    # Preserve an explicitly persisted custom gateway.  The preset value is
+    # only a migration fallback for stores written before model_base_url was
+    # introduced; preferring it would silently discard a custom gateway on
+    # every restart.
+    persisted_model_base = settings.get("model_base_url")
     model_base = str(
-        (endpoint or {}).get("model_base_url")
-        or settings.get("model_base_url")
+        (
+            persisted_model_base
+            if persisted_model_base is not None
+            else (endpoint or {}).get("model_base_url")
+        )
         or ""
     ).strip().rstrip("/")
+    # Earlier releases made api5-normal the TraeCode preset default. The
+    # desktop client gets trae-api-cn from boot config and lets its network
+    # layer route that hostname to api5-normal. Migrate only that old preset
+    # value; an explicit TRAE_CODE_BASE_URL remains authoritative.
+    legacy_traecode_gateway = "https://api5-normal.mchost.guru"
+    env_code_gateway = str(os.environ.get("TRAE_CODE_BASE_URL") or "").strip().rstrip("/")
+    if (
+        (endpoint_id in {"ide", "solo"} or mode in {"ide", "solo"})
+        and model_base == legacy_traecode_gateway
+        and DEFAULT_MODEL_GATEWAY_URL != legacy_traecode_gateway
+        and (
+            not env_code_gateway
+            or env_code_gateway == DEFAULT_MODEL_GATEWAY_URL
+        )
+    ):
+        model_base = DEFAULT_MODEL_GATEWAY_URL
     if model_base:
         os.environ["TRAE_MODEL_API_HOST"] = model_base
+        if mode in {"work", "work-agent"}:
+            os.environ["TRAE_RAW_BASE_URL"] = model_base
+            os.environ["TRAE_WORK_BASE_URL"] = model_base
+        elif mode in {"ide", "solo"}:
+            os.environ["TRAE_CODE_BASE_URL"] = model_base
+    else:
+        os.environ.pop("TRAE_MODEL_API_HOST", None)
+        if mode in {"work", "work-agent"}:
+            os.environ.pop("TRAE_RAW_BASE_URL", None)
+            os.environ.pop("TRAE_WORK_BASE_URL", None)
+        elif mode in {"ide", "solo"}:
+            os.environ.pop("TRAE_CODE_BASE_URL", None)
     # Repair partially migrated stores once at startup.  This also makes the
     # settings API/UI observe the same canonical mode and URL as dispatch.
     if endpoint is not None and (
@@ -152,18 +210,14 @@ def _restore_persisted_relay_settings() -> dict:
         or str(settings.get("web_base_url") or "").strip().rstrip("/")
         != str(endpoint["base_url"]).rstrip("/")
         or str(settings.get("model_base_url") or "").strip().rstrip("/")
-        != str(endpoint.get("model_base_url") or "").rstrip("/")
+        != model_base
     ):
         try:
             auth.set_relay_settings(
                 web_base_url=str(endpoint["base_url"]),
                 upstream_mode=str(endpoint["mode"]),
                 endpoint_id=str(endpoint["id"]),
-                model_base_url=str(
-                    endpoint.get("model_base_url")
-                    or settings.get("model_base_url")
-                    or ""
-                ),
+                model_base_url=model_base,
             )
             # ``auth.set_relay_settings`` persists the canonical values, but
             # an older/custom store adapter may return a stale snapshot from
@@ -176,11 +230,7 @@ def _restore_persisted_relay_settings() -> dict:
                     "web_base_url": str(endpoint["base_url"]).rstrip("/"),
                     "upstream_mode": str(endpoint["mode"]).strip().lower(),
                     "endpoint_id": str(endpoint["id"]).strip().lower(),
-                    "model_base_url": str(
-                        endpoint.get("model_base_url")
-                        or settings.get("model_base_url")
-                        or ""
-                    ).rstrip("/"),
+                    "model_base_url": model_base,
                 }
             )
         except Exception:
@@ -204,45 +254,68 @@ CHECKIN_AUTO_RETRY_INTERVAL = float(
     os.environ.get("TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS", "60") or "60"
 )
 DEFAULT_REMOTE_BASE_URL = "https://trae-api-cn.mchost.guru/api/remote/v1"
-DEFAULT_MODEL_GATEWAY_URL = "https://trae-api-cn.mchost.guru"
+DEFAULT_WORK_MODEL_GATEWAY_URL = (
+    os.environ.get("TRAE_WORK_BASE_URL")
+    or "https://trae-api-cn.mchost.guru"
+).rstrip("/")
+DEFAULT_MODEL_GATEWAY_URL = (
+    os.environ.get("TRAE_CODE_BASE_URL")
+    or "https://trae-api-cn.mchost.guru"
+).rstrip("/")
 WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", DEFAULT_REMOTE_BASE_URL)).rstrip("/")
 UPSTREAM_ENDPOINT_PRESETS = (
     {
         "id": "remote",
-        "label": "Remote / chat_sessions",
+        "label": "Remote / chat_sessions（trae remote）",
         "base_url": DEFAULT_REMOTE_BASE_URL,
         "endpoint_url": DEFAULT_REMOTE_BASE_URL + "/chat_sessions",
         "endpoint_path": "/api/remote/v1/chat_sessions",
         "mode": "remote",
+        "product": "trae",
+    },
+    {
+        "id": "work",
+        "label": "TraeWork / chat_sessions（Work tier）",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "endpoint_url": DEFAULT_REMOTE_BASE_URL + "/chat_sessions",
+        "endpoint_path": "/api/remote/v1/chat_sessions",
+        "mode": "work",
+        "product": "traework",
+    },
+    {
+        "id": "solo",
+        "label": "TraeCode Solo / llm_utils_chat（solo_work_lite）",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "model_base_url": DEFAULT_MODEL_GATEWAY_URL,
+        "endpoint_url": DEFAULT_MODEL_GATEWAY_URL + "/api/agent/v3/llm_utils_chat",
+        "endpoint_path": "/api/agent/v3/llm_utils_chat",
+        "mode": "solo",
+        "legacy_function": "solo_work_lite",
+        "product": "trae",
     },
     {
         "id": "ide",
-        "label": "IDE Agent / llm_utils_chat",
+        "label": "TraeCode IDE / llm_utils_chat（solo_work_lite）",
         "base_url": DEFAULT_REMOTE_BASE_URL,
         "model_base_url": DEFAULT_MODEL_GATEWAY_URL,
         "endpoint_url": DEFAULT_MODEL_GATEWAY_URL + "/api/agent/v3/llm_utils_chat",
         "endpoint_path": "/api/agent/v3/llm_utils_chat",
         "mode": "ide",
+        "legacy_function": "solo_work_lite",
+        "product": "trae",
     },
-    {
-        "id": "solo",
-        "label": "Solo / api/agent/v3/llm_utils_chat",
-        "base_url": DEFAULT_REMOTE_BASE_URL,
-        "model_base_url": DEFAULT_MODEL_GATEWAY_URL,
-        "endpoint_url": DEFAULT_MODEL_GATEWAY_URL + "/api/agent/v3/llm_utils_chat",
-        "endpoint_path": "/api/agent/v3/llm_utils_chat",
-        # The Solo transport is implemented by the existing IDE client.  The
-        # distinct mode keeps the selected protocol visible and persistent
-        # while reusing its headers, SSE parser and fallback behavior.
-        "mode": "solo",
-    },
+    # Settings written by releases before the four-way endpoint split remain
+    # readable.  The entry is intentionally hidden from the public selector;
+    # new settings use ``work`` above.
     {
         "id": "agent",
-        "label": "Work Agent / solo_work_remote",
+        "label": "Work Agent（兼容）/ chat_sessions",
         "base_url": DEFAULT_REMOTE_BASE_URL,
         "endpoint_url": DEFAULT_REMOTE_BASE_URL + "/chat_sessions",
         "endpoint_path": "/api/remote/v1/chat_sessions",
         "mode": "work-agent",
+        "product": "traework",
+        "visible": False,
     },
 )
 CHAT_OPTION_FIELDS = (
@@ -406,6 +479,20 @@ _USAGE_SNAPSHOT_TASKS: set[asyncio.Task] = set()
 _USAGE_PENDING_TASK_IDS: set[str] = set()
 _USAGE_ACTIVE_ACCOUNTS: dict[str, int] = {}
 _USAGE_UNSAFE_ACCOUNTS: set[str] = set()
+# Concurrent requests for one account share the same "before" snapshot.  A
+# per-request snapshot makes the second request look unsafe and drops its
+# credit delta, even though the account total still advances normally.
+_USAGE_ACCOUNT_BEFORE_TASKS: dict[tuple[int, str], asyncio.Task] = {}
+# The after-snapshot read is serialized per account and compared with the last
+# observed total.  This turns two concurrent deltas (10 -> 11 -> 12) into two
+# one-credit rows instead of 1 and 2 credits or an unknown row.
+_USAGE_CREDIT_SETTLE_GATES: dict[tuple[int, str], asyncio.Lock] = {}
+_USAGE_LAST_CREDIT_TOTALS: dict[str, float] = {}
+# Credit display reconciliation is intentionally separate from request
+# settlement.  The latter attributes a single turn; this overlay reconciles
+# all confirmed charges that arrived after the last official balance poll.
+_CREDIT_RECONCILE_TASKS: set[asyncio.Task] = set()
+_CREDIT_RECONCILE_STATE: dict[str, dict[str, Any]] = {}
 _CHECKIN_ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
 _CHECKIN_CLAIM_GATE: asyncio.Lock | None = None
 _CHECKIN_CLAIM_GATE_LOOP: asyncio.AbstractEventLoop | None = None
@@ -456,6 +543,23 @@ _UPSTREAM_SESSION_LEASES: OrderedDict[str, _UpstreamSessionLease] = OrderedDict(
 
 class _ModelAccountUnavailable(RuntimeError):
     """No enabled credential can receive this model request."""
+
+
+def _cancel_unclaimed_account_slot(options: Optional[Mapping[str, Any]]) -> bool:
+    """Return a scheduler reservation that no transport consumed."""
+
+    if not options or not options.get("_account_slot_reserved"):
+        return False
+    account_id = str(
+        options.get("_account_slot_reservation_account")
+        or options.get("_account_id")
+        or ""
+    )
+    reservation_id = str(options.get("_account_slot_reservation_id") or "")
+    cancelled = auth.cancel_account_slot_reservation(account_id, reservation_id)
+    if cancelled and isinstance(options, dict):
+        options["_account_slot_reserved"] = False
+    return cancelled
 
 
 def _ensure_model_account_enabled(account_id: str = "", token: str = "") -> None:
@@ -523,6 +627,7 @@ PUBLIC_PATHS = {
     "/models",
     "/web/login",
     "/web/login/download",
+    "/web/login/helper-info",
     "/authorize",
     "/api/web-auth",
     "/api/logout",
@@ -897,7 +1002,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.10"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -931,6 +1036,9 @@ _LUCIDE_ICONS = {
     'sigma': '<path d="M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2"/>',
     'calendar': '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/>',
     'server': '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+    'lock': '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    'unlock': '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>',
+    'route': '<circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/>',
 }
 
 
@@ -1123,6 +1231,44 @@ a { color: var(--accent); }
   padding: 18px 18px 16px; min-width: 0;
 }
 .span-2 { grid-column: 1 / -1; }
+.model-list-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;
+  align-items: start;
+}
+.model-column {
+  min-width: 0; overflow: hidden;
+  border: 1px solid var(--line-strong); border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.model-column-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 10px 12px; border-bottom: 1px solid var(--line-strong);
+  background: var(--surface); color: var(--text);
+}
+.model-column-title { font-size: 13px; font-weight: 650; }
+.model-column-count {
+  color: var(--faint); font-family: var(--mono); font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.model-column-body {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 520px; overflow: auto; padding: 10px;
+}
+.model-item {
+  display: flex; flex-direction: column; gap: 2px; min-width: 0;
+  padding: 7px 9px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--text); font-family: var(--mono); font-size: 12px;
+  line-height: 1.4; overflow-wrap: anywhere;
+}
+.model-item:hover { border-color: var(--edge); background: var(--accent-soft); }
+.model-item-name { overflow-wrap: anywhere; }
+.model-item-alias { color: var(--muted); font-family: inherit; font-size: 10px; }
+.model-column-empty { padding: 18px 10px; color: var(--faint); text-align: center; font-size: 12px; }
+.model-fallback { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.model-fallback-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.model-fallback-title { color: var(--muted); font-size: 12px; font-weight: 650; }
+.model-fallback-note { color: var(--faint); font-size: 11px; }
+.model-fallback-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 6px; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .section-head > div { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
 .section-title { font-size: 14px; font-weight: 650; color: var(--text); }
@@ -1135,6 +1281,8 @@ a { color: var(--accent); }
 .state-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); }
 .state-pill.on { color: var(--ok); background: var(--ok-soft); border-color: var(--ok-line); }
 .state-pill.on::before { background: var(--ok); box-shadow: 0 0 0 3px var(--ring); }
+.state-pill.lock { color: var(--warn); background: var(--warn-soft); border-color: var(--warn-line); }
+.state-pill.lock::before { background: var(--warn); }
 
 /* Overview stats */
 .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
@@ -1203,6 +1351,23 @@ a { color: var(--accent); }
 .field-note { font-size: 12px; color: var(--faint); margin-top: 6px; }
 .required { color: var(--danger); }
 
+/* Auto-route lock: while auto routing is on the manual endpoint fields are
+   read-only, so the effective upstream cannot contradict the switch. */
+.endpoint-locked { position: relative; }
+.endpoint-locked .form-group > label { color: var(--faint); }
+.form-group input:disabled, .form-group select:disabled, .form-group textarea:disabled {
+  background: var(--surface-2); color: var(--faint); border-color: var(--line);
+  cursor: not-allowed; opacity: .72; -webkit-text-fill-color: var(--faint);
+}
+.endpoint-locked .form-group input:disabled, .endpoint-locked .form-group select:disabled { border-style: dashed; }
+.lock-note {
+  display: flex; align-items: flex-start; gap: 8px; margin: 2px 0 12px;
+  padding: 10px 12px; border: 1px dashed var(--warn-line); border-radius: var(--radius-sm);
+  background: var(--warn-soft); color: var(--warn); font-size: 12px; line-height: 1.5;
+}
+.lock-note svg { width: 15px; height: 15px; margin-top: 1px; }
+.lock-note strong { font-weight: 650; }
+
 /* Switch */
 .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
 .switch-row + .switch-row { border-top: 1px solid var(--line); }
@@ -1263,6 +1428,15 @@ a { color: var(--accent); }
 .status-cell .badge + .badge { margin-left: 4px; }
 .numeric { text-align: right !important; font-variant-numeric: tabular-nums; }
 .credit-value { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.credit-calibration {
+  display: inline-flex; align-items: center; min-height: 24px; padding: 0 7px;
+  border: 1px solid var(--line-strong); border-radius: 5px; color: var(--muted);
+  background: var(--surface-2); font-size: 11px; white-space: nowrap;
+}
+.credit-calibration.ok { color: var(--ok); border-color: var(--ok-line); background: var(--ok-soft); }
+.credit-calibration.projected { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+.credit-calibration.stale, .credit-calibration.error { color: var(--danger); border-color: var(--danger-line); background: var(--danger-soft); }
+.credit-calibration.unknown { color: var(--faint); border-style: dashed; }
 .muted-cell { color: var(--faint); font-size: 12px; white-space: nowrap; font-family: var(--mono); }
 .row-subtitle { display: block; color: var(--faint); font-size: 11px; margin-top: 2px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .actions-col { width: 120px; }
@@ -1275,17 +1449,19 @@ a { color: var(--accent); }
 .switch input:disabled + .track { opacity: .6; }
 .empty-state { padding: 28px 12px; text-align: center; color: var(--faint); font-size: 13px; border: 1px dashed var(--frame); border-radius: var(--radius); }
 .usage-records-container { max-height: calc(100vh - 220px); min-height: 160px; overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
-.usage-table { min-width: 1280px; table-layout: fixed; }
+.usage-table { min-width: 1400px; table-layout: fixed; }
 .usage-table th:nth-child(1) { width: 170px; }
 .usage-table th:nth-child(2) { width: 130px; }
-.usage-table th:nth-child(3) { width: 150px; }
-.usage-table th:nth-child(4) { width: 105px; }
+.usage-table th:nth-child(3) { width: 145px; }
+.usage-table th:nth-child(4) { width: 150px; }
 .usage-table th:nth-child(5) { width: 105px; }
-.usage-table th:nth-child(6) { width: 145px; }
-.usage-table th:nth-child(7) { width: 190px; }
-.usage-table th:nth-child(8) { width: 100px; }
-.usage-table th:nth-child(9) { width: 90px; }
+.usage-table th:nth-child(6) { width: 105px; }
+.usage-table th:nth-child(7) { width: 145px; }
+.usage-table th:nth-child(8) { width: 190px; }
+.usage-table th:nth-child(9) { width: 100px; }
 .usage-table th:nth-child(10) { width: 90px; }
+.usage-table th:nth-child(11) { width: 90px; }
+.usage-table th:nth-child(12) { width: 110px; }
 .usage-table td { overflow-wrap: anywhere; }
 .usage-table .usage-status { white-space: nowrap; }
 .usage-table .usage-meta { white-space: nowrap; }
@@ -1293,6 +1469,7 @@ a { color: var(--accent); }
 .usage-table .usage-meta.unknown { color: var(--faint); }
 .usage-table .usage-meta .usage-arrow { color: var(--faint); padding: 0 3px; }
 .usage-table .usage-meta .usage-sub { color: var(--muted); font-size: 11px; }
+.usage-route-endpoint { color: var(--muted); font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-model-cell { min-width: 0; }
 .usage-model-cell > div:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-model-flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
@@ -1490,6 +1667,7 @@ html.theme-anim *, html.theme-anim *::before, html.theme-anim *::after {
   .topbar { position: static; padding: 12px 14px; }
   .content { padding: 14px 14px 36px; }
   .panel-card { padding: 16px 14px 14px; }
+  .model-list-grid { grid-template-columns: minmax(0, 1fr); }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .stat dd { font-size: 18px; }
   .manual-grid { grid-template-columns: minmax(0, 1fr); }
@@ -1565,6 +1743,7 @@ def _web_login_html() -> str:
           <tr>
             <th>时间</th>
             <th>账号</th>
+            <th>产品 / 端点</th>
             <th>模型</th>
             <th>思考强度</th>
             <th>上下文模式</th>
@@ -1573,6 +1752,7 @@ def _web_login_html() -> str:
             <th class="numeric">Tokens（入 / 出 / 总）</th>
             <th class="numeric">消耗积分</th>
             <th>状态</th>
+            <th>链路</th>
           </tr>
         </thead>
         <tbody id="usage-records-body"></tbody>
@@ -1680,6 +1860,9 @@ def _web_login_html() -> str:
     # ``2001 failed to get app config: record not found``; the raw transport
     # remains available only for internal protocol diagnostics.
     selected_endpoint_id = str(settings.get("endpoint_id") or "").strip().lower()
+    selected_endpoint_id = {
+        "agent": "work",
+    }.get(selected_endpoint_id, selected_endpoint_id)
     selected_mode = str(
         settings.get("upstream_mode") or _current_upstream_mode() or ""
     ).strip().lower()
@@ -1693,6 +1876,7 @@ def _web_login_html() -> str:
         "9router": "remote",
         "trae-remote": "remote",
         "web": "remote",
+        "work-agent": "work",
     }.get(selected_mode, selected_mode)
     def _preset_url_match(item: Mapping[str, Any]) -> bool:
         """Match the shared base, or a legacy host-only IDE/SOLO gateway.
@@ -1705,7 +1889,22 @@ def _web_login_html() -> str:
 
         shared = str(item.get("base_url") or "").rstrip("/")
         gateway = str(item.get("model_base_url") or "").rstrip("/")
-        return settings_web == shared or (bool(gateway) and settings_web == gateway)
+        if settings_web == shared or (bool(gateway) and settings_web == gateway):
+            return True
+        # Stores from the first endpoint split wrote the shared host without
+        # ``/api/remote/v1``.  Treat that legacy value as the same preset so
+        # the page can show the selected protocol before the next save
+        # canonicalizes the URL.
+        try:
+            parsed_web = urlsplit(settings_web)
+            parsed_shared = urlsplit(shared)
+            return bool(
+                parsed_web.scheme.lower() == parsed_shared.scheme.lower()
+                and parsed_web.netloc.lower() == parsed_shared.netloc.lower()
+                and parsed_web.path.rstrip("/") in {"", "/"}
+            )
+        except Exception:
+            return False
 
     url_matches = [
         item for item in UPSTREAM_ENDPOINT_PRESETS if _preset_url_match(item)
@@ -1713,12 +1912,16 @@ def _web_login_html() -> str:
     # Prefer the persisted preset identity.  The IDE/SOLO presets keep their
     # own host-only model gateway, so URL-only matching can silently render
     # the wrong option after a reload.
+    # ``endpoint_id`` is the durable protocol identity. Older releases
+    # persisted a bare host instead of the canonical Remote path, so requiring
+    # an exact URL match would render a valid IDE/SOLO selection as "custom"
+    # after a reload. Prefer the saved id and let the settings API normalize
+    # the URL on the next explicit save.
     matched_endpoint = next(
         (
             item
             for item in UPSTREAM_ENDPOINT_PRESETS
             if str(item.get("id") or "").strip().lower() == selected_endpoint_id
-            and _preset_url_match(item)
         ),
         None,
     )
@@ -1738,6 +1941,8 @@ def _web_login_html() -> str:
             f'<option value="__saved" selected>{html_mod.escape(settings_web)}</option>'
         )
     for item in UPSTREAM_ENDPOINT_PRESETS:
+        if not item.get("visible", True):
+            continue
         selected = " selected" if matched_endpoint and matched_endpoint["id"] == item["id"] else ""
         endpoint_options.append(
             f'<option value="{html_mod.escape(item["id"])}"{selected}>{html_mod.escape(item["label"])}</option>'
@@ -1765,6 +1970,18 @@ def _web_login_html() -> str:
     max_state_text = '已开启' if max_settings.get('enabled') else '已关闭'
     auto_route_checked = 'checked' if auto_route_on else ''
     auto_route_state_text = '已开启' if auto_route_on else '已关闭'
+    # While auto routing is enabled the dispatcher ignores the manual endpoint
+    # selection, so the settings form renders those fields read-only instead of
+    # letting the console show a channel that will never be used.
+    endpoint_lock_pill = ' lock' if auto_route_on else ''
+    endpoint_lock_text = '自动路由已接管' if auto_route_on else '手动选择'
+    endpoint_fields_class = 'endpoint-locked' if auto_route_on else ''
+    # Render the disabled state on the first response as well as in
+    # ``applyEndpointLock``.  This prevents a brief interactive window before
+    # the browser evaluates the settings script after a refresh.
+    endpoint_disabled_attr = (
+        ' disabled aria-disabled="true"' if auto_route_on else ' aria-disabled="false"'
+    )
     auto_checkin = auth.get_auto_checkin_settings()
     auto_checkin_checked = 'checked' if auto_checkin.get('enabled') else ''
     auto_checkin_time = html_mod.escape(auto_checkin.get('time') or '08:30')
@@ -1814,6 +2031,7 @@ def _web_login_html() -> str:
     <button class="nav-item" role="tab" data-tab="usage" data-title="消费记录" onclick="switchTab('usage')">{ic['receipt']}<span>消费记录</span></button>
     <button class="nav-item" role="tab" data-tab="settings" data-title="轮询与设置" onclick="switchTab('settings')">{ic['sliders-horizontal']}<span>轮询与设置</span></button>
     <button class="nav-item" role="tab" data-tab="models" data-title="模型测试" onclick="switchTab('models')">{ic['activity']}<span>模型测试</span></button>
+    <button class="nav-item" role="tab" data-tab="model-list" data-title="模型列表" onclick="switchTab('model-list')">{ic['list']}<span>模型列表</span></button>
   </nav>
   <div class="sidebar-foot"><span>Trae2api-cn</span><span>v{APP_VERSION}</span></div>
 </aside>
@@ -1871,7 +2089,7 @@ def _web_login_html() -> str:
     <div><dt>{ic['zap']}1M 上下文</dt><dd id="ov-max">--</dd></div>
     <div><dt>{ic['calendar-check']}自动签到</dt><dd id="ov-autocheckin">--</dd></div>
     <div><dt>{ic['list']}进行中请求</dt><dd id="ov-inflight">--</dd></div>
-    <div><dt>{ic['coins']}剩余通用积分</dt><dd id="ov-credits">--</dd></div>
+  <div><dt>{ic['coins']}剩余通用积分</dt><dd id="ov-credits">--</dd><dd class="stat-sub" id="ov-credits-meta">等待校准</dd></div>
   </dl>
 </section>
 </div>
@@ -1897,7 +2115,7 @@ def _web_login_html() -> str:
   <div class="stat"><dt>{ic['users']}账号</dt><dd id="stat-total">{stat_total}</dd></div>
   <div class="stat"><dt>{ic['shield-check']}有效</dt><dd id="stat-valid">{stat_valid}</dd></div>
   <div class="stat"><dt>{ic['check-check']}今日已签到</dt><dd id="stat-checked">{stat_checked}</dd></div>
-  <div class="stat"><dt>{ic['coins']}剩余通用积分</dt><dd id="stat-credits">{stat_credits}</dd></div>
+  <div class="stat"><dt>{ic['coins']}剩余通用积分</dt><dd id="stat-credits">{stat_credits}</dd><dd class="stat-sub" id="stat-credits-meta">等待校准</dd></div>
 </dl>
 <section class="panel-card" aria-label="账号列表">
   <div class="section-head">
@@ -1906,6 +2124,7 @@ def _web_login_html() -> str:
       <span id="checkin-busy" class="busy-indicator" role="status" aria-live="polite">正在处理...</span>
       <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">{ic['refresh-cw']}查询签到状态</button>
       <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">{ic['coins']}查询全部积分</button>
+      <span id="credits-calibration-state" class="credit-calibration" role="status" aria-live="polite">等待校准</span>
       <button class="btn btn-primary btn-sm" id="checkin-claim-btn" onclick="checkinClaimAll()">{ic['calendar-check']}一键轮询签到</button>
       <button class="btn btn-secondary btn-sm" id="account-model-save-btn" onclick="saveAccountModelSettings()" disabled>{ic['save']}保存模型开关</button>
     </div>
@@ -1921,13 +2140,14 @@ def _web_login_html() -> str:
   <div class="section-head"><div class="section-title" id="login-title">授权登录</div></div>
   <ol class="login-steps">
     <li>点击授权登录，自动检测本机授权助手（<code>127.0.0.1:{listener_port}</code>）。</li>
-    <li>未检测到时，下载 <code>web_login.py</code> 或 <code>start_auth.bat</code> 在<b>本机</b>运行后重试。</li>
+    <li>未检测到时，下载 <code>web_login.py</code> 或本机一键脚本（Windows <code>start_auth.bat</code> / macOS·Linux <code>start_auth.sh</code>）在<b>本机</b>运行后重试。</li>
     <li>浏览器需已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener">trae.cn</a>，授权完成后凭据自动写入服务器。</li>
   </ol>
   <div class="btn-group">
     <button class="btn btn-primary" onclick="startAuth()" id="auth-btn">{ic['log-in']}使用 Trae 网页授权登录</button>
-    <a class="btn btn-secondary" href="/web/login/download" download>{ic['download']}授权助手 web_login.py</a>
-    <a class="btn btn-secondary" href="/web/login/download?as=bat" download id="bat-link" style="display:none">{ic['download']}start_auth.bat</a>
+    <a class="btn btn-secondary" href="/web/login/download?as=py" download id="helper-py-link">{ic['download']}授权助手 web_login.py</a>
+    <a class="btn btn-secondary" href="/web/login/download?as=bat" download id="bat-link">{ic['download']}start_auth.bat</a>
+    <a class="btn btn-secondary" href="/web/login/download?as=sh" download id="sh-link">{ic['download']}start_auth.sh</a>
     <a class="icon-btn" href="https://www.trae.cn" target="_blank" rel="noopener" title="访问 trae.cn" aria-label="访问 trae.cn">{ic['external-link']}</a>
   </div>
   <div id="loading" class="loading">等待授权中...</div>
@@ -2027,26 +2247,35 @@ def _web_login_html() -> str:
   <div id="poll-msg" class="msg" role="status" aria-live="polite"></div>
 </div>
 <div class="panel-card">
-  <div class="section-head"><div class="section-title">上游端点</div></div>
+  <div class="section-head">
+    <div class="section-title">上游端点</div>
+    <span id="endpoint-lock-state" class="state-pill{endpoint_lock_pill}">{endpoint_lock_text}</span>
+  </div>
+  <div id="endpoint-lock-note" class="lock-note" hidden>
+    {ic['lock']}
+    <div><strong>自动路由已开启，手动端点选择已锁定。</strong>当前由自动路由决定实际通道：工具或图片请求走 IDE Agent，纯文字聊天走 Remote，失败保底回落 Remote。如需手动指定端点，请先在下方关闭自动路由。</div>
+  </div>
+  <div id="endpoint-fields" class="{endpoint_fields_class}">
   <div class="form-group">
     <label for="settings-endpoint-preset">预设端点</label>
-    <select id="settings-endpoint-preset" onchange="applyEndpointPreset()">
+    <select id="settings-endpoint-preset"{endpoint_disabled_attr} onchange="applyEndpointPreset()">
       {endpoint_options_html}
     </select>
   </div>
   <div class="form-row">
     <div class="form-group">
       <label for="settings-web">自定义 Web Base URL</label>
-    <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1" oninput="markEndpointDirty()">
+    <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1"{endpoint_disabled_attr} oninput="markEndpointDirty()">
     </div>
   </div>
   <div class="form-row">
     <div class="form-group">
       <label for="settings-model-base">模型网关地址（IDE Agent / Solo）</label>
-    <input id="settings-model-base" class="mono-input" value="{html_mod.escape(settings_model_base)}" placeholder="https://trae-api-cn.mchost.guru" oninput="markEndpointDirty()">
+    <input id="settings-model-base" class="mono-input" value="{html_mod.escape(settings_model_base)}" placeholder="https://trae-api-cn.mchost.guru"{endpoint_disabled_attr} oninput="markEndpointDirty()">
     </div>
   </div>
   <p class="field-note" id="settings-endpoint-preview"></p>
+  </div>
   <div class="btn-group">
     <button class="btn btn-primary btn-sm" id="settings-save-btn" onclick="saveSettings()" disabled>{ic['save']}保存设置</button>
   </div>
@@ -2070,7 +2299,7 @@ def _web_login_html() -> str:
     <span id="auto-route-state" class="state-pill{auto_route_pill}">{auto_route_state_text}</span>
   </div>
   <div class="switch-row">
-    <div class="switch-text"><strong>启用自动路由</strong><span>工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote；开启后忽略预设端点的模式</span></div>
+    <div class="switch-text"><strong>启用自动路由</strong><span>工具或图片请求走 IDE Agent，纯文字聊天走 Remote，失败回落 Remote；开启后忽略预设端点的模式</span></div>
     <label class="switch" title="启用自动路由">
       <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="markAutoRouteDirty()" aria-label="启用自动路由"><span class="track"></span>
     </label>
@@ -2120,11 +2349,11 @@ def _web_login_html() -> str:
     <div class="form-group">
       <label for="conn-endpoint">指定上游（测试期间禁止跨端点回落）</label>
     <select id="conn-endpoint">
-        <option value="auto-route">自动路由（工具 IDE Agent / 聊天 Remote）</option>
+        <option value="auto-route">自动路由（工具或图片 IDE Agent / 文字 Remote）</option>
         <option value="remote">Remote / chat_sessions</option>
-        <option value="ide">IDE Agent / llm_utils_chat</option>
-        <option value="solo">Solo / api/agent/v3/llm_utils_chat</option>
-        <option value="work-agent">Work Agent / solo_work_remote</option>
+        <option value="work">TraeWork / chat_sessions（Work tier）</option>
+        <option value="solo">TraeCode Solo / llm_raw_chat</option>
+        <option value="ide">TraeCode IDE / llm_raw_chat</option>
       </select>
     </div>
   </div>
@@ -2142,6 +2371,7 @@ def _web_login_html() -> str:
           <option value="medium">medium / 高</option>
           <option value="high">high / 高</option>
           <option value="xhigh">xhigh / 极高</option>
+          <option value="ultra">ultra / 极高</option>
         </select>
       </label>
       <label class="inline-check inline-field">超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600"></label>
@@ -2159,15 +2389,41 @@ def _web_login_html() -> str:
   </div>
   <div id="conn-msg" class="msg"></div>
 </div>
-<div class="panel-card">
-  <div class="section-head">
-    <div class="section-title">模型列表</div>
-    <button class="btn btn-secondary btn-sm" onclick="refreshModels()">{ic['list']}获取模型列表</button>
-  </div>
-  <p class="section-desc">从当前账号的上游模型列表实时获取，只列小写模型名，大小写重复项已合并。</p>
-  <pre id="models-out" class="code-out"></pre>
-  <div id="models-msg" class="msg"></div>
 </div>
+</div>
+
+<div class="tab-page" data-page="model-list">
+<div class="panel-stack">
+<section id="model-list-panel" aria-labelledby="model-list-title">
+  <div class="section-head">
+    <div><div class="section-title" id="model-list-title">模型列表</div><span id="model-list-meta" class="section-meta">尚未加载</span></div>
+    <button class="btn btn-secondary btn-sm" id="models-refresh-btn" onclick="refreshModels()">{ic['refresh-cw']}刷新模型列表</button>
+  </div>
+  <p class="section-desc">TraeCode：Solo / IDE · TraeWork：Work · 同一模型可出现在多个端点目录中</p>
+  <div class="model-list-grid">
+    <section class="model-column" aria-labelledby="models-col-remote-title">
+      <div class="model-column-head"><span class="model-column-title" id="models-col-remote-title">Remote</span><span class="model-column-count" id="models-count-remote">0</span></div>
+      <div class="model-column-body" id="models-col-remote"><div class="model-column-empty">尚未加载</div></div>
+    </section>
+    <section class="model-column" aria-labelledby="models-col-traecode-title">
+      <div class="model-column-head"><span class="model-column-title" id="models-col-traecode-title">TraeCode</span><span class="model-column-count" id="models-count-traecode">0</span></div>
+      <div class="model-column-body" id="models-col-traecode"><div class="model-column-empty">尚未加载</div></div>
+    </section>
+    <section class="model-column" aria-labelledby="models-col-traework-title">
+      <div class="model-column-head"><span class="model-column-title" id="models-col-traework-title">TraeWork</span><span class="model-column-count" id="models-count-traework">0</span></div>
+      <div class="model-column-body" id="models-col-traework"><div class="model-column-empty">尚未加载</div></div>
+    </section>
+  </div>
+  <div id="models-fallback" class="model-fallback" hidden>
+    <div class="model-fallback-head">
+      <span class="model-fallback-title">内置回退 · 端点未确认</span>
+      <span class="model-column-count" id="models-count-fallback">0</span>
+      <span class="model-fallback-note">内置或未归类的候选模型，尚未验证端点可用性</span>
+    </div>
+    <div class="model-fallback-list" id="models-col-fallback"></div>
+  </div>
+  <div id="models-msg" class="msg" role="status" aria-live="polite"></div>
+</section>
 </div>
 </div>
 
@@ -2198,6 +2454,7 @@ function switchTab(name){{
   try{{ history.replaceState(null,'','#'+name); }}catch(e){{}}
   syncSelection();
   if(name==='overview') refreshOverview();
+  if(name==='model-list') refreshModels();
 }}
 // Sliding highlights for the nav and segmented controls. The first placement
 // skips the transition so elements don't fly in from the corner.
@@ -2236,6 +2493,128 @@ function setStatePill(id,text,on){{
   el.textContent=text;
   el.classList.toggle('on',!!on);
 }}
+// Credit reconciliation state is intentionally kept separate from usage
+// rendering.  The server's ``remaining`` field is the effective balance
+// (official snapshot minus weighted, confirmed local debits); older servers
+// may only expose the historical ``remaining``/``total_limit`` pair.
+var creditUiState={{
+  accounts:Object.create(null),
+  meta:{{status:'unknown',reconciled_at:0,confidence:null,official_remaining:null,local_debit:null}},
+  usageFingerprint:'',
+  usageFingerprintReady:false,
+  reconcileTimer:null,
+  reconcileInFlight:false
+}};
+function creditNumber(value){{
+  if(value===undefined||value===null||value==='') return null;
+  var n=Number(value);
+  return Number.isFinite(n)?n:null;
+}}
+function creditSnapshot(data){{
+  if(!data||typeof data!=='object') return null;
+  var raw=data.account_credits||data.credits||data;
+  if(!raw||typeof raw!=='object') return null;
+  var out=Object.assign({{}},raw);
+  ['credits_reconciled_at','reconcile_status','reconcile_confidence','official_remaining','local_debit','credits_updated_at'].forEach(function(key){{
+    if(out[key]===undefined&&data[key]!==undefined) out[key]=data[key];
+  }});
+  return out;
+}}
+function creditStatusLabel(status){{
+  var value=String(status||'unknown').trim().toLowerCase();
+  if(value==='ok'||value==='verified'||value==='upstream') return '已校准';
+  if(value==='projected'||value==='weighted'||value==='usage_weighted') return '加权估算';
+  if(value==='stale'||value==='pending'||value==='settling') return '待校准';
+  if(value==='error'||value==='failed') return '校准失败';
+  return '等待校准';
+}}
+function creditStatusClass(status){{
+  var value=String(status||'unknown').trim().toLowerCase();
+  if(value==='ok'||value==='verified'||value==='upstream') return 'ok';
+  if(value==='projected'||value==='weighted'||value==='usage_weighted') return 'projected';
+  if(value==='stale'||value==='pending'||value==='settling') return 'stale';
+  if(value==='error'||value==='failed') return 'error';
+  return 'unknown';
+}}
+function creditTime(value){{
+  var n=creditNumber(value);
+  if(!n) return '';
+  // Upstream stores seconds; tolerate millisecond timestamps in custom
+  // adapters without showing an implausible 1970 date.
+  if(n>100000000000) n=n/1000;
+  try{{ return new Date(n*1000).toLocaleTimeString(); }}catch(e){{ return ''; }}
+}}
+function renderCreditCalibrationMeta(){{
+  var meta=creditUiState.meta||{{}};
+  var label=creditStatusLabel(meta.status);
+  var stamp=creditTime(meta.reconciled_at||meta.updated_at);
+  var confidence=creditNumber(meta.confidence);
+  var text=label+(stamp?' · '+stamp:'');
+  if(confidence!==null) text+=' · 置信 '+Math.round(Math.max(0,Math.min(1,confidence))*100)+'%';
+  var detail=[];
+  var official=creditNumber(meta.official_remaining);
+  var local=creditNumber(meta.local_debit);
+  if(official!==null) detail.push('官方 '+official.toFixed(2));
+  if(local!==null&&local>0) detail.push('待上游扣除 '+local.toFixed(2));
+  ['credits-calibration-state','stat-credits-meta','ov-credits-meta'].forEach(function(id){{
+    var el=document.getElementById(id);
+    if(!el) return;
+    el.textContent=text;
+    el.title=detail.join(' · ')||'总积分由上游快照与已确认消费加权校准';
+    if(el.classList){{ el.classList.remove('ok','projected','stale','error','unknown'); el.classList.add(creditStatusClass(meta.status)); }}
+  }});
+}}
+function updateCreditCalibrationMeta(data){{
+  if(!data||typeof data!=='object') return;
+  var meta=creditUiState.meta||{{}};
+  var source=data.accounts&&typeof data.accounts==='object'?data.accounts:data;
+  var status=source.credits_reconcile_status;
+  var stamp=source.credits_reconciled_at||source.credits_updated_at;
+  var confidence=source.credits_reconcile_confidence;
+  var official=source.credits_official_remaining;
+  var local=source.credits_local_debit;
+  if(status===undefined&&data.account_credits) status=data.account_credits.reconcile_status;
+  if(stamp===undefined&&data.account_credits) stamp=data.account_credits.credits_reconciled_at||data.account_credits.credits_updated_at;
+  if(confidence===undefined&&data.account_credits) confidence=data.account_credits.reconcile_confidence;
+  if(official===undefined&&data.account_credits) official=data.account_credits.official_remaining;
+  if(local===undefined&&data.account_credits) local=data.account_credits.local_debit;
+  if(status!==undefined&&status!==null&&status!=='') meta.status=status;
+  if(stamp!==undefined&&stamp!==null&&stamp!=='') meta.reconciled_at=stamp;
+  if(confidence!==undefined&&confidence!==null&&confidence!=='') meta.confidence=confidence;
+  if(official!==undefined&&official!==null&&official!=='') meta.official_remaining=official;
+  if(local!==undefined&&local!==null&&local!=='') meta.local_debit=local;
+  creditUiState.meta=meta;
+  renderCreditCalibrationMeta();
+}}
+function updateCreditCalibrationFromAccounts(accounts){{
+  if(!Array.isArray(accounts)||!accounts.length) return;
+  var latest=0, status='', confidenceTotal=0, confidenceWeight=0, officialTotal=0, localTotal=0;
+  var hasOfficial=false, hasLocal=false, successful=0;
+  accounts.forEach(function(account){{
+    var snap=creditSnapshot(account);
+    if(!snap) return;
+    var stamp=creditNumber(snap.credits_reconciled_at||account.credits_reconciled_at||snap.credits_updated_at||account.credits_updated_at);
+    if(stamp!==null) latest=Math.max(latest,stamp);
+    var accountStatus=snap.reconcile_status||account.credits_reconcile_status;
+    if(accountStatus) status=status||accountStatus;
+    var confidence=creditNumber(snap.reconcile_confidence||account.credits_reconcile_confidence);
+    var remaining=creditNumber(snap.remaining);
+    if(confidence!==null){{ var weight=Math.max(1,remaining===null?1:Math.abs(remaining)); confidenceTotal+=confidence*weight; confidenceWeight+=weight; }}
+    var official=creditNumber(snap.official_remaining);
+    if(official!==null){{ officialTotal+=official; hasOfficial=true; }}
+    var local=creditNumber(snap.local_debit);
+    if(local!==null){{ localTotal+=local; hasLocal=true; }}
+    if(!account.error) successful++;
+  }});
+  if(successful===0) return;
+  updateCreditCalibrationMeta({{
+    credits_reconciled_at:latest||null,
+    credits_reconcile_status:status||'ok',
+    credits_reconcile_confidence:confidenceWeight?confidenceTotal/confidenceWeight:null,
+    credits_official_remaining:hasOfficial?officialTotal:null,
+    credits_local_debit:hasLocal?localTotal:null
+  }});
+}}
 // Overview numbers are derived from the rendered rows so every partial
 // refresh (single check-in, credits query, claim-all) keeps them in sync.
 function refreshStats(){{
@@ -2254,6 +2633,7 @@ function refreshStats(){{
   set('stat-total',rows.length);
   set('stat-checked',checked);
   set('stat-credits',unlimited?'无限':(known?sum.toFixed(2):'-'));
+  renderCreditCalibrationMeta();
 }}
 const state = {{ traceId: null, win: null }};
 let currentCodeVerifier = '';
@@ -2276,21 +2656,65 @@ async function buildAuthUrl() {{
   }});
   return '{auth_url}?'+p.toString();
 }}
+let localHelperError = '';
 async function checkLocalListener() {{
+  var timer;
+  localHelperError = '';
   try {{
     var ctrl = new AbortController();
-    var timer = setTimeout(function(){{ ctrl.abort(); }}, 1200);
+    timer = setTimeout(function(){{ ctrl.abort(); }}, 2500);
+    var expectedResponse = await fetch(helperEndpointPath('/web/login/helper-info') + '?relay=' + encodeURIComponent(currentDeploymentBase()), {{signal: ctrl.signal, cache: 'no-store'}});
+    if (!expectedResponse.ok) {{
+      localHelperError = '授权助手部署配置无效，请检查服务器配置后重新下载。';
+      return false;
+    }}
+    var expected = await expectedResponse.json();
     var r = await fetch('http://127.0.0.1:{listener_port}/healthz', {{signal: ctrl.signal, cache: 'no-store'}});
-    clearTimeout(timer);
-    return r.ok;
+    if (!r.ok) return false;
+    var helper = await r.json();
+    if (!helper.relay || normalizeHelperBase(helper.relay) !== normalizeHelperBase(expected.relay_url)) {{
+      localHelperError = '本机授权助手绑定了其他部署，请关闭旧助手，重新下载并运行当前页面的助手。';
+      return false;
+    }}
+    return true;
   }} catch(e) {{ return false; }}
+  finally {{ clearTimeout(timer); }}
 }}
+function helperEndpointPath(path) {{
+  return window.location.pathname.replace(/\\/web\\/login\\/?$/, '').replace(/\\/$/, '') + path;
+}}
+function currentDeploymentBase() {{
+  return window.location.origin + helperEndpointPath('');
+}}
+function normalizeHelperBase(value) {{
+  var url = new URL(value);
+  return url.origin + url.pathname.replace(/\\/+$/, '');
+}}
+function refreshHelperDownloadLinks() {{
+  var base = currentDeploymentBase();
+  var suffix = '&relay=' + encodeURIComponent(base);
+  [['helper-py-link', 'py'], ['bat-link', 'bat'], ['sh-link', 'sh']].forEach(function(item) {{
+    var link = document.getElementById(item[0]);
+    if (link) link.href = helperEndpointPath('/web/login/download') + '?as=' + item[1] + suffix;
+  }});
+  pickHelperPlatformScript();
+}}
+function pickHelperPlatformScript() {{
+  // 只显示与本机系统匹配的一键脚本，避免多下一个用不了的文件。
+  var probe = String(navigator.platform || '') + ' ' + String(navigator.userAgent || '');
+  var isWindows = /Win/i.test(probe);
+  var bat = document.getElementById('bat-link');
+  var sh = document.getElementById('sh-link');
+  if (bat) bat.style.display = isWindows ? 'inline-flex' : 'none';
+  if (sh) sh.style.display = isWindows ? 'none' : 'inline-flex';
+}}
+refreshHelperDownloadLinks();
 async function startAuth() {{
   try {{
   var ok = await checkLocalListener();
   if (!ok) {{
-    showMsg('auth-msg', '未检测到本机授权助手，请先下载并双击运行 web_login.py（需 Python）或 start_auth.bat：', false);
-    document.getElementById('bat-link').style.display='inline-flex';
+    showMsg('auth-msg', localHelperError || '未检测到本机授权助手，请先下载并运行当前页面的授权助手。', false);
+    pickHelperPlatformScript();
     return;
   }}
   state.traceId = uuid();
@@ -2335,12 +2759,12 @@ function usageBoolean(value){{
 }}
 function usageEffortLabel(value){{
   if(value===undefined || value===null || value==='') return '';
-  var text=String(value).trim().toLowerCase().replace(/[\s-]+/g,'_');
+  var text=String(value).trim().toLowerCase().replace(/[\\s-]+/g,'_');
   if(text==='none' || text==='minimal' || text==='min') return '最低';
   if(text==='low' || text==='light') return '低';
   if(text==='medium' || text==='mid' || text==='normal' || text==='default') return '中';
   if(text==='high') return '高';
-  if(text==='xhigh' || text==='extra_high' || text==='very_high' || text==='max' || text==='maximum') return '极高';
+  if(text==='xhigh' || text==='extra_high' || text==='very_high' || text==='max' || text==='maximum' || text==='ultra') return '极高';
   return escapeHtml(String(value));
 }}
 function usageReasoningMeta(record){{
@@ -2385,7 +2809,7 @@ function usageContextMeta(record){{
   // the separate Max column for actual activation evidence.
   if(value===null && requested!==null) value=requested;
   if(value===null) return {{text:'--',title:'未记录上下文模式'+(requested!==null?'；请求: '+String(requested):''),unknown:true}};
-  var text=String(value).trim().toLowerCase().replace(/[\s_-]+/g,'');
+  var text=String(value).trim().toLowerCase().replace(/[\\s_-]+/g,'');
   var label;
   if(['max','max1m','1m','1000000','agent','agentmax','maxmode'].indexOf(text)>=0 || size>=1000000) label='1M Max';
   else if(['standard','default','work','dev','200k','200000','normal'].indexOf(text)>=0) label='标准';
@@ -2402,14 +2826,14 @@ function usageMaxMeta(record){{
   if(requested===null){{
     var requestedContext=usageRecordField(record,['context_mode_requested','requested_context_mode']);
     if(requestedContext!==null){{
-      var normalized=String(requestedContext).trim().toLowerCase().replace(/[\s_-]+/g,'');
+      var normalized=String(requestedContext).trim().toLowerCase().replace(/[\\s_-]+/g,'');
       requested=['max','max1m','1m','1000000','agentmax','maxmode'].indexOf(normalized)>=0;
     }}
   }}
   if(enabled===null){{
     var actualContext=usageRecordField(record,['context_mode_actual','actual_context_mode','context_mode']);
     if(actualContext!==null){{
-      var actual=String(actualContext).trim().toLowerCase().replace(/[\s_-]+/g,'');
+      var actual=String(actualContext).trim().toLowerCase().replace(/[\\s_-]+/g,'');
       enabled=['max','max1m','1m','1000000','agentmax','maxmode'].indexOf(actual)>=0;
     }}
   }}
@@ -2445,6 +2869,69 @@ function usageModelFlags(maxMode,tool){{
   return '<span class="usage-flag'+maxClass+'" title="'+escapeHtml(maxMode.title)+'">Max: '+maxText+'</span>'
     + '<span class="usage-flag'+toolClass+'" title="'+escapeHtml(tool.title)+'">Tool: '+toolText+'</span>';
 }}
+function usageTransportMeta(record){{
+  // Queue position and continuation rounds are transport telemetry: they must
+  // never appear in the model answer, but operators still need them to explain
+  // a slow turn or a completion that took more than one upstream round.
+  var position=Number(usageRecordField(record,['queue_position'])||0);
+  var rounds=Number(usageRecordField(record,['auto_continue_rounds'])||0);
+  var parts=[];
+  var title=[];
+  if(position>0){{ parts.push('排队 #'+position); title.push('上游队列位置 '+position); }}
+  if(rounds>0){{ parts.push('续写 '+rounds); title.push('自动续写 '+rounds+' 轮'); }}
+  if(!parts.length) return null;
+  return {{text:parts.join(' · '),title:title.join('；')}};
+}}
+function usageRouteMeta(record){{
+  var rawProduct=usageRecordField(record,['product','provider_product','upstream_product']);
+  var product=rawProduct===null?'':String(rawProduct).trim().toLowerCase();
+  var productLabel=product==='traework'?'TraeWork':(product==='trae'?'Trae':(rawProduct===null?'--':String(rawProduct)));
+  var actual=usageRecordField(record,['actual_endpoint','actual_mode','upstream_endpoint']);
+  var requested=usageRecordField(record,['requested_endpoint','requested_mode']);
+  var publicEndpoint=usageRecordField(record,['endpoint']);
+  var endpoint=actual||requested||publicEndpoint;
+  var detail=endpoint===null?'--':String(endpoint);
+  var title=[];
+  if(productLabel!=='--') title.push('产品: '+productLabel);
+  if(actual!==null) title.push('实际端点: '+String(actual));
+  if(requested!==null && String(requested)!==String(actual||'')) title.push('请求端点: '+String(requested));
+  if(publicEndpoint!==null && String(publicEndpoint)!==String(actual||requested||'')) title.push('入口: '+String(publicEndpoint));
+  return {{
+    text:escapeHtml(productLabel)+'<div class="usage-route-endpoint">'+escapeHtml(detail)+'</div>',
+    title:title.join('；')||'未记录产品/端点',
+    unknown:productLabel==='--' && endpoint===null
+  }};
+}}
+function usageCreditFingerprint(records){{
+  if(!Array.isArray(records)) return '';
+  return records.map(function(record){{
+    if(!record||typeof record!=='object') return '';
+    var amount=creditNumber(record.credits_consumed);
+    var source=String(record.credits_source||'').toLowerCase();
+    var status=String(record.status||'completed').toLowerCase();
+    if(amount===null||amount<=0||status==='error'||status==='cancelled'||source==='pending'||source==='unavailable'||source==='unknown') return '';
+    return String(record.request_id||record.id||record.timestamp||'')+'='+amount.toFixed(4)+'@'+String(record.account_id||'');
+  }}).filter(Boolean).join('|');
+}}
+function scheduleUsageCreditCalibration(records){{
+  var fingerprint=usageCreditFingerprint(records);
+  if(!fingerprint) return;
+  if(!creditUiState.usageFingerprintReady){{
+    creditUiState.usageFingerprint=fingerprint;
+    creditUiState.usageFingerprintReady=true;
+    return;
+  }}
+  if(fingerprint===creditUiState.usageFingerprint) return;
+  creditUiState.usageFingerprint=fingerprint;
+  // A settled usage row means the effective balance may have changed.  One
+  // debounced bulk query refreshes all rows and the aggregate without
+  // turning the five-second history poll into an upstream polling loop.
+  clearTimeout(creditUiState.reconcileTimer);
+  creditUiState.reconcileTimer=setTimeout(function(){{
+    creditUiState.reconcileTimer=null;
+    creditsRefreshAll({{silent:true,reason:'usage'}});
+  }},1200);
+}}
 async function refreshUsage() {{
   if(usageRefreshing) return;
   usageRefreshing=true;
@@ -2456,6 +2943,7 @@ async function refreshUsage() {{
     if(!result.ok) throw new Error(apiError(result.data,result.status));
     var records=usageRecordsFromPayload(result.data);
     if(records===null) throw new Error(apiError(result.data,result.status));
+    scheduleUsageCreditCalibration(records);
     if(!tbody) return;
     if(records.length===0) {{
       tbody.innerHTML='';
@@ -2467,10 +2955,12 @@ async function refreshUsage() {{
         var when=stamp?new Date(stamp*1000).toLocaleString():'--';
         var account=record.account_id?String(record.account_id).slice(-12):'--';
         var model=record.model||'--';
+         var route=usageRouteMeta(record);
          var reasoning=usageReasoningMeta(record);
          var context=usageContextMeta(record);
          var maxMode=usageMaxMeta(record);
          var tool=usageToolMeta(record);
+         var transport=usageTransportMeta(record);
         var input=Number(record.input_tokens!==undefined?record.input_tokens:(record.prompt_tokens||0));
         var output=Number(record.output_tokens!==undefined?record.output_tokens:(record.completion_tokens||0));
         var total=Number(record.total_tokens!==undefined?record.total_tokens:(input+output));
@@ -2486,6 +2976,7 @@ async function refreshUsage() {{
         return '<tr>'
           + '<td>'+escapeHtml(when)+'</td>'
           + '<td><code>'+escapeHtml(account)+'</code></td>'
+          + '<td class="usage-meta usage-route'+(route.unknown?' unknown':'')+'" title="'+escapeHtml(route.title)+'">'+route.text+'</td>'
           + '<td class="usage-model-cell"><div title="'+escapeHtml(model)+'">'+escapeHtml(model)+'</div><div class="usage-model-flags">'+usageModelFlags(maxMode,tool)+'</div></td>'
           + '<td class="usage-meta'+(reasoning.unknown?' unknown':'')+'" title="'+escapeHtml(reasoning.title)+'">'+reasoning.text+'</td>'
           + '<td class="usage-meta'+(context.unknown?' unknown':'')+'" title="'+escapeHtml(context.title)+'">'+escapeHtml(context.text)+'</td>'
@@ -2494,6 +2985,7 @@ async function refreshUsage() {{
           + '<td class="numeric">'+escapeHtml(tokenText)+'</td>'
           + '<td class="numeric" title="'+escapeHtml(source)+'">'+escapeHtml(creditText)+'</td>'
           + '<td class="usage-status"><span class="badge '+badge+'">'+escapeHtml(statusText)+'</span></td>'
+          + '<td class="usage-meta usage-transport"'+(transport?(' title="'+escapeHtml(transport.title)+'"'):'')+'>'+(transport?escapeHtml(transport.text):'--')+'</td>'
           + '</tr>';
       }}).join('');
     }}
@@ -2585,6 +3077,7 @@ function renderOverview(){{
   setOv('ov-inflight',String(s.in_flight||0));
   var cr=a.credits_remaining;
   setOv('ov-credits',cr==='unlimited'?'无限':(cr===null||cr===undefined?'--':Number(cr).toFixed(2)));
+  updateCreditCalibrationMeta(a);
   renderOverviewChart();
   renderOverviewDays();
   showOverviewDay(ovDay);
@@ -2712,7 +3205,10 @@ function setOverviewRange(value){{
 }})();
 setInterval(function(){{
   if(document.hidden) return;
-  if(document.querySelector('.tab-page.active[data-page="overview"]')) refreshOverview();
+  // /api/overview reads the persisted credit projection and never calls the
+  // provider.  Keep the calibration badge and aggregate total fresh on every
+  // page without turning this timer into an upstream credit probe.
+  refreshOverview();
 }},10000);
 refreshOverview();
 window.addEventListener('message',function(ev){{
@@ -2845,15 +3341,26 @@ function setAccountCheckinBusy(id,busy){{
   syncCheckinBusyUI();
 }}
 function setCredits(id,data){{
-  var values=[['general-credits-',data&&data.account_credits]];
-  values.forEach(function(pair){{
-    var el=document.getElementById(pair[0]+id), value=pair[1];
-    if(!el) return;
-    if(value===undefined||value===null) return;
-    if(value.unlimited) el.textContent='☆ 无限';
-    else if(value.remaining!==undefined&&value.remaining!==null) el.textContent='剩'+Number(value.remaining).toFixed(2)+'/总'+(value.total_limit===undefined?'?':Number(value.total_limit).toFixed(2));
-    else el.textContent='-';
-  }});
+  var value=creditSnapshot(data);
+  var el=document.getElementById('general-credits-'+id);
+  if(!el||!value) return;
+  creditUiState.accounts[String(id)]=Object.assign({{}},creditUiState.accounts[String(id)]||{{}},value);
+  var row=document.getElementById('row-'+id);
+  if(row){{
+    var remaining=creditNumber(value.remaining);
+    var official=creditNumber(value.official_remaining);
+    var local=creditNumber(value.local_debit);
+    if(remaining!==null) row.dataset.creditRemaining=String(remaining);
+    if(official!==null) row.dataset.creditOfficial=String(official);
+    if(local!==null) row.dataset.creditLocalDebit=String(local);
+    if(value.reconcile_status) row.dataset.creditStatus=String(value.reconcile_status);
+    if(value.credits_reconciled_at) row.dataset.creditReconciledAt=String(value.credits_reconciled_at);
+  }}
+  if(value.unlimited) el.textContent='☆ 无限';
+  else if(value.remaining!==undefined&&value.remaining!==null) el.textContent='剩'+Number(value.remaining).toFixed(2)+'/总'+(value.total_limit===undefined?'?':Number(value.total_limit).toFixed(2));
+  else if(value.official_remaining!==undefined&&value.official_remaining!==null) el.textContent='剩'+Number(value.official_remaining).toFixed(2)+'/总'+(value.total_limit===undefined?'?':Number(value.total_limit).toFixed(2));
+  else el.textContent='-';
+  updateCreditCalibrationMeta(value);
 }}
 function setCheckinState(id,checked,detail,error){{
   var el=document.getElementById('checkin-'+id), detailEl=document.getElementById('checkin-detail-'+id);
@@ -3070,21 +3577,122 @@ async function runConnTest(){{
     endpointWarnings.slice(0,3).join('\\n'),false,12000);
 }}
 async function refreshModels(){{
-  var el=document.getElementById('models-out');
-  var msg=document.getElementById('models-msg');
-  el.style.display='block';
-  el.textContent='加载中...';
+  if(refreshModels.running) return;
+  refreshModels.running=true;
+  var refreshButton=document.getElementById('models-refresh-btn');
+  if(refreshButton) refreshButton.disabled=true;
+  var meta=document.getElementById('model-list-meta');
+  var groupNames=['remote','traecode','traework'];
+  var columns={{}};
+  groupNames.forEach(function(group){{
+    columns[group]=document.getElementById('models-col-'+group);
+    var count=document.getElementById('models-count-'+group);
+    if(count) count.textContent='0';
+    if(columns[group]) columns[group].innerHTML='<div class="model-column-empty">加载中...</div>';
+  }});
+  var fallbackPanel=document.getElementById('models-fallback');
+  var fallbackColumn=document.getElementById('models-col-fallback');
+  var fallbackCount=document.getElementById('models-count-fallback');
+  if(fallbackPanel) fallbackPanel.hidden=true;
+  if(fallbackColumn) fallbackColumn.innerHTML='';
+  if(fallbackCount) fallbackCount.textContent='0';
+  if(meta) meta.textContent='加载中...';
   try{{
     var result=await requestJSON('/v1/models?refresh=true',{{method:'GET'}},45000);
     var d=result.data;
     if(!result.ok || !d || !Array.isArray(d.data)){{
       throw new Error((d && d.error && d.error.message) || ('HTTP '+result.status));
     }}
-    el.textContent=d.data.map(function(model,index){{ return String(index+1).padStart(2,'0')+'  '+String(model.id||''); }}).join('\\n');
+    var groupForEndpoint=function(endpoint){{
+      endpoint=String(endpoint||'').trim().toLowerCase();
+      if(endpoint==='remote') return 'remote';
+      if(endpoint==='work' || endpoint==='traework') return 'traework';
+      if(endpoint==='solo' || endpoint==='ide' || endpoint==='traecode') return 'traecode';
+      return '';
+    }};
+    var fallbackModels=[];
+    var modelGroups=function(model){{
+      var modelId=String(model.id||'').toLowerCase();
+      if(modelId==='auto') return ['remote'];
+      var groups=(Array.isArray(model.endpoint_groups)?model.endpoint_groups:[model.endpoint_group])
+        .map(groupForEndpoint).filter(Boolean);
+      if(!groups.length){{
+        groups=(Array.isArray(model.endpoints)?model.endpoints:[model.endpoint])
+          .map(groupForEndpoint).filter(Boolean);
+      }}
+      if(!groups.length && model.endpoint){{
+        groups=[groupForEndpoint(model.endpoint)].filter(Boolean);
+      }}
+      groups=groups.filter(function(item,index){{ return item && groups.indexOf(item)===index; }});
+      if(!groups.length && !fallbackModels.some(function(item){{ return item.id===model.id; }})) fallbackModels.push(model);
+      return groups;
+    }};
+    var appendModel=function(column,model){{
+      var item=document.createElement('div');
+      item.className='model-item';
+      var name=document.createElement('div');
+      name.className='model-item-name';
+      name.textContent=String(model.id||'');
+      item.appendChild(name);
+      if(String(model.id||'').toLowerCase()==='auto'){{
+        var route=document.createElement('div');
+        route.className='model-item-alias';
+        route.textContent='Relay 自动路由';
+        item.appendChild(route);
+      }}
+      if(model.alias_for){{
+        var alias=document.createElement('div');
+        alias.className='model-item-alias';
+        alias.textContent='别名 → '+String(model.alias_for);
+        item.appendChild(alias);
+      }}
+      column.appendChild(item);
+    }};
+    var grouped={{remote:[],traecode:[],traework:[]}};
+    d.data.forEach(function(model){{
+      modelGroups(model).forEach(function(group){{
+        if(!grouped[group].some(function(existing){{ return String(existing.id||'')===String(model.id||''); }})){{
+          grouped[group].push(model);
+        }}
+      }});
+    }});
+    groupNames.forEach(function(group){{
+      var column=columns[group];
+      var count=document.getElementById('models-count-'+group);
+      if(!column) return;
+      column.innerHTML='';
+      var items=grouped[group]||[];
+      if(count) count.textContent=String(items.length);
+      if(!items.length){{
+        column.innerHTML='<div class="model-column-empty">暂无模型</div>';
+        return;
+      }}
+      items.forEach(function(model){{
+        appendModel(column,model);
+      }});
+    }});
+    if(fallbackPanel && fallbackColumn && fallbackModels.length){{
+      fallbackPanel.hidden=false;
+      if(fallbackCount) fallbackCount.textContent=String(fallbackModels.length);
+      fallbackModels.forEach(function(model){{
+        appendModel(fallbackColumn,model);
+      }});
+    }}
+    if(meta) meta.textContent='共 '+d.data.length+' 个模型，按端点归类';
     showMsg('models-msg','成功获取 '+d.data.length+' 个模型',true);
   }}catch(e){{
-    el.textContent=String(e);
+    groupNames.forEach(function(group){{
+      var column=columns[group];
+      if(column) column.innerHTML='<div class="model-column-empty">加载失败</div>';
+    }});
+    if(fallbackPanel) fallbackPanel.hidden=true;
+    if(fallbackColumn) fallbackColumn.innerHTML='';
+    if(fallbackCount) fallbackCount.textContent='0';
+    if(meta) meta.textContent='加载失败';
     showMsg('models-msg',String(e),false);
+  }}finally{{
+    refreshModels.running=false;
+    if(refreshButton) refreshButton.disabled=false;
   }}
 }}
 async function logout(){{
@@ -3242,8 +3850,13 @@ function endpointPreviewText(state){{
   var web=String(state.web_base_url||'').replace(/\\/+$/,'');
   var model=String(state.model_base_url||'').replace(/\\/+$/,'');
   var parts=[];
-  if(entry&&(entry.mode==='ide'||entry.mode==='solo')){{
+  if(entry&&(entry.mode==='work'||entry.mode==='work-agent')){{
+    parts.push('模型请求 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
+    parts.push('TraeWork / solo_work_remote（Work tier）');
+  }}else if(entry&&(entry.mode==='ide'||entry.mode==='solo')){{
     parts.push('模型请求 '+(model||'https://trae-api-cn.mchost.guru')+'/api/agent/v3/llm_utils_chat');
+    parts.push('function=solo_work_lite');
+    parts.push('raw 诊断 '+(model||'https://trae-api-cn.mchost.guru')+'/api/ide/v2/llm_raw_chat');
     parts.push('Remote 回落 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
   }}else{{
     parts.push('会话请求 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
@@ -3338,7 +3951,40 @@ function markRelayServiceDirty(){{
 function markAutoRouteDirty(){{
   var button=document.getElementById('auto-route-save-btn');
   if(button) button.disabled=false;
+  // Mirror the switch immediately: the endpoint panel must gray out as soon as
+  // auto routing is turned on, before the save round-trip completes.
+  var toggle=document.getElementById('auto-route-toggle');
+  applyEndpointLock(toggle&&toggle.checked);
   showMsg('auto-route-msg','自动路由设置已修改，点击“保存自动路由”后生效',true,0);
+}}
+// Auto routing owns the endpoint choice while it is on: the dispatcher ignores
+// the preset, so the form is locked instead of accepting a value that would
+// never be used.  Applied from server-rendered state on load, mirrored on every
+// switch change, and re-applied after each save so the two panels can never
+// disagree about which channel is actually in use.
+function applyEndpointLock(enabled){{
+  enabled=!!enabled;
+  var fields=document.getElementById('endpoint-fields');
+  var note=document.getElementById('endpoint-lock-note');
+  var pill=document.getElementById('endpoint-lock-state');
+  if(fields) fields.classList.toggle('endpoint-locked',enabled);
+  ['settings-endpoint-preset','settings-web','settings-model-base'].forEach(function(id){{
+    var el=document.getElementById(id);
+    if(!el) return;
+    el.disabled=enabled;
+    el.setAttribute('aria-disabled',enabled?'true':'false');
+    el.title=enabled?'自动路由开启时由路由自动决定端点':'';
+  }});
+  if(note) note.hidden=!enabled;
+  if(pill){{
+    pill.textContent=enabled?'自动路由已接管':'手动选择';
+    pill.classList.toggle('lock',enabled);
+  }}
+  var saveButton=document.getElementById('settings-save-btn');
+  // Keep endpoint drafts intact while the form is locked.  If the user turns
+  // auto routing back off without reloading, the explicit endpoint Save button
+  // must become available again instead of silently losing the draft.
+  if(saveButton) saveButton.disabled=enabled || !endpointDirty;
 }}
 async function saveAutoRoute(){{
   var toggle=document.getElementById('auto-route-toggle');
@@ -3348,7 +3994,8 @@ async function saveAutoRoute(){{
     var button=document.getElementById('auto-route-save-btn');
     if(button) button.disabled=true;
     setStatePill('auto-route-state',d.enabled?'已开启':'已关闭',d.enabled);
-    showMsg('auto-route-msg',d.enabled?'自动路由已开启，下一个请求生效':'自动路由已关闭，使用预设端点',true,3000);
+    applyEndpointLock(d.enabled);
+    showMsg('auto-route-msg',d.enabled?'自动路由已开启，上游端点选择已锁定':'自动路由已关闭，可手动选择上游端点',true,3000);
   }} else {{
     showMsg('auto-route-msg',d.error||'保存失败',false);
   }}
@@ -3412,6 +4059,10 @@ async function detectMaxModels(){{
 const ENDPOINT_PRESET_MAP = {endpoint_map_json};
 endpointLastGoodState=readEndpointSelection();
 renderEndpointPreview(endpointLastGoodState);
+// Server-rendered auto-route state decides whether the manual endpoint form
+// starts locked; the DOM attributes are applied here so both panels agree on
+// first paint.
+applyEndpointLock({str(auto_route_on).lower()});
 function applyEndpointPreset(){{
   var selector=document.getElementById('settings-endpoint-preset');
   var input=document.getElementById('settings-web');
@@ -3446,25 +4097,36 @@ async function checkinRefreshAll(){{
   finally{{ setBusy(false); }}
 }}
 async function creditsRefreshAll(){{
-  setBusy(true);
+  var options=arguments[0]||{{}};
+  var silent=!!options.silent;
+  if(creditUiState.reconcileInFlight) return;
+  creditUiState.reconcileInFlight=true;
+  if(!silent) setBusy(true);
   try{{
     var result=await requestJSON('/api/checkin/credits/accounts',{{method:'GET'}},90000);
     var d=result.data;
     if(!result.ok||!d||!d.success){{ throw new Error(apiError(d,result.status)); }}
     var accounts=d.accounts||[];
     accounts.forEach(updateAccountCreditsRow);
+    updateCreditCalibrationFromAccounts(accounts);
     var failures=accounts.filter(function(a){{ return a.error; }});
     var summary=document.getElementById('checkin-summary');
     if(summary) summary.textContent='积分查询完成：'+(accounts.length-failures.length)+' / '+accounts.length+' 个账号'+(failures.length?'，'+failures.length+' 个异常':'');
     var updated=document.getElementById('checkin-updated');
     if(updated) updated.textContent='更新于 '+new Date().toLocaleTimeString();
-    if(failures.length){{
+    if(!silent&&failures.length){{
       showMsg('checkin-msg','积分查询完成，但有 '+failures.length+' 个账号失败：\\n'+failures.slice(0,3).map(checkinFailureText).join('\\n'),false,12000);
-    }}else{{
+    }}else if(!silent){{
       showMsg('checkin-msg','积分查询成功，已刷新 '+accounts.length+' 个账号',true,3000);
     }}
-  }}catch(e){{ showMsg('checkin-msg',String(e),false,12000); }}
-  finally{{ setBusy(false); }}
+  }}catch(e){{
+    creditUiState.meta.status='error';
+    renderCreditCalibrationMeta();
+    if(!silent) showMsg('checkin-msg',String(e),false,12000);
+  }}finally{{
+    creditUiState.reconcileInFlight=false;
+    if(!silent) setBusy(false);
+  }}
 }}
 async function checkinAccount(id){{
   setAccountCheckinBusy(id,true);
@@ -3740,13 +4402,16 @@ async def _deferred_dispatch_stream(
             "auto",
             "ide",
             "solo",
+            "work",
             "work-agent",
             "traework-native",
             "native",
             "traework",
         }
+        and _remote_fallback_allowed_for_request(messages, options)
     )
     fallback_attempted = False
+    fallback_input_error_event = None
     task = asyncio.create_task(_dispatch_chat(messages, model, True, options))
     dispatch_claimed = False
     response = None
@@ -3755,6 +4420,7 @@ async def _deferred_dispatch_stream(
     started_at = time.monotonic()
     upstream_chunks = 0
     upstream_payload_chunks = 0
+    upstream_observed_model_event = False
     saw_done = False
     stream_status = "opening"
     sent_start_event = False
@@ -3784,7 +4450,7 @@ async def _deferred_dispatch_stream(
     async def try_remote_fallback(reason: str):
         """Open one Remote stream after a native path fails before output."""
 
-        nonlocal fallback_attempted, response
+        nonlocal fallback_attempted, response, fallback_input_error_event
         if not fallback_allowed or fallback_attempted:
             return None
         fallback_attempted = True
@@ -3822,6 +4488,8 @@ async def _deferred_dispatch_stream(
                 requested_mode,
                 _upstream_response_error(fallback),
             )
+            if getattr(fallback, "status_code", 200) == 413:
+                fallback_input_error_event = _stream_error_event(fallback)
             response = fallback
             await close_current()
             return None
@@ -3839,21 +4507,53 @@ async def _deferred_dispatch_stream(
 
         nonlocal iterator, upstream_chunks, upstream_payload_chunks
         nonlocal saw_done, stream_status, sent_start_event
-        iterator = getattr(current_response, "body_iterator", None)
-        if iterator is None:
-            body = getattr(current_response, "body", b"")
-            if body:
-                yield body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-            return
-        async for chunk in iterator:
-            if isinstance(chunk, bytes):
-                chunk = chunk.decode("utf-8", errors="replace")
+        iterator = _response_body_iterator(current_response)
+        buffer = ""
+        saw_model_output = False
+        observed_model_event = False
+        saw_error = False
+        pending_terminal_chunks: list[str] = []
+
+        def public_chunks(chunk: str):
+            nonlocal upstream_chunks, upstream_payload_chunks
+            nonlocal upstream_observed_model_event
+            nonlocal saw_done, stream_status, sent_start_event
+            nonlocal saw_model_output, observed_model_event, saw_error
+            text = _chunk_text_delta(chunk)
+            reasoning = _chunk_reasoning_delta(chunk)
+            has_tools = _chunk_has_tool_calls(chunk)
+            has_output = bool(text.strip() or reasoning.strip() or has_tools)
+            saw_model_output = saw_model_output or has_output
+            observed_model_event = observed_model_event or bool(
+                text or reasoning or has_tools
+            )
+            payloads = list(_iter_sse_payloads(chunk))
+            for value in payloads:
+                if (
+                    isinstance(value.get("usage"), Mapping)
+                    or value.get("provider_model_name")
+                ):
+                    observed_model_event = True
+            if not payloads and any(
+                line.lstrip().startswith("data:")
+                and line.split(":", 1)[1].strip() not in {"", "[DONE]"}
+                for line in chunk.splitlines()
+            ):
+                # An invalid model frame cannot prove that replay is safe.
+                observed_model_event = True
+            state = _chunk_stream_state(chunk)
+            saw_error = saw_error or state == "error"
+            upstream_observed_model_event = bool(
+                upstream_observed_model_event or observed_model_event or saw_error
+            )
+            if state == "completed" and not saw_model_output and not saw_error:
+                # Do not let a bare finish/[DONE] turn an empty upstream into
+                # success before the EOF check can surface its real failure.
+                pending_terminal_chunks.append(chunk)
+                return
             if chunk:
                 upstream_chunks += 1
-                if any(
-                    line.lstrip().startswith("data:")
-                    for line in chunk.splitlines()
-                ):
+                if has_output:
                     upstream_payload_chunks += 1
                 if "data: [DONE]" in chunk:
                     saw_done = True
@@ -3862,6 +4562,29 @@ async def _deferred_dispatch_stream(
                     yield _stream_start_event(model)
                     sent_start_event = True
                 yield chunk
+
+        async for chunk in iterator:
+            if isinstance(chunk, (bytes, bytearray)):
+                chunk = bytes(chunk).decode("utf-8", errors="replace")
+            buffer += str(chunk or "").replace("\r\n", "\n")
+            while "\n\n" in buffer:
+                block, buffer = buffer.split("\n\n", 1)
+                for public_chunk in public_chunks(block + "\n\n"):
+                    yield public_chunk
+        if buffer.strip():
+            for public_chunk in public_chunks(buffer):
+                yield public_chunk
+        if not saw_model_output and not saw_error:
+            raise EmptyUpstreamResponse(
+                "Trae upstream stream ended without text, reasoning, or tool calls",
+                retryable=not observed_model_event,
+                observed_model_event=observed_model_event,
+            )
+        for chunk in pending_terminal_chunks:
+            upstream_chunks += 1
+            if "data: [DONE]" in chunk:
+                saw_done = True
+            yield chunk
 
     async def close_dispatch() -> None:
         nonlocal response, iterator
@@ -3905,15 +4628,18 @@ async def _deferred_dispatch_stream(
                 yield ": relay-keepalive\n\n"
 
         if getattr(response, "status_code", 200) >= 400:
+            input_too_large = getattr(response, "status_code", 200) == 413
             upstream_error = _upstream_response_error(response) or "http error"
             error_event = _stream_error_event(response)
             await close_current()
-            fallback = await try_remote_fallback(
-                upstream_error
+            fallback = (
+                None
+                if input_too_large
+                else await try_remote_fallback(upstream_error)
             )
             if fallback is None:
                 stream_status = "upstream_error"
-                yield error_event
+                yield fallback_input_error_event or error_event
                 yield "data: [DONE]\n\n"
                 saw_done = True
                 return
@@ -3927,19 +4653,40 @@ async def _deferred_dispatch_stream(
         except Exception as exc:
             if isinstance(exc, EmptyUpstreamResponse):
                 _track_usage_from_exception(exc, model)
-                if not exc.retryable or exc.observed_model_event:
+                # Native Trae endpoints may emit ``model_config`` and a
+                # usage-turn id before returning account-scoped 4011/429.
+                # The translator preserves those metadata fields on the
+                # exception, but no model output was sent.  Let the endpoint
+                # fallback proceed for this capacity error; otherwise the
+                # public streaming request becomes a 502 while the same
+                # non-stream probe can still rotate/fallback successfully.
+                native_capacity_error = _is_native_rate_limit_error(exc)
+                if (
+                    (not exc.retryable or exc.observed_model_event)
+                    and not native_capacity_error
+                ):
                     raise
             # A StreamingResponse can be returned with HTTP 200 and fail only
             # when its body iterator starts (empty native SSE, invalid headers,
             # or a provider disconnect).  Retry Remote only before any native
             # payload has reached the caller; once partial output is visible we
             # preserve that stream and surface the original failure.
-            if upstream_payload_chunks or fallback_attempted:
+            if (
+                upstream_payload_chunks
+                or upstream_observed_model_event
+                or fallback_attempted
+            ):
                 raise
             await close_current()
             fallback = await try_remote_fallback(str(exc))
             if fallback is None:
-                raise
+                if fallback_input_error_event is None:
+                    raise
+                stream_status = "upstream_error"
+                yield fallback_input_error_event
+                yield "data: [DONE]\n\n"
+                saw_done = True
+                return
             response = fallback
             async for chunk in forward_response(response):
                 yield chunk
@@ -3980,15 +4727,477 @@ async def _deferred_dispatch_stream(
         yield "data: [DONE]\n\n"
         saw_done = True
     finally:
-        await _await_session_cleanup(asyncio.create_task(close_dispatch()))
-        logger.info(
-            "public stream closed id=%s status=%s chunks=%d done=%s elapsed_ms=%d",
-            request_id,
-            stream_status,
-            upstream_chunks,
-            saw_done,
-            int((time.monotonic() - started_at) * 1000),
+        try:
+            await _await_session_cleanup(asyncio.create_task(close_dispatch()))
+        finally:
+            _cancel_unclaimed_account_slot(options)
+            logger.info(
+                "public stream closed id=%s status=%s chunks=%d done=%s elapsed_ms=%d",
+                request_id,
+                stream_status,
+                upstream_chunks,
+                saw_done,
+                int((time.monotonic() - started_at) * 1000),
+            )
+
+
+def _continuation_allowed(options: Optional[Mapping[str, Any]]) -> bool:
+    """Whether this request may transparently continue a truncated answer."""
+
+    if not continuation.enabled():
+        return False
+    options = options or {}
+    if options.get("_disable_auto_continue"):
+        return False
+    # TraeWork's custom-model ingress already owns its own turn loop; a relay
+    # continuation there would double-bill a client-managed conversation.
+    if options.get("_traework_custom_model"):
+        return False
+    return True
+
+
+async def _stream_with_continuation(
+    messages: list[dict],
+    model: str,
+    options: dict,
+    first_response,
+):
+    """Forward one streamed turn, continuing it while the answer is cut off.
+
+    The public response is a single OpenAI SSE stream: continued rounds append
+    deltas, and only the last round emits the finish frame and ``[DONE]``.  Any
+    tool call, an explicit ``finish_reason=length`` on the client's request
+    budget, or a repeated short answer stops the loop so a caller never sees a
+    duplicated or unbounded answer.
+    """
+
+    limit = continuation.max_continues()
+    if not _continuation_allowed(options) or limit <= 0:
+        async for chunk in first_response:
+            yield chunk
+        return
+
+    threshold = continuation.text_threshold()
+    similarity_limit = continuation.similarity_threshold()
+    current_messages = list(messages)
+    current_response = _response_body_iterator(first_response)
+    text_total = ""
+    last_short_text = ""
+    finish_chunks: list[str] = []
+    saw_tool_call = False
+    finish_reason = "stop"
+    reasoning_total = ""
+    request_id = str((options or {}).get("_relay_request_id") or "")
+    # Upstream/proxies may coalesce several SSE blocks into one network
+    # chunk. Keep an incomplete block between reads so a terminal block never
+    # causes the preceding text block to be held back or dropped.
+    sse_buffer = ""
+
+    def complete_blocks(raw: Any, *, flush: bool = False) -> list[str]:
+        nonlocal sse_buffer
+        if isinstance(raw, (bytes, bytearray)):
+            text = bytes(raw).decode("utf-8", errors="replace")
+        else:
+            text = str(raw or "")
+        if text:
+            sse_buffer += text.replace("\r\n", "\n")
+        blocks: list[str] = []
+        while "\n\n" in sse_buffer:
+            block, sse_buffer = sse_buffer.split("\n\n", 1)
+            if block.strip():
+                blocks.append(block + "\n\n")
+        if flush and sse_buffer.strip():
+            blocks.append(sse_buffer)
+            sse_buffer = ""
+        return blocks
+
+    for attempt in range(limit + 1):
+        finish_chunks = []
+        round_text = ""
+        round_reasoning = ""
+        saw_tool_call = False
+        finish_reason = "stop"
+        async for raw_chunk in current_response:
+            for chunk in complete_blocks(raw_chunk):
+                parsed = _chunk_finish_reason(chunk)
+                if parsed:
+                    finish_reason = parsed
+                if _chunk_has_tool_calls(chunk):
+                    saw_tool_call = True
+                state = _chunk_stream_state(chunk)
+                if state is not None:
+                    # Hold only the terminal SSE block. If a proxy coalesced
+                    # text + finish + [DONE], the text block was already
+                    # yielded above instead of being lost with the finish.
+                    finish_chunks.append(chunk)
+                    continue
+                round_text += _chunk_text_delta(chunk)
+                round_reasoning += _chunk_reasoning_delta(chunk)
+                yield chunk
+
+        # Flush a final non-blank fragment for upstreams that close without a
+        # blank-line delimiter. A terminal [DONE] block is always delimited.
+        for chunk in complete_blocks("", flush=True):
+            parsed = _chunk_finish_reason(chunk)
+            if parsed:
+                finish_reason = parsed
+            if _chunk_has_tool_calls(chunk):
+                saw_tool_call = True
+            state = _chunk_stream_state(chunk)
+            if state is not None:
+                finish_chunks.append(chunk)
+                continue
+            round_text += _chunk_text_delta(chunk)
+            round_reasoning += _chunk_reasoning_delta(chunk)
+            yield chunk
+
+        text_total += round_text
+        reasoning_total += round_reasoning
+        truncated = continuation.looks_truncated(
+            text_total,
+            finish_reason,
+            has_tool_calls=saw_tool_call,
+            reasoning=round_reasoning,
         )
+        reasoning_only = continuation.looks_reasoning_only(
+            round_text,
+            has_tool_calls=saw_tool_call,
+            reasoning=round_reasoning,
+        )
+        if not truncated and not reasoning_only:
+            break
+        if attempt >= limit:
+            logger.info(
+                "auto-continue limit reached id=%s rounds=%d finish=%s",
+                request_id,
+                attempt + 1,
+                finish_reason,
+            )
+            break
+
+        # A short round that repeats the previous round verbatim means the
+        # model is looping; continuing again would only duplicate it.  Compare
+        # per-round text, never the accumulated answer, so a legitimate
+        # continuation that shares a prefix is not mistaken for a loop.
+        current_text = round_text.strip()
+        if len(current_text) < threshold and last_short_text:
+            if continuation.similarity(last_short_text, current_text) > similarity_limit:
+                logger.warning(
+                    "auto-continue stopped on repeated short answer id=%s", request_id
+                )
+                break
+        if len(current_text) < threshold:
+            last_short_text = current_text
+
+        logger.info(
+            "auto-continue round=%d id=%s model=%s reason=%s finish=%s chars=%d",
+            attempt + 1,
+            request_id,
+            model,
+            "reasoning-only" if reasoning_only else "truncated",
+            finish_reason,
+            len(round_text),
+        )
+        active_tracker = _USAGE_TRACKER.get()
+        bind_rounds = getattr(active_tracker, "bind_auto_continue", None)
+        if callable(bind_rounds):
+            bind_rounds(attempt + 1)
+        current_messages = continuation.continued_messages(
+            messages, text_total, reasoning_only=reasoning_only
+        )
+        # Re-enter the deferred dispatcher so a continuation round keeps the
+        # same endpoint fallback and pre-output retry guarantees as the first
+        # round.  It is an async generator, so a mid-stream failure surfaces as
+        # a stream error frame instead of an exception at this call site.
+        current_response = _deferred_dispatch_stream(
+            current_messages, model, dict(options)
+        )
+
+    if not finish_chunks:
+        # A continued round that closed without its own terminal frame must not
+        # leave the caller waiting on a half-open stream.
+        finish_chunks = [
+            _stream_error_event_free_finish(model),
+            "data: [DONE]\n\n",
+        ]
+    for chunk in finish_chunks:
+        yield chunk
+
+
+def _stream_error_event_free_finish(model: str) -> str:
+    """A terminal Chat Completions frame for a stream that ended silently."""
+
+    return (
+        "data: "
+        + json.dumps(
+            {
+                "id": "",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
+
+
+async def _nonstream_with_continuation(
+    messages: list[dict],
+    model: str,
+    options: dict,
+    tracker: "_UsageTracker",
+):
+    """Non-streaming twin of :func:`_stream_with_continuation`.
+
+    Completion objects are merged in place: the continued text is appended to
+    the first answer's message, usage is summed, and the terminal finish reason
+    comes from the final round.
+    """
+
+    limit = continuation.max_continues()
+    threshold = continuation.text_threshold()
+    similarity_limit = continuation.similarity_threshold()
+    request_id = str((options or {}).get("_relay_request_id") or "")
+    current_messages = list(messages)
+    merged: Optional[dict[str, Any]] = None
+    text_total = ""
+    reasoning_total = ""
+    last_short_text = ""
+    # One tracker owns the whole multi-round turn: begin once, fold every
+    # round's usage into it, and finish once so the console still records a
+    # single billable request with the summed token counts.
+    context_token = _USAGE_TRACKER.set(tracker)
+    status = "completed"
+    try:
+        await tracker.begin()
+        for attempt in range(limit + 1):
+            response = await _dispatch_chat(current_messages, model, False, options)
+            if getattr(response, "status_code", 200) >= 400:
+                status = "error"
+                return response
+            try:
+                completion = json.loads(getattr(response, "body", b"{}"))
+            except Exception:
+                return response
+            if not isinstance(completion, dict):
+                return response
+            _track_usage_from_result(completion, model)
+            choices = completion.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else {}
+            choice = choice if isinstance(choice, Mapping) else {}
+            message = choice.get("message")
+            message = message if isinstance(message, Mapping) else {}
+            tool_calls = message.get("tool_calls")
+            tool_calls = tool_calls if isinstance(tool_calls, list) else []
+            round_text = str(message.get("content") or "")
+            round_reasoning = str(
+                message.get("reasoning_content") or message.get("reasoning") or ""
+            )
+            finish_reason = str(choice.get("finish_reason") or "stop")
+
+            if merged is None:
+                merged = completion
+            else:
+                merged_choices = merged.setdefault("choices", [{}])
+                merged_choice = (
+                    merged_choices[0] if isinstance(merged_choices, list) and merged_choices else {}
+                )
+                if not isinstance(merged_choice, dict):
+                    merged_choice = {}
+                    merged_choices.insert(0, merged_choice)
+                merged_message = merged_choice.setdefault("message", {})
+                if not isinstance(merged_message, dict):
+                    merged_message = {}
+                    merged_choice["message"] = merged_message
+                combined = str(merged_message.get("content") or "") + round_text
+                merged_message["content"] = combined or None
+                if round_reasoning:
+                    merged_message["reasoning_content"] = (
+                        str(merged_message.get("reasoning_content") or "")
+                        + round_reasoning
+                    )
+                if tool_calls:
+                    merged_message["tool_calls"] = tool_calls
+                merged_choice["finish_reason"] = finish_reason
+                merged_usage = merged.get("usage")
+                round_usage = completion.get("usage")
+                if isinstance(merged_usage, dict) and isinstance(round_usage, Mapping):
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        merged_usage[key] = int(merged_usage.get(key) or 0) + int(
+                            round_usage.get(key) or 0
+                        )
+
+            text_total += round_text
+            reasoning_total += round_reasoning
+            truncated = continuation.looks_truncated(
+                text_total,
+                finish_reason,
+                has_tool_calls=bool(tool_calls),
+                reasoning=round_reasoning,
+            )
+            reasoning_only = continuation.looks_reasoning_only(
+                round_text,
+                has_tool_calls=bool(tool_calls),
+                reasoning=round_reasoning,
+            )
+            if not truncated and not reasoning_only:
+                break
+            if attempt >= limit:
+                break
+            current_text = round_text.strip()
+            if len(current_text) < threshold and last_short_text:
+                if (
+                    continuation.similarity(last_short_text, current_text)
+                    > similarity_limit
+                ):
+                    logger.warning(
+                        "auto-continue stopped on repeated short answer id=%s",
+                        request_id,
+                    )
+                    break
+            if len(current_text) < threshold:
+                last_short_text = current_text
+            logger.info(
+                "auto-continue round=%d id=%s model=%s nonstream reason=%s chars=%d",
+                attempt + 1,
+                request_id,
+                model,
+                "reasoning-only" if reasoning_only else "truncated",
+                len(round_text),
+            )
+            bind_auto_continue = getattr(tracker, "bind_auto_continue", None)
+            if callable(bind_auto_continue):
+                bind_auto_continue(attempt + 1)
+            current_messages = continuation.continued_messages(
+                messages, text_total, reasoning_only=reasoning_only
+            )
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        try:
+            _USAGE_TRACKER.reset(context_token)
+            await tracker.finish(status)
+        finally:
+            _cancel_unclaimed_account_slot(options)
+
+    if merged is None:
+        return _openai_error(502, "Upstream returned no completion", "api_error")
+    return JSONResponse(content=merged)
+
+
+def _response_body_iterator(response):
+    if hasattr(response, "__aiter__"):
+        return response
+    if hasattr(response, "__iter__") and not isinstance(response, (str, bytes, Mapping)):
+        return _as_async(response)
+    iterator = getattr(response, "body_iterator", None)
+    if iterator is not None:
+        return iterator
+    body = getattr(response, "body", b"") or b""
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+
+    async def single():
+        if text:
+            yield text
+
+    return single()
+
+
+async def _as_async(iterable):
+    """Adapt a plain (sync) iterator to an async one for the stream helpers."""
+
+    for item in iterable:
+        yield item
+
+
+def _chunk_text_delta(chunk: Any) -> str:
+    return _chunk_delta_field(chunk, "content")
+
+
+def _chunk_reasoning_delta(chunk: Any) -> str:
+    text = _chunk_delta_field(chunk, "reasoning_content")
+    return text or _chunk_delta_field(chunk, "reasoning")
+
+
+def _chunk_delta_field(chunk: Any, field: str) -> str:
+    for value in _iter_sse_payloads(chunk):
+        choices = value.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, Mapping):
+                    continue
+                delta = choice.get("delta")
+                if isinstance(delta, Mapping):
+                    text = delta.get(field)
+                    if isinstance(text, str) and text:
+                        return text
+        text = value.get(field)
+        if isinstance(text, str) and text:
+            return text
+    return ""
+
+
+def _chunk_finish_reason(chunk: Any) -> str:
+    for value in _iter_sse_payloads(chunk):
+        choices = value.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            reason = choice.get("finish_reason")
+            if reason not in (None, ""):
+                return str(reason)
+    return ""
+
+
+def _chunk_has_tool_calls(chunk: Any) -> bool:
+    for value in _iter_sse_payloads(chunk):
+        if _tool_call_count(value) > 0:
+            return True
+        choices = value.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, Mapping) and delta.get("tool_calls"):
+                return True
+    return False
+
+
+def _iter_sse_payloads(chunk: Any):
+    if isinstance(chunk, (bytes, bytearray)):
+        text = bytes(chunk).decode("utf-8", errors="replace")
+    else:
+        text = str(chunk or "")
+    if not text:
+        return
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        if not block.strip():
+            continue
+        data_lines = [
+            line[5:].lstrip()
+            for line in block.split("\n")
+            if line.startswith("data:")
+        ]
+        if not data_lines:
+            continue
+        payload = "\n".join(data_lines).strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            value = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(value, Mapping):
+            yield value
 
 
 def _tool_translation_options(
@@ -4180,6 +5389,30 @@ def _chat_history_key(messages: list[dict], length: int | None = None) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _chat_history_prefix_keys(messages: list[dict]) -> list[str]:
+    """Hash all non-empty prefixes while serializing each message once."""
+
+    digest = hashlib.sha256(b"[")
+    keys: list[str] = []
+    for index, message in enumerate(messages):
+        if index:
+            digest.update(b",")
+        encoded = json.dumps(
+            message,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest.update(encoded.encode("utf-8"))
+        # Closing only the snapshot preserves the canonical JSON array hash
+        # while the running digest remains ready for the next message.
+        prefix = digest.copy()
+        prefix.update(b"]")
+        keys.append(prefix.hexdigest())
+    return keys
+
+
 def _chat_has_prior_turn(messages: list[dict]) -> bool:
     return any(
         isinstance(message, dict)
@@ -4315,9 +5548,12 @@ def _bind_chat_session(
     rotate_for_new: bool = True,
 ) -> dict:
     """Attach a stable upstream session and account to one API request."""
+    history_keys = _chat_history_prefix_keys(messages)
+    history_key = history_keys[-1] if history_keys else _chat_history_key(messages)
     now = time.monotonic()
     with _CHAT_SESSION_LOCK:
         _prune_chat_sessions(now)
+        polling_enabled = bool(auth.get_polling_status().get("enabled"))
         session_id = requested_session_id.strip()
         inferred_account_snapshot: tuple[str, dict] | None = None
         if not session_id and _chat_has_prior_turn(messages):
@@ -4328,8 +5564,8 @@ def _bind_chat_session(
             inferred_account_snapshot = auth.get_active_account_snapshot()
             # Prefer the most specific known prefix, then fall back to the full
             # replay for idempotent retries of the same request.
-            for length in range(len(messages), 0, -1):
-                found = _CHAT_HISTORY_SESSIONS.get(_chat_history_key(messages, length))
+            for prefix_key in reversed(history_keys):
+                found = _CHAT_HISTORY_SESSIONS.get(prefix_key)
                 if found is not None:
                     candidate_id = found[0]
                     candidate_lease = _UPSTREAM_SESSION_LEASES.get(candidate_id)
@@ -4342,21 +5578,45 @@ def _bind_chat_session(
                         (inferred_account_snapshot or ("", {}))[0] or ""
                     )
                     if (
-                        active_account
+                        not polling_enabled
+                        and active_account
                         and candidate_lease is not None
                         and candidate_lease.account_id
                         and candidate_lease.account_id != active_account
                     ):
                         continue
                     session_id = candidate_id
-                    _CHAT_HISTORY_SESSIONS.move_to_end(_chat_history_key(messages, length))
+                    _CHAT_HISTORY_SESSIONS.move_to_end(prefix_key)
                     break
         if not session_id:
             session_id = uuid_mod.uuid4().hex
 
         lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        # A reservation belongs to this API request, not to the logical chat
+        # lease.  It is consumed by the selected transport (or cancelled by
+        # the dispatch wrapper if routing fails before a transport opens).
+        slot_reserved = False
+        slot_reservation_account = ""
+        slot_reservation_id = ""
         if lease is None:
-            if rotate_for_new and _current_upstream_mode() in (
+            upstream_mode = _current_upstream_mode()
+            slot_mode = upstream_mode not in ("", "cli")
+            selected_snapshot: tuple[str, dict] | None = None
+            account_rows = auth.get_accounts_raw() if slot_mode else []
+            if rotate_for_new and slot_mode and account_rows:
+                # Selection and reservation are one operation.  This is what
+                # lets credit-priority polling fill every entitlement slot on
+                # the richest account before moving to the next account.
+                selected_snapshot = auth.reserve_model_account(
+                    require_polling=polling_enabled
+                )
+                if selected_snapshot[0]:
+                    slot_reserved = True
+                    slot_reservation_account = selected_snapshot[0]
+                    slot_reservation_id = str(
+                        selected_snapshot[1].get("_slot_reservation_id") or ""
+                    )
+            if rotate_for_new and selected_snapshot is None and upstream_mode in (
                 "raw",
                 "direct",
                 "web",
@@ -4366,15 +5626,19 @@ def _bind_chat_session(
                 "auto",
                 "ide",
                 "solo",
+                "work",
                 "work-agent",
             ):
+                # Keep the legacy rotation hook for single-token/test
+                # deployments that have no persisted account rows.  Known
+                # accounts are selected by ``reserve_model_account`` above.
                 auth.next_polling_account()
             # Read the selected id and its credential record as one snapshot.
             # Separate getter calls can race an account rotation and bind an
             # account id to a different account's token.
-            if inferred_account_snapshot is not None and not bool(
-                auth.get_polling_status().get("enabled")
-            ):
+            if selected_snapshot is not None and selected_snapshot[0]:
+                account_id, record = selected_snapshot
+            elif inferred_account_snapshot is not None and not polling_enabled:
                 account_id, record = inferred_account_snapshot
             else:
                 account_id, record = auth.get_active_account_snapshot()
@@ -4397,7 +5661,17 @@ def _bind_chat_session(
                 account_id = auth.get_active_account_id() or ""
             if account_id and not record:
                 record = auth.get_account_record(account_id)
-            _ensure_model_account_enabled(account_id, str(record.get("token") or ""))
+            try:
+                _ensure_model_account_enabled(
+                    account_id, str(record.get("token") or "")
+                )
+            except BaseException:
+                if slot_reserved:
+                    auth.cancel_account_slot_reservation(
+                        slot_reservation_account or account_id,
+                        slot_reservation_id,
+                    )
+                raise
             token = str(record.get("token") or "")
             if not token and not account_id:
                 # Preserve the CLI/env single-credential path when the
@@ -4427,14 +5701,36 @@ def _bind_chat_session(
             # A continuation must stay on the credential captured for its first
             # turn. Do not rotate accounts, call refresh, or mutate global auth.
             _ensure_model_account_enabled(lease.account_id, lease.auth_token)
+            if (
+                _current_upstream_mode() not in ("", "cli")
+                and auth.get_accounts_raw()
+            ):
+                # A logical session can have multiple simultaneous turns.  Each
+                # turn therefore reserves its own account slot while retaining
+                # the session's credential affinity.
+                selected_snapshot = auth.reserve_model_account(
+                    preferred_account_id=lease.account_id
+                )
+                if selected_snapshot[0]:
+                    slot_reserved = True
+                    slot_reservation_account = selected_snapshot[0]
+                    slot_reservation_id = str(
+                        selected_snapshot[1].get("_slot_reservation_id") or ""
+                    )
             lease.last_client_activity = now
             _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
 
-        _CHAT_HISTORY_SESSIONS[_chat_history_key(messages)] = (session_id, now)
-        _CHAT_HISTORY_SESSIONS.move_to_end(_chat_history_key(messages))
+        _CHAT_HISTORY_SESSIONS[history_key] = (session_id, now)
+        _CHAT_HISTORY_SESSIONS.move_to_end(history_key)
 
     bound = dict(options)
     bound["session_id"] = session_id
+    if slot_reserved:
+        bound["_account_slot_reserved"] = True
+        bound["_account_slot_reservation_account"] = (
+            slot_reservation_account or lease.account_id
+        )
+        bound["_account_slot_reservation_id"] = slot_reservation_id
     if lease.account_id:
         bound["_account_id"] = lease.account_id
         if _current_upstream_mode() in ("raw", "direct", "auto"):
@@ -4768,6 +6064,66 @@ def _optional_bool(value: Any) -> bool | None:
     return None
 
 
+def _normalize_usage_thinking(value: Any) -> dict[str, Any] | str | None:
+    """Keep a compact, non-sensitive copy of the caller's thinking hint.
+
+    Request options can contain the full Anthropic/OpenAI ``thinking`` object.
+    Usage history only needs the small routing/display fields; persisting the
+    whole object would make records noisy and could retain adapter-specific
+    payloads indefinitely.
+    """
+
+    if value in (None, "", False):
+        return None
+    if isinstance(value, Mapping):
+        allowed = (
+            "type",
+            "enabled",
+            "enable",
+            "effort",
+            "level",
+            "budget_tokens",
+            "budgetTokens",
+        )
+        compact = {
+            key: value[key]
+            for key in allowed
+            if key in value and value[key] not in (None, "")
+        }
+        return compact or None
+    if isinstance(value, bool):
+        return {"type": "enabled"} if value else None
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_usage_product(value: Any) -> str | None:
+    """Normalize route products to the public ``trae``/``traework`` labels."""
+
+    if value in (None, ""):
+        return None
+    product = str(value).strip().lower().replace("_", "-")
+    if product in {
+        "work",
+        "work-agent",
+        "remote-work",
+        "trae-work",
+        "traework",
+        "traework-native",
+        "native",
+        "solo-work",
+    }:
+        return "traework"
+    if product in {"trae", "trae-cn", "remote", "ide", "solo"}:
+        return "trae"
+    # Do not mistake an HTTP path (the legacy ``endpoint`` field) for a
+    # product when normalizing old rows. Unknown products remain unknown;
+    # callers can still inspect the raw route fields separately.
+    return None
+
+
 def _context_mode_bool(value: Any) -> bool | None:
     """Map known context labels to a Max-enabled boolean.
 
@@ -4892,9 +6248,10 @@ def _context_mode_metadata(
         if not requested_max
         else None
     )
+    # A max acknowledgement does not itself prove the descriptor's context
+    # window.  Keep the value unknown unless the bound model descriptor/trace
+    # supplied an explicit token count; never synthesize a 1M capability.
     window = _number_value(trace.get("max_context_tokens"))
-    if window is None and applied_max is True:
-        window = 1_000_000
     return requested, actual, window, applied_max
 
 
@@ -4986,11 +6343,209 @@ async def _fetch_used_credits(token: str) -> int | float | None:
         return None
 
 
+def _credit_reconcile_interval_seconds() -> float:
+    """Return the cadence for official total-credit reconciliation."""
+
+    try:
+        value = float(
+            os.environ.get("TRAE_CREDIT_RECONCILE_INTERVAL_SECONDS", "120")
+            or "120"
+        )
+    except (TypeError, ValueError):
+        value = 120.0
+    return max(15.0, min(value, 86_400.0))
+
+
+def _credit_settled_timestamp(record: Mapping[str, Any]) -> float:
+    value = record.get("credits_settled_at")
+    if value in (None, ""):
+        value = record.get("timestamp")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _credit_source_weight(record: Mapping[str, Any]) -> float:
+    """Return confidence for a confirmed charge source.
+
+    Session usage and explicit upstream usage are authoritative.  Account
+    total deltas are reliable but can race another request, so they receive a
+    slightly lower weight.  Pending/unknown rows never reduce the displayed
+    balance.
+    """
+
+    source = str(record.get("credits_source") or "").strip().lower()
+    if source in {"session_usage", "upstream", "manual"}:
+        return 1.0
+    if source in {"snapshot_delta", "account_total"}:
+        return 0.85
+    return 0.0
+
+
+def _settled_credit_overlay(
+    account_id: str, anchor_at: float
+) -> tuple[float, float, float, int, float]:
+    """Return weighted post-anchor charges for one account.
+
+    The tuple is ``(weighted, raw, confidence, count, latest_timestamp)``.
+    Rows are read under the usage lock, but account persistence happens after
+    the lock is released so usage updates and account refreshes cannot deadlock.
+    """
+
+    if not account_id or anchor_at <= 0:
+        return 0.0, 0.0, 0.0, 0, 0.0
+    weighted = raw = confidence_total = 0.0
+    count = 0
+    latest = 0.0
+    with _USAGE_LOCK:
+        records = tuple(_USAGE_HISTORY)
+    for record in records:
+        if str(record.get("account_id") or "") != str(account_id):
+            continue
+        amount = _number_value(record.get("credits_consumed"))
+        settled_at = _credit_settled_timestamp(record)
+        # Include the boundary instant.  The provider and local settlement can
+        # legitimately share the same timestamp (especially in tests or when
+        # the billing response is handled in the same event-loop tick); using
+        # ``<=`` would then hide a confirmed charge from the projection.
+        if amount is None or amount < 0 or settled_at < anchor_at:
+            continue
+        weight = _credit_source_weight(record)
+        if weight <= 0:
+            continue
+        weighted += float(amount) * weight
+        raw += float(amount)
+        confidence_total += weight
+        count += 1
+        latest = max(latest, settled_at)
+    confidence = (confidence_total / count) if count else 0.0
+    return (
+        _credit_round(weighted) or 0.0,
+        _credit_round(raw) or 0.0,
+        round(min(1.0, confidence), 4),
+        count,
+        latest,
+    )
+
+
+def _credit_projection_for_account(
+    account_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a local balance projection from the latest official anchor."""
+
+    credits = auth.get_account_credit_state(account_id)
+    if not credits:
+        return {}, {}
+    official = _number_value(
+        credits.get("official_remaining")
+        if "official_remaining" in credits
+        else credits.get("remaining")
+    )
+    if official is None or credits.get("unlimited"):
+        return credits, {
+            "remaining": credits.get("remaining"),
+            "local_debit": 0.0,
+            "confidence": 1.0,
+            "status": "unlimited" if credits.get("unlimited") else "unknown",
+            "source": "upstream",
+            "latest": 0.0,
+        }
+    anchor = credits.get("credits_anchor_at") or credits.get(
+        "credits_reconciled_at"
+    )
+    try:
+        anchor_at = float(anchor or 0)
+    except (TypeError, ValueError):
+        anchor_at = 0.0
+    weighted, raw, confidence, count, latest = _settled_credit_overlay(
+        account_id, anchor_at
+    )
+    effective = max(0.0, float(official) - float(weighted))
+    projection = {
+        "remaining": _credit_round(effective),
+        "local_debit": _credit_round(weighted) or 0.0,
+        "confidence": confidence if count else 1.0,
+        "status": "projected" if count else "ok",
+        "source": "usage_weighted" if count else "upstream",
+        "latest": latest,
+        "raw_debit": _credit_round(raw) or 0.0,
+    }
+    return credits, projection
+
+
+def _refresh_credit_projection(account_id: str) -> dict[str, Any]:
+    """Persist the current post-settlement balance projection."""
+
+    credits, projection = _credit_projection_for_account(account_id)
+    if not credits or not projection:
+        return credits
+    return auth.update_account_credit_projection(
+        account_id,
+        effective_remaining=projection.get("remaining"),
+        local_debit=projection.get("local_debit", 0),
+        status=projection.get("status", "projected"),
+        source=projection.get("source", "usage_weighted"),
+        confidence=projection.get("confidence", 0),
+        settled_at=projection.get("latest"),
+    ) or credits
+
+
+def _credit_snapshot_projection(
+    account_id: str, parsed: Mapping[str, Any], observed_at: float
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Combine an upstream snapshot with charges not yet reflected upstream."""
+
+    previous = auth.get_account_credit_state(account_id)
+    previous_used = _number_value(
+        previous.get("official_used")
+        if "official_used" in previous
+        else previous.get("used")
+    )
+    incoming_used = _number_value(parsed.get("used"))
+    upstream_delta = 0.0
+    if previous_used is not None and incoming_used is not None:
+        upstream_delta = max(0.0, float(incoming_used) - float(previous_used))
+    # Charges after the previous anchor may already be included in the new
+    # upstream ``used`` counter.  Subtract only the weighted remainder.
+    anchor = previous.get("credits_anchor_at") or previous.get(
+        "credits_reconciled_at"
+    )
+    try:
+        anchor_at = float(anchor or 0)
+    except (TypeError, ValueError):
+        anchor_at = 0.0
+    weighted, raw, confidence, count, latest = _settled_credit_overlay(
+        account_id, anchor_at
+    )
+    unmatched = max(0.0, float(weighted) - upstream_delta)
+    official_remaining = _number_value(parsed.get("remaining"))
+    if official_remaining is None:
+        effective = parsed.get("remaining")
+    else:
+        effective = _credit_round(max(0.0, float(official_remaining) - unmatched))
+    state = {
+        "local_debit": _credit_round(unmatched) or 0.0,
+        "confidence": confidence if count else 1.0,
+        "status": "projected" if unmatched > 0 else "ok",
+        "source": "upstream_weighted" if unmatched > 0 else "upstream",
+        "raw_debit": _credit_round(raw) or 0.0,
+        "upstream_delta": _credit_round(upstream_delta) or 0.0,
+        "latest": latest,
+    }
+    return state, {"effective_remaining": effective}
+
+
 def _begin_credit_snapshot(account_id: str, token: str) -> bool:
     if not account_id or account_id == "default" or not token:
         return False
     with _USAGE_LOCK:
         active = _USAGE_ACTIVE_ACCOUNTS.get(account_id, 0)
+        if active == 0:
+            # A new in-flight batch starts a fresh attribution window.  Do
+            # not let a previous test/request's terminal total become the
+            # baseline for this batch.
+            _USAGE_LAST_CREDIT_TOTALS.pop(account_id, None)
         if active:
             _USAGE_UNSAFE_ACCOUNTS.add(account_id)
         _USAGE_ACTIVE_ACCOUNTS[account_id] = active + 1
@@ -4999,21 +6554,130 @@ def _begin_credit_snapshot(account_id: str, token: str) -> bool:
         return active == 0
 
 
-def _end_credit_snapshot(account_id: str) -> None:
+def _end_credit_snapshot(account_id: str) -> bool:
+    """Release one live snapshot and return whether it was the last owner."""
+
     if not account_id:
-        return
+        return False
     with _USAGE_LOCK:
         active = _USAGE_ACTIVE_ACCOUNTS.get(account_id, 0)
         if active <= 1:
             _USAGE_ACTIVE_ACCOUNTS.pop(account_id, None)
             _USAGE_UNSAFE_ACCOUNTS.discard(account_id)
+            # The shared before task is no longer useful once every request
+            # in the batch has settled.  Remove only the map entry here; the
+            # caller decides whether it is safe to cancel the task.
+            for key in tuple(_USAGE_ACCOUNT_BEFORE_TASKS):
+                if key[1] == account_id:
+                    _USAGE_ACCOUNT_BEFORE_TASKS.pop(key, None)
+            for key in tuple(_USAGE_CREDIT_SETTLE_GATES):
+                if key[1] == account_id:
+                    _USAGE_CREDIT_SETTLE_GATES.pop(key, None)
+            return True
         else:
             _USAGE_ACTIVE_ACCOUNTS[account_id] = active - 1
+            return False
 
 
 def _credit_snapshot_is_safe(account_id: str) -> bool:
     with _USAGE_LOCK:
         return account_id not in _USAGE_UNSAFE_ACCOUNTS
+
+
+def _shared_credit_before_task(account_id: str, token: str) -> asyncio.Task | None:
+    """Return one before-snapshot task shared by concurrent requests."""
+
+    if not account_id or account_id == "default" or not token:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = (id(loop), account_id)
+    with _USAGE_LOCK:
+        existing = _USAGE_ACCOUNT_BEFORE_TASKS.get(key)
+        if existing is not None:
+            return existing
+        task = _spawn_usage_task(
+            _fetch_used_credits(token),
+            _USAGE_SNAPSHOT_TASKS,
+        )
+        if task is not None:
+            _USAGE_ACCOUNT_BEFORE_TASKS[key] = task
+        return task
+
+
+def _credit_settle_gate(account_id: str) -> asyncio.Lock | None:
+    """Get a loop-local gate for account after-snapshot attribution."""
+
+    if not account_id or account_id == "default":
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = (id(loop), account_id)
+    with _USAGE_LOCK:
+        gate = _USAGE_CREDIT_SETTLE_GATES.get(key)
+        if gate is None:
+            gate = asyncio.Lock()
+            _USAGE_CREDIT_SETTLE_GATES[key] = gate
+        return gate
+
+
+def _credit_delta_from_total(
+    account_id: str,
+    before: int | float | None,
+    after: int | float | None,
+) -> tuple[float, float] | None:
+    """Attribute one monotonic account-total increment.
+
+    The first request in a concurrent batch uses its before snapshot. Later
+    requests use the last observed after total as their baseline, preventing
+    the same upstream increment from being counted twice.
+    """
+
+    before_value = _number_value(before)
+    after_value = _number_value(after)
+    if after_value is None:
+        return None
+    with _USAGE_LOCK:
+        previous = _number_value(_USAGE_LAST_CREDIT_TOTALS.get(account_id))
+        candidates = [value for value in (before_value, previous) if value is not None]
+        if not candidates:
+            return None
+        baseline = max(candidates)
+        if after_value < baseline:
+            return None
+        _USAGE_LAST_CREDIT_TOTALS[account_id] = max(
+            after_value,
+            previous if previous is not None else after_value,
+        )
+    return _credit_round(after_value - baseline), _credit_round(baseline)
+
+
+def _usage_pending_max_age_seconds() -> float:
+    try:
+        # Commercial usage can lag the model stream by several polling
+        # intervals, especially when two requests finish on the same account.
+        # Keep a row recoverable long enough for a periodic reconciliation to
+        # observe the eventual bill instead of freezing it after one miss.
+        value = float(os.environ.get("TRAE_USAGE_PENDING_MAX_AGE_SECONDS", "300"))
+    except (TypeError, ValueError):
+        value = 300.0
+    return max(1.0, min(value, 86_400.0))
+
+
+def _usage_enrichment_interval_seconds() -> float:
+    """Return the cadence for retrying unresolved usage rows."""
+
+    try:
+        value = float(
+            os.environ.get("TRAE_USAGE_ENRICH_INTERVAL_SECONDS", "5") or "5"
+        )
+    except (TypeError, ValueError):
+        value = 5.0
+    return max(1.0, min(value, 60.0))
 
 
 def _usage_account_token(account_id: str) -> str:
@@ -5110,15 +6774,54 @@ def _schedule_pending_usage_enrichment() -> int:
             # enrichment coroutine's own cleanup.
             _USAGE_PENDING_TASK_IDS.discard(request_id)
 
-    scheduled = 0
+    now = time.time()
+    stale_request_ids: list[str] = []
+    unrecoverable_request_ids: list[str] = []
     with _USAGE_LOCK:
-        pending = [
-            dict(record)
-            for record in _USAGE_HISTORY
-            if _number_value(record.get("credits_consumed")) is None
-            and record.get("usage_turn_id")
-            and record.get("request_id")
-        ]
+        pending = []
+        for record in _USAGE_HISTORY:
+            request_id = str(record.get("request_id") or "")
+            # A live request may already have a settlement task. Do not mark
+            # that row unavailable from the periodic restart/reconciliation
+            # scan while the in-process lookup is still running.
+            if request_id and request_id in _USAGE_PENDING_TASK_IDS:
+                continue
+            source = str(record.get("credits_source") or "").lower()
+            if (
+                _number_value(record.get("credits_consumed")) is not None
+                # ``pending`` is the normal post-stream state.  Keep
+                # ``unknown`` rows eligible too because older adapters may
+                # have written a terminal row before the usage turn id was
+                # discovered by the SSE parser.
+                or source not in {"", "unknown", "pending"}
+                or not record.get("request_id")
+            ):
+                continue
+            age = max(0.0, now - float(record.get("timestamp") or now))
+            if age > _usage_pending_max_age_seconds():
+                stale_request_ids.append(str(record.get("request_id") or ""))
+                continue
+            # A restart cannot reconstruct a missing before-snapshot.  Turn
+            # usage ids are recoverable from the commercial endpoint; rows
+            # without one are only safe to enrich while the live request is
+            # still in this process.
+            if record.get("usage_turn_id"):
+                pending.append(dict(record))
+            else:
+                unrecoverable_request_ids.append(str(record.get("request_id") or ""))
+    for request_id in stale_request_ids:
+        _update_usage_record(
+            request_id,
+            credits_source="unavailable",
+            credits_resolution="expired",
+        )
+    for request_id in unrecoverable_request_ids:
+        _update_usage_record(
+            request_id,
+            credits_source="unavailable",
+            credits_resolution="no_usage_turn",
+        )
+    scheduled = 0
     concurrency_limit = _usage_enrich_concurrency()
     semaphore = asyncio.Semaphore(concurrency_limit)
     for record in pending:
@@ -5128,6 +6831,11 @@ def _schedule_pending_usage_enrichment() -> int:
         account_id = str(record.get("account_id") or "")
         token = _usage_account_token(account_id)
         if not token:
+            _update_usage_record(
+                request_id,
+                credits_source="unavailable",
+                credits_resolution="account_token_missing",
+            )
             continue
         _USAGE_PENDING_TASK_IDS.add(request_id)
         _spawn_usage_task(enrich_pending(record, token, semaphore))
@@ -5166,6 +6874,10 @@ async def _cancel_usage_tasks() -> None:
     tasks = set(_USAGE_ENRICH_TASKS) | set(_USAGE_SNAPSHOT_TASKS)
     if not tasks:
         _USAGE_PENDING_TASK_IDS.clear()
+        with _USAGE_LOCK:
+            _USAGE_ACCOUNT_BEFORE_TASKS.clear()
+            _USAGE_CREDIT_SETTLE_GATES.clear()
+            _USAGE_LAST_CREDIT_TOTALS.clear()
         return
     for task in tasks:
         if not task.done():
@@ -5174,6 +6886,10 @@ async def _cancel_usage_tasks() -> None:
     _USAGE_ENRICH_TASKS.difference_update(tasks)
     _USAGE_SNAPSHOT_TASKS.difference_update(tasks)
     _USAGE_PENDING_TASK_IDS.clear()
+    with _USAGE_LOCK:
+        _USAGE_ACCOUNT_BEFORE_TASKS.clear()
+        _USAGE_CREDIT_SETTLE_GATES.clear()
+        _USAGE_LAST_CREDIT_TOTALS.clear()
 
 
 def _usage_credit_retry_delays() -> tuple[float, ...]:
@@ -5206,6 +6922,7 @@ async def _enrich_usage_credits(
     usage_turn_id: str = "",
     credit_safe: bool = True,
     release_snapshot: bool = True,
+    allow_shared_snapshot: bool = False,
 ) -> None:
     if request_id:
         _USAGE_PENDING_TASK_IDS.add(request_id)
@@ -5230,11 +6947,6 @@ async def _enrich_usage_credits(
                     # Zero is a valid settled charge. Only None means that
                     # the commercial endpoint has not produced a bill yet.
                     if credits is not None and credits >= 0:
-                        await _cancel_usage_task(
-                            before_task,
-                            _USAGE_SNAPSHOT_TASKS,
-                        )
-                        before_task = None
                         _update_usage_record(
                             request_id,
                             credits_consumed=_credit_round(credits),
@@ -5253,7 +6965,53 @@ async def _enrich_usage_credits(
                         attempt + 1,
                         exc,
                     )
-        if not credit_safe or not _credit_snapshot_is_safe(account_id):
+            # A real upstream turn id is preferred.  For a live request that
+            # also owns a before snapshot, however, the account-total delta is
+            # a useful bounded fallback when the commercial turn endpoint is
+            # temporarily unavailable.  This prevents every other concurrent
+            # request from remaining in "settling" forever.  Restart-resumed
+            # rows have no before snapshot and must remain pending so they are
+            # never charged from an unrelated account delta.
+            if request_id and usage_turn_id and (
+                not credit_safe or before_task is None
+            ):
+                _update_usage_record(
+                    request_id,
+                    credits_source="pending",
+                    credits_resolution="session_usage_pending",
+                )
+                return
+        if (
+            (not credit_safe and not allow_shared_snapshot)
+            or not account_id
+            or account_id == "default"
+        ):
+            if request_id:
+                _update_usage_record(
+                    request_id,
+                    credits_source=(
+                        "pending"
+                        if usage_turn_id
+                        else "unavailable"
+                    ),
+                    credits_resolution=(
+                        "concurrent_pending"
+                        if usage_turn_id
+                        else "concurrent_or_unbound"
+                    ),
+                )
+            return
+        # Snapshot deltas are only safe for a single in-flight account turn.
+        # ``allow_shared_snapshot`` is retained for compatibility with older
+        # callers, but it must not opt concurrent requests into false
+        # per-turn attribution.
+        if not credit_safe and not allow_shared_snapshot:
+            if request_id:
+                _update_usage_record(
+                    request_id,
+                    credits_source="unavailable",
+                    credits_resolution="concurrent_snapshot_unattributable",
+                )
             return
         before = None
         if before_task is not None:
@@ -5261,22 +7019,83 @@ async def _enrich_usage_credits(
                 before = await before_task
             except Exception:
                 before = None
-        after = await _fetch_used_credits(token)
-        if before is None or after is None or after < before:
+        if before is None:
+            if request_id:
+                _update_usage_record(
+                    request_id,
+                    # Keep a bound turn recoverable.  The account entitlement
+                    # endpoint can transiently return no data while the
+                    # commercial bill is being committed; the background
+                    # reconciler will retry this row.
+                    credits_source=(
+                        "pending" if usage_turn_id else "unavailable"
+                    ),
+                    credits_resolution=(
+                        "before_snapshot_pending"
+                        if usage_turn_id
+                        else "before_snapshot_unavailable"
+                    ),
+                )
             return
-        _update_usage_record(
-            request_id,
-            credits_consumed=_credit_round(after - before),
-            credits_source="snapshot_delta",
-            credits_before=_credit_round(before),
-            credits_after=_credit_round(after),
-        )
+        gate = _credit_settle_gate(account_id)
+        if gate is None:
+            after = await _fetch_used_credits(token)
+            delta = _credit_delta_from_total(account_id, before, after)
+            if delta is None:
+                _update_usage_record(
+                    request_id,
+                    credits_source=(
+                        "pending" if usage_turn_id else "unavailable"
+                    ),
+                    credits_resolution=(
+                        "after_snapshot_pending"
+                        if usage_turn_id
+                        else "after_snapshot_unavailable"
+                    ),
+                )
+                return
+            credits, baseline = delta
+            _update_usage_record(
+                request_id,
+                credits_consumed=credits,
+                credits_source="snapshot_delta",
+                credits_before=baseline,
+                credits_after=_credit_round(after),
+            )
+            return
+        async with gate:
+            after = await _fetch_used_credits(token)
+            delta = _credit_delta_from_total(account_id, before, after)
+            if delta is None:
+                _update_usage_record(
+                    request_id,
+                    credits_source=(
+                        "pending" if usage_turn_id else "unavailable"
+                    ),
+                    credits_resolution=(
+                        "after_snapshot_pending"
+                        if usage_turn_id
+                        else "after_snapshot_unavailable"
+                    ),
+                )
+                return
+            credits, baseline = delta
+            _update_usage_record(
+                request_id,
+                credits_consumed=credits,
+                credits_source="snapshot_delta",
+                credits_before=baseline,
+                credits_after=_credit_round(after),
+            )
     finally:
         if request_id:
             _USAGE_PENDING_TASK_IDS.discard(request_id)
-        await _cancel_usage_task(before_task, _USAGE_SNAPSHOT_TASKS)
         if release_snapshot:
-            _end_credit_snapshot(account_id)
+            last_owner = _end_credit_snapshot(account_id)
+            # A shared before snapshot must survive until the last request in
+            # this account batch has finished its enrichment.
+            if last_owner:
+                await _cancel_usage_task(before_task, _USAGE_SNAPSHOT_TASKS)
 
 
 class _UsageTracker:
@@ -5341,8 +7160,12 @@ class _UsageTracker:
         # ``tools`` catalog means the caller offered tools; it does not mean
         # that this response actually returned a tool call.
         self.tools_requested = _tools_requested_from_options(options)
+        self.thinking = _normalize_usage_thinking(options.get("thinking"))
+        self.tool_choice = options.get("tool_choice")
         self.tool_used: bool | None = None
         self.tool_calls_returned: bool | None = None
+        self.queue_position: int | None = None
+        self.auto_continue_rounds: int | None = None
         self.status = "in_progress"
         self._finished = False
         self._credit_snapshot_started = bool(
@@ -5350,13 +7173,17 @@ class _UsageTracker:
         )
         self._credit_safe = _begin_credit_snapshot(self.account_id, self.token)
         self._before_task = (
-            _spawn_usage_task(
-                _fetch_used_credits(self.token),
-                _USAGE_SNAPSHOT_TASKS,
-            )
+            _shared_credit_before_task(self.account_id, self.token)
             if self._credit_safe
             else None
         )
+        # Concurrent requests join the first request's before snapshot.  The
+        # old unsafe request path had no before value at all and consequently
+        # produced a permanently missing credit row.
+        if self._before_task is None and self._credit_snapshot_started:
+            self._before_task = _shared_credit_before_task(
+                self.account_id, self.token
+            )
 
     def update(self, usage: Any) -> None:
         self.saw_usage = True
@@ -5394,6 +7221,24 @@ class _UsageTracker:
         if value and (replace or not self.usage_turn_id):
             self.usage_turn_id = value
 
+    def bind_queue_position(self, position: Any) -> None:
+        """Record the deepest queue position observed for this request."""
+
+        if isinstance(position, bool) or not isinstance(position, (int, float)):
+            return
+        value = int(position)
+        if self.queue_position is None or value > self.queue_position:
+            self.queue_position = value
+
+    def bind_auto_continue(self, rounds: Any) -> None:
+        """Record how many automatic continuation rounds completed the answer."""
+
+        if isinstance(rounds, bool) or not isinstance(rounds, (int, float)):
+            return
+        value = int(rounds)
+        if value > 0:
+            self.auto_continue_rounds = value
+
     async def rebind(self, options: Optional[Mapping[str, Any]] = None) -> None:
         """Move billing/credit tracking to the account used by a retry.
 
@@ -5422,10 +7267,12 @@ class _UsageTracker:
             return
 
         old_account = self.account_id
-        await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+        old_before_task = self._before_task
         self._before_task = None
         if self._credit_snapshot_started:
-            _end_credit_snapshot(old_account)
+            last_owner = _end_credit_snapshot(old_account)
+            if last_owner:
+                await _cancel_usage_task(old_before_task, _USAGE_SNAPSHOT_TASKS)
 
         self.account_id = account_id or self.account_id
         self.billing_id = billing_id or self.account_id
@@ -5435,10 +7282,9 @@ class _UsageTracker:
             self.account_id and self.account_id != "default" and self.token
         )
         self._credit_safe = _begin_credit_snapshot(self.account_id, self.token)
-        if self._credit_safe:
-            self._before_task = _spawn_usage_task(
-                _fetch_used_credits(self.token),
-                _USAGE_SNAPSHOT_TASKS,
+        if self._credit_snapshot_started:
+            self._before_task = _shared_credit_before_task(
+                self.account_id, self.token
             )
 
     async def finish(self, status: str | None = None) -> None:
@@ -5456,6 +7302,23 @@ class _UsageTracker:
             trace.get("reasoning_effort_applied")
             or self.options.get("_reasoning_effort_applied")
         )
+        product = _normalize_usage_product(
+            trace.get("product")
+            or self.options.get("product")
+            or self.options.get("provider_product")
+            or (
+                "traework"
+                if self.options.get("_traework_custom_model")
+                or str(self.options.get("_trae_mode") or "").lower() == "work"
+                else None
+            )
+        )
+        requested_endpoint = (
+            trace.get("requested_endpoint") or trace.get("requested_mode")
+        )
+        actual_endpoint = trace.get("actual_endpoint") or trace.get("actual_mode")
+        requested_mode = trace.get("requested_mode")
+        actual_mode = trace.get("actual_mode")
         (
             context_requested,
             context_actual,
@@ -5481,11 +7344,20 @@ class _UsageTracker:
             self.tool_used = self.tool_calls_returned
         context_mode = self.context_mode_actual
         explicit_credits = values.get("credits_consumed")
+        # A failed/cancelled request with no usage frame has no evidence of a
+        # billable upstream turn.  Do not render it as "settling" forever.
+        no_billable_activity = (
+            final_status in {"error", "cancelled"}
+            and not self.saw_usage
+            and not self.usage_turn_id
+        )
         credits_source = (
             "upstream"
             if explicit_credits is not None
+            else "unavailable"
+            if no_billable_activity
             else "pending"
-            if self.usage_turn_id or self._credit_safe
+            if self.usage_turn_id or self._credit_snapshot_started
             else "unknown"
         )
         _record_usage(
@@ -5498,6 +7370,11 @@ class _UsageTracker:
             usage_turn_id=self.usage_turn_id or None,
             request_id=self.request_id,
             endpoint=self.endpoint,
+            product=product,
+            requested_endpoint=requested_endpoint,
+            actual_endpoint=actual_endpoint,
+            requested_mode=requested_mode,
+            actual_mode=actual_mode,
             stream=self.stream,
             status=final_status,
             duration_ms=round((time.perf_counter() - self.started) * 1000, 1),
@@ -5510,6 +7387,8 @@ class _UsageTracker:
                 if applied_effort not in (None, "")
                 else None
             ),
+            thinking=self.thinking,
+            tool_choice=self.tool_choice,
             context_mode_requested=self.context_mode_requested,
             context_mode=context_mode,
             context_mode_actual=self.context_mode_actual,
@@ -5521,15 +7400,25 @@ class _UsageTracker:
             tool_used=self.tool_used,
             tool_calls_returned=self.tool_calls_returned,
             tool_called=self.tool_used,
+            queue_position=self.queue_position,
+            auto_continue_rounds=self.auto_continue_rounds,
         )
         if explicit_credits is not None:
             try:
-                await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+                last_owner = (
+                    _end_credit_snapshot(self.account_id)
+                    if self._credit_snapshot_started
+                    else False
+                )
+                if last_owner:
+                    await _cancel_usage_task(
+                        self._before_task, _USAGE_SNAPSHOT_TASKS
+                    )
             finally:
                 self._before_task = None
-                if self._credit_snapshot_started:
-                    _end_credit_snapshot(self.account_id)
-        elif self.usage_turn_id or self._credit_safe:
+        elif not no_billable_activity and (
+            self.usage_turn_id or self._credit_snapshot_started
+        ):
             _spawn_usage_task(
                 _enrich_usage_credits(
                     self.request_id,
@@ -5539,17 +7428,28 @@ class _UsageTracker:
                     usage_turn_id=self.usage_turn_id,
                     credit_safe=self._credit_safe,
                     release_snapshot=self._credit_snapshot_started,
+                    allow_shared_snapshot=True,
                 )
             )
         else:
             try:
-                await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+                last_owner = (
+                    _end_credit_snapshot(self.account_id)
+                    if self._credit_snapshot_started
+                    else False
+                )
+                if last_owner:
+                    await _cancel_usage_task(
+                        self._before_task, _USAGE_SNAPSHOT_TASKS
+                    )
             finally:
                 self._before_task = None
-                if self._credit_snapshot_started:
-                    _end_credit_snapshot(self.account_id)
 
     async def begin(self) -> None:
+        if self._credit_snapshot_started and self._before_task is None:
+            self._before_task = _shared_credit_before_task(
+                self.account_id, self.token
+            )
         if self._before_task is not None:
             # Let the before-snapshot request start without delaying the first
             # model frame on the result of a separate billing endpoint.
@@ -5664,6 +7564,11 @@ def _bind_usage_turn(usage_turn_id: Any, *, replace: bool = False) -> None:
 def _bind_usage_turn_from_metadata(metadata: Any) -> None:
     if isinstance(metadata, Mapping):
         _bind_usage_turn(metadata.get("usage_turn_id"))
+        position = metadata.get("queue_position")
+        tracker = _USAGE_TRACKER.get()
+        bind_position = getattr(tracker, "bind_queue_position", None)
+        if callable(bind_position) and isinstance(position, (int, float)):
+            bind_position(position)
 
 
 def _remote_only_models() -> set[str]:
@@ -5698,6 +7603,20 @@ def _raw_history_limit_int(
         return default
 
 
+class RemoteQueryTooLarge(ValueError):
+    """The compacted query still cannot fit Trae Remote's hard input cap."""
+
+    def __init__(self, query_chars: int, limit: int):
+        self.query_chars = max(0, int(query_chars))
+        self.limit = max(0, int(limit))
+        super().__init__(
+            "Trae remote query exceeds the configured input limit "
+            f"({self.query_chars} > {self.limit} characters after compaction). "
+            "Attached images count toward this limit; reduce the input size "
+            "or use the IDE/Solo endpoint for larger image payloads."
+        )
+
+
 def _bounded_remote_query(
     messages: list[Mapping[str, Any]],
     options: Mapping[str, Any],
@@ -5707,7 +7626,7 @@ def _bounded_remote_query(
     Trae's remote session silently ends the event stream (no text, no ``done``)
     when initial_message.query exceeds roughly 500k chars.  Keep the system
     prompt and the newest turns intact and drop the oldest conversation from
-    the front until ``flatten_query`` is under the configured cap.
+    the front until the complete wire query, including images, fits the cap.
     """
 
     raw_limit = _raw_history_limit_int(
@@ -5718,31 +7637,252 @@ def _bounded_remote_query(
     )
     if raw_limit <= 0:
         return [dict(m) for m in messages], 0
-    bounded = [dict(m) for m in messages]
-    removed = 0
-    while True:
-        query = trae_client.flatten_query(bounded)
-        if len(query) <= raw_limit:
-            return bounded, removed
-        non_system = [
-            index
-            for index, message in enumerate(bounded)
-            if str(message.get("role") or "user") not in {"system", "developer"}
+    original = [dict(m) for m in messages]
+    query = trae_client.flatten_query_parts(original)
+    if len(query) <= raw_limit:
+        return original, 0
+    non_system = [
+        index
+        for index, message in enumerate(original)
+        if str(message.get("role") or "user") not in {"system", "developer"}
+    ]
+    boundaries = [0]
+    offset = 0
+    while offset + 1 < len(non_system):
+        head = non_system[offset]
+        message = original[head]
+        paired = (
+            str(message.get("role") or "") == "assistant"
+            and bool(message.get("tool_calls") or message.get("function_call"))
+            and head + 1 == non_system[offset + 1]
+            and str(original[head + 1].get("role") or "") == "tool"
+        )
+        offset += 2 if paired else 1
+        boundaries.append(offset)
+
+    non_system_set = set(non_system)
+
+    def suffix(removed_count: int) -> list[dict[str, Any]]:
+        first = non_system[removed_count] if removed_count < len(non_system) else len(original)
+        return [
+            message
+            for index, message in enumerate(original)
+            if index >= first or index not in non_system_set
         ]
-        if len(non_system) <= 1:
-            return bounded, removed
-        head = non_system[0]
-        drop = {head}
-        head_message = bounded[head]
-        if str(head_message.get("role") or "") == "assistant" and (
-            head_message.get("tool_calls") or head_message.get("function_call")
-        ):
-            if head + 1 < len(bounded):
-                following = bounded[head + 1]
-                if str(following.get("role") or "") == "tool":
-                    drop.add(head + 1)
-        bounded = [m for index, m in enumerate(bounded) if index not in drop]
-        removed += len(drop)
+
+    # Ordinary histories only lose serialized text/media when a prefix is
+    # removed. Find the same first fitting suffix without re-encoding a large
+    # image once per history message on the event loop. Renderer tool results
+    # can inherit names from earlier calls, so keep their exact sequential
+    # behavior instead of assuming their serialized size is monotonic.
+    inherited_tool_names = any(
+        raw_client._renderer_tool_result_blocks(message.get("content"))
+        for message in original
+    )
+    removed = 0
+    bounded = original
+    if inherited_tool_names:
+        for removed in boundaries[1:]:
+            bounded = suffix(removed)
+            query = trae_client.flatten_query_parts(bounded)
+            if len(query) <= raw_limit:
+                return bounded, removed
+    elif len(boundaries) > 1:
+        removed = boundaries[-1]
+        bounded = suffix(removed)
+        query = trae_client.flatten_query_parts(bounded)
+        if len(query) <= raw_limit:
+            low, high = 1, len(boundaries) - 1
+            while low < high:
+                middle = (low + high) // 2
+                candidate = suffix(boundaries[middle])
+                candidate_query = trae_client.flatten_query_parts(candidate)
+                if len(candidate_query) <= raw_limit:
+                    high = middle
+                    bounded, query = candidate, candidate_query
+                else:
+                    low = middle + 1
+            return bounded, boundaries[low]
+
+    # Media cannot be shortened by the text-fitting pass. Reject its fixed
+    # lower bound before repeatedly normalizing an attachment that cannot fit.
+    query_parts = json.loads(query)
+    media = [
+        part
+        for part in query_parts
+        if isinstance(part, Mapping) and part.get("type") == "image_url"
+    ]
+    if media and len(json.dumps(media, ensure_ascii=False)) > raw_limit:
+        raise RemoteQueryTooLarge(len(query), raw_limit)
+
+    # The loop above can only remove complete turns.  A request containing one
+    # enormous user/tool-result message has no removable non-system turn, so
+    # the old implementation returned the oversized query unchanged.  Trae
+    # accepts the create-session request but then closes the events stream
+    # before the first model event; callers consequently rotate through every
+    # account and end with a burst of 502 responses.  Clamp message content as
+    # a final step so a single large turn cannot bypass the upstream limit.
+    bounded = _fit_remote_query_contents(bounded, raw_limit)
+    final_query_chars = len(trae_client.flatten_query_parts(bounded))
+    if final_query_chars > raw_limit:
+        # Never send a request that the provider is known to accept only
+        # partially. A non-text tool payload or an intentionally tiny custom
+        # limit can leave fixed JSON/tool metadata larger than the budget even
+        # after text truncation. Failing before ``create_session`` keeps this
+        # deterministic client error from being replayed on every account.
+        raise RemoteQueryTooLarge(final_query_chars, raw_limit)
+    return bounded, removed
+
+
+def _remote_fallback_allowed_for_request(
+    messages: Optional[list[Mapping[str, Any]]],
+    options: Optional[Mapping[str, Any]],
+) -> bool:
+    """Return whether a native failure may safely retry the request on Remote.
+
+    Remote can compact ordinary conversation history, but an image attachment
+    is intentionally kept intact.  When that attachment alone leaves the
+    flattened query above Remote's hard input cap, retrying the same payload
+    would only replace a useful IDE error with a deterministic 413 (and may
+    replay it across polling accounts).  Text, tool requests, and images that
+    fit after compaction retain the normal fallback behavior.
+    """
+
+    if not images.messages_have_images(messages):
+        return True
+    try:
+        _bounded_remote_query(messages or [], options or {})
+    except RemoteQueryTooLarge:
+        return False
+    return True
+
+
+_REMOTE_QUERY_TRUNCATION_MARKER = (
+    "\n\n[relay: older context omitted to fit the Trae remote query limit]\n\n"
+)
+
+
+def _truncate_remote_text(text: str, limit: int) -> str:
+    """Keep the useful head and tail of one message within ``limit`` chars."""
+
+    value = str(text or "")
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    if limit <= len(_REMOTE_QUERY_TRUNCATION_MARKER):
+        return value[:limit]
+    available = limit - len(_REMOTE_QUERY_TRUNCATION_MARKER)
+    head = max(1, int(available * 0.65))
+    tail = max(0, available - head)
+    if not tail:
+        return value[:head] + _REMOTE_QUERY_TRUNCATION_MARKER
+    return (
+        value[:head]
+        + _REMOTE_QUERY_TRUNCATION_MARKER
+        + value[-tail:]
+    )
+
+
+def _remote_message_text(message: Mapping[str, Any]) -> str:
+    """Return the trimmable text, excluding intact image attachments."""
+
+    content = message.get("content")
+    if content in (None, "", []) and not message.get("tool_calls"):
+        for key in ("parts", "text", "prompt", "message", "input"):
+            candidate = message.get(key)
+            if candidate not in (None, "", [], {}):
+                content = candidate
+                break
+    return raw_client._content_to_text(raw_client._without_native_images(content))
+
+
+def _truncate_remote_message(
+    message: Mapping[str, Any],
+    content_limit: int,
+) -> dict[str, Any]:
+    """Copy one message while bounding its text contribution.
+
+    Image attachments and tool call metadata remain intact. Only text may be
+    shortened; an attachment that cannot fit must produce an explicit error.
+    """
+
+    updated = dict(message)
+    text = _remote_message_text(message)
+    truncated = _truncate_remote_text(text, content_limit)
+    content = message.get("content")
+    attachments = (
+        [
+            part
+            for part in content
+            if isinstance(part, Mapping) and images.is_image_part(part)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    updated["content"] = (
+        [{"type": "text", "text": truncated}, *attachments]
+        if attachments
+        else truncated
+    )
+    for key in ("parts", "text", "prompt", "message", "input"):
+        if key in updated and key != "content":
+            updated.pop(key, None)
+    return updated
+
+
+def _fit_remote_query_contents(
+    messages: list[dict[str, Any]],
+    raw_limit: int,
+) -> list[dict[str, Any]]:
+    """Trim oversized individual messages until the flattened query fits."""
+
+    if raw_limit <= 0:
+        return messages
+    bounded = [dict(message) for message in messages]
+    while len(trae_client.flatten_query_parts(bounded)) > raw_limit:
+        before_query_chars = len(trae_client.flatten_query_parts(bounded))
+        candidates = sorted(
+            (
+                (index, len(_remote_message_text(message)))
+                for index, message in enumerate(bounded)
+                if _remote_message_text(message)
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if not candidates:
+            break
+        index, text_length = candidates[0]
+        current = bounded[index]
+        low, high = 0, text_length
+        best: Optional[dict[str, Any]] = None
+        # Find the largest prefix/suffix slice that makes the whole query fit.
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = _truncate_remote_message(current, middle)
+            probe = list(bounded)
+            probe[index] = candidate
+            if len(trae_client.flatten_query_parts(probe)) <= raw_limit:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best is None:
+            # Keep a small marker rather than returning an invalid oversized
+            # request when fixed JSON framing consumes the entire budget.
+            best = _truncate_remote_message(
+                current,
+                max(1, min(text_length, len(_REMOTE_QUERY_TRUNCATION_MARKER))),
+            )
+        bounded[index] = best
+        if len(trae_client.flatten_query_parts(bounded)) >= before_query_chars:
+            # Avoid spinning forever when a non-text tool payload alone is
+            # larger than the configured budget.  The normal cap leaves ample
+            # room for tool metadata; this is only a defensive escape hatch
+            # for malformed or extremely small custom limits.
+            break
+    return bounded
 
 
 _CONTINUATION_ONLY_RE = re.compile(
@@ -5977,8 +8117,11 @@ async def _tracked_dispatch(
         status = "error"
         raise
     finally:
-        _USAGE_TRACKER.reset(context_token)
-        await tracker.finish(status)
+        try:
+            _USAGE_TRACKER.reset(context_token)
+            await tracker.finish(status)
+        finally:
+            _cancel_unclaimed_account_slot(options)
 
 
 async def run_cli_chat(messages, model, stream: bool, options: Optional[dict] = None):
@@ -6119,8 +8262,12 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
     bound_options["provider_specific"] = (
         dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
     )
-    await trae_client.acquire_web_slot(
-        account_id, timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+    slot_lease_token = await trae_client.acquire_web_slot(
+        account_id,
+        timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
+        reservation_id=str(
+            bound_options.get("_account_slot_reservation_id") or ""
+        ),
     )
     client = None
     session_id = ""
@@ -6143,7 +8290,7 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
                 if client is not None:
                     await client.aclose()
             finally:
-                trae_client.release_web_slot(account_id)
+                trae_client.release_web_slot_owned(account_id, slot_lease_token)
 
     async def close_web_session() -> None:
         nonlocal cleanup_task
@@ -6167,6 +8314,7 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
             client,
             token=token,
             provider_specific=bound_options.get("provider_specific"),
+            slot_lease_token=slot_lease_token,
         )
         lease_registered = True
         event_iter = trae_client.stream_web_events(
@@ -6198,6 +8346,32 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
     except BaseException:
         await close_web_session()
         raise
+
+
+def _is_remote_account_capacity_error(error: BaseException) -> bool:
+    """Recognize account capacity errors that cannot be repaired through Work."""
+
+    if bool(getattr(error, "account_quota_exhausted", False)):
+        return True
+    if str(getattr(error, "code", "") or "").strip() in {
+        "3004", "4008", "4011", "429"
+    }:
+        return True
+    text = str(error or "").lower()
+    return bool(
+        re.search(r"(?:\[|\bhttp\s+)(?:3004|4008|4011|429)\b", text)
+        or any(
+            marker in text
+            for marker in (
+                "parallel",
+                "rate limit",
+                "rate-limit",
+                "too many requests",
+                "quota exceeded",
+                "exceeded the quota",
+            )
+        )
+    )
 
 
 async def run_remote_session(messages, model, stream: bool, options: Optional[dict] = None):
@@ -6238,14 +8412,13 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     if not token:
         raise RuntimeError("No Cloud-IDE-JWT token available")
     remote_options = dict(options)
-    # Caller-owned tools must run in the API client's workspace.  Agent owns a
-    # separate remote workspace and can consume file/shell work internally,
-    # then return only a success sentence; Work keeps the advertised tools as
-    # calls for Codex/the API client to execute.  Plain text requests remain
-    # Agent-first (including the 1M/max profile), and operators can explicitly
-    # opt tool requests back into Agent with ``...USE_WORK=0`` for diagnostics.
+    # Agent is the default executor for every remote request, including turns
+    # that advertise caller-owned tools.  This matches the desktop Agent
+    # contract and is required for the Agent-tier model binding/1M profile.
+    # Operators that need local-workspace tool execution can explicitly opt
+    # those turns into Work with ``TRAE_REMOTE_CALLER_TOOLS_USE_WORK=1``.
     caller_tools_use_work = (
-        os.environ.get("TRAE_REMOTE_CALLER_TOOLS_USE_WORK", "1").strip().lower()
+        os.environ.get("TRAE_REMOTE_CALLER_TOOLS_USE_WORK", "0").strip().lower()
         in {"1", "true", "yes", "on"}
     )
     if (
@@ -6274,6 +8447,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
     )
     slot_released = False
+    slot_lease_token = ""
     cleanup_task = None
 
     def release_slot_once() -> None:
@@ -6283,7 +8457,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         if slot_released:
             return
         slot_released = True
-        trae_client.release_web_slot(account_id)
+        trae_client.release_web_slot_owned(account_id, slot_lease_token)
 
     client = None
     session_id = ""
@@ -6341,6 +8515,53 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         fallback["_session_variant"] = "work-fallback"
         return fallback
 
+    def mark_work_fallback_trace() -> None:
+        """Expose an Agent -> Work fallback as the actual billed product."""
+
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace.update(
+                actual_mode="work",
+                actual_endpoint="work",
+                product="traework",
+                fallback_used=True,
+                fallback_target="work",
+            )
+
+    def agent_create_may_fallback(error: BaseException) -> bool:
+        """Only replay transient Agent setup failures through Work.
+
+        A deterministic account/config/auth error cannot be repaired by
+        sending the same model to another executor. Replaying those errors
+        creates a second request, obscures the real diagnosis, and can charge
+        the wrong product.
+        """
+
+        text = str(error or "").lower()
+        if _is_remote_account_capacity_error(error):
+            return False
+        if any(
+            marker in text
+            for marker in (
+                "model binding mismatch",
+                "model is not available",
+                "failed to get app config",
+                "app config",
+                "record not found",
+                "unauthorized",
+                "authentication",
+                "invalid token",
+                "no cloud-ide-jwt",
+                "http 400",
+                "http 401",
+                "http 403",
+                "http 404",
+                "http 422",
+            )
+        ):
+            return False
+        return True
+
     # Inject caller-owned tool definitions as a system prompt so the
     # remote upstream sees the available tools even though its transport
     # only accepts text messages.
@@ -6374,9 +8595,11 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     prepared_messages, omitted_history = raw_client._compact_raw_history(
         prepared_messages, compact_options
     )
+    query_chars_before_bound = len(trae_client.flatten_query_parts(prepared_messages))
     prepared_messages, query_trimmed = _bounded_remote_query(
         prepared_messages, compact_options
     )
+    query_chars_after_bound = len(trae_client.flatten_query_parts(prepared_messages))
     if omitted_history:
         logger.info(
             "remote history compacted input_messages=%d output_messages=%d omitted=%d",
@@ -6390,21 +8613,33 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             original_message_count,
             len(prepared_messages),
             query_trimmed,
-            len(trae_client.flatten_query(prepared_messages)),
+            query_chars_after_bound,
         )
-    await trae_client.acquire_web_slot(
+    elif query_chars_after_bound < query_chars_before_bound:
+        logger.warning(
+            "remote query content trimmed for upstream size "
+            "input_query_chars=%d output_query_chars=%d",
+            query_chars_before_bound,
+            query_chars_after_bound,
+        )
+    slot_lease_token = await trae_client.acquire_web_slot(
         account_id,
         timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
+        reservation_id=str(
+            remote_options.get("_account_slot_reservation_id") or ""
+        ),
     )
     try:
         client = httpx.AsyncClient(timeout=None)
         logger.info(
-            "remote create start id=%s account=%s model=%s messages=%d last_chars=%d",
+            "remote create start id=%s account=%s model=%s messages=%d "
+            "input_last_chars=%d query_chars=%d",
             str(options.get("_relay_request_id") or ""),
             account_id,
             model,
             len(messages),
             len(str(messages[-1].get("content") or "")) if messages else 0,
+            query_chars_after_bound,
         )
         try:
             session_id, message_id = await trae_remote_client.create_session(
@@ -6415,7 +8650,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 options=remote_options,
             )
         except Exception as create_exc:
-            if not can_work_fallback:
+            if not can_work_fallback or not agent_create_may_fallback(create_exc):
                 raise
             logger.warning(
                 "remote Agent create failed; falling back to Work id=%s model=%s error=%s",
@@ -6431,6 +8666,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             client = httpx.AsyncClient(timeout=None)
             remote_options = work_fallback_options(remote_options)
             work_fallback_used = True
+            mark_work_fallback_trace()
             session_id, message_id = await trae_remote_client.create_session(
                 client,
                 token,
@@ -6495,9 +8731,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                             _track_usage_from_exception(exc, model)
                         polling_retry_enabled = bool(
                             auth.get_polling_status().get("enabled")
+                            and not options.get(
+                                "_disable_remote_stream_account_retry"
+                            )
                         )
                         if (
                             not exc_retryable
+                            or exc_observed_model_event
+                            or exc_usage is not None
                             or work_fallback_used
                             or not (can_work_fallback or polling_retry_enabled)
                             or (quota_exhausted and not polling_retry_enabled)
@@ -6530,6 +8771,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         )
                         await close_remote_session()
                         slot_reacquired = False
+                        retry_slot_lease_token = ""
                         retry_client = None
                         retry_session_id = ""
                         retry_message_id = ""
@@ -6554,7 +8796,10 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                         await retry_client.aclose()
                                 finally:
                                     if slot_reacquired:
-                                        trae_client.release_web_slot(retry_account_id)
+                                        trae_client.release_web_slot_owned(
+                                            retry_account_id,
+                                            retry_slot_lease_token,
+                                        )
 
                         try:
                             retry_options = dict(remote_options)
@@ -6566,6 +8811,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                             ):
                                 retry_options = work_fallback_options(retry_options)
                                 work_fallback_used = True
+                                mark_work_fallback_trace()
                             retry_token = token
                             # A 4008 is account-scoped. Never retry it through
                             # the same account's Work executor; rotate to a
@@ -6576,56 +8822,54 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 quota_exhausted
                                 or not (can_work_fallback and work_fallback_used)
                             ):
+                                _cancel_unclaimed_account_slot(retry_options)
                                 next_snapshot = _next_retry_account_snapshot(
                                     {_retry_account_key(options, 0)}, 1
                                 )
                                 if next_snapshot is not None:
                                     next_account_id, record = next_snapshot
                                     retry_account_id = next_account_id
-                                    retry_token = (
-                                        str(record.get("token") or "") or retry_token
-                                    )
-                                    retry_billing_id = (
-                                        _account_id_from_token(retry_token)
-                                        or next_account_id
-                                    )
-                                    retry_options = dict(retry_options)
-                                    retry_options["_account_id"] = next_account_id
-                                    retry_options["_billing_id"] = retry_billing_id
-                                    retry_options["_auth_token"] = retry_token
-                                    retry_options["_auth_user_id"] = retry_billing_id
-                                    retry_provider = (
-                                        record.get("provider_specific")
-                                        or record.get("providerSpecificData")
-                                        or {}
-                                    )
-                                    if isinstance(retry_provider, Mapping):
-                                        retry_options["provider_specific"] = dict(
-                                            retry_provider
-                                        )
-                                    retry_tracker = _USAGE_TRACKER.get()
-                                    if retry_tracker is not None:
-                                        await retry_tracker.rebind(retry_options)
-                                    _rebind_chat_session_account(
-                                        str(
-                                            retry_options.get("session_id")
-                                            or retry_options.get("sessionId")
-                                            or ""
-                                        ),
-                                        next_account_id,
-                                        retry_billing_id,
+                                    (
+                                        retry_options,
                                         retry_token,
+                                        retry_billing_id,
                                         retry_provider,
+                                    ) = _retry_options_for_account(
+                                        retry_options, next_account_id, record
                                     )
+                                    try:
+                                        retry_tracker = _USAGE_TRACKER.get()
+                                        if retry_tracker is not None:
+                                            await retry_tracker.rebind(retry_options)
+                                        _rebind_chat_session_account(
+                                            str(
+                                                retry_options.get("session_id")
+                                                or retry_options.get("sessionId")
+                                                or ""
+                                            ),
+                                            next_account_id,
+                                            retry_billing_id,
+                                            retry_token,
+                                            retry_provider,
+                                        )
+                                    except BaseException:
+                                        _cancel_unclaimed_account_slot(retry_options)
+                                        raise
                                 elif quota_exhausted:
                                     # Do not reacquire the exhausted account
                                     # and replay the turn. The caller receives
                                     # the original quota error instead.
                                     raise
-                            await trae_client.acquire_web_slot(
+                            retry_slot_lease_token = await trae_client.acquire_web_slot(
                                 retry_account_id,
                                 timeout=float(
                                     os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")
+                                ),
+                                reservation_id=str(
+                                    retry_options.get(
+                                        "_account_slot_reservation_id"
+                                    )
+                                    or ""
                                 ),
                             )
                             slot_reacquired = True
@@ -6673,9 +8917,12 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 yield chunk
                             stream_status = "completed"
                         finally:
-                            await _await_session_cleanup(
-                                asyncio.create_task(cleanup_retry_session())
-                            )
+                            try:
+                                await _await_session_cleanup(
+                                    asyncio.create_task(cleanup_retry_session())
+                                )
+                            finally:
+                                _cancel_unclaimed_account_slot(retry_options)
                 except asyncio.CancelledError:
                     stream_status = "client_cancelled"
                     raise
@@ -6714,7 +8961,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             return JSONResponse(content=result)
         except EmptyUpstreamResponse as exc:
             _track_usage_from_exception(exc, model)
-            if not (can_work_fallback and not work_fallback_used and exc.retryable):
+            if not (
+                can_work_fallback
+                and not work_fallback_used
+                and exc.retryable
+                and not exc.observed_model_event
+                and exc.usage is None
+                and not _is_remote_account_capacity_error(exc)
+            ):
                 raise
             logger.warning(
                 "remote upstream ended before any model event; falling back to Work "
@@ -6743,6 +8997,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             except Exception:
                 pass
             remote_options = work_fallback_options(remote_options)
+            mark_work_fallback_trace()
             session_id, message_id = await trae_remote_client.create_session(
                 client,
                 token,
@@ -6782,60 +9037,228 @@ def _effort_note(effort: str, trace: Mapping[str, Any]) -> Optional[str]:
         return None
     mode = str(trace.get("actual_mode") or trace.get("actual_endpoint") or "")
     if mode in {"ide", "solo"}:
-        # llm_utils_chat is the IDE/Solo utility route (titles/prompt tools); the
-        # real IDE sends strength only via the ai-agent task, so the field is
-        # ignored here.
-        return "llm_utils_chat 端点不接受强度字段"
+        # TraeCode's raw endpoint carries model selection in CustomModel.  The
+        # relay keeps the caller's requested level in usage metadata even
+        # when a particular native config does not expose a writable effort
+        # field, so the diagnostic must name the actual protocol.
+        return "当前 TraeCode IDE/SOLO raw 配置未声明可写思考档位"
     if mode == "raw":
         return "raw 端点需要企业 PAT"
     return "该模型未声明 reasoning_effort_config"
 
 
 async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = None):
-    """trae2api 风格 IDE chat，流式响应消费完成后关闭 response 和 client。"""
+    """Run the IDE/SOLO protocol with a bounded raw -> legacy fallback.
+
+    TraeCode raw v2 is the preferred protocol because it preserves the
+    desktop model binding. Personal CN accounts, however, can reject a valid
+    catalog model with ``4001 param invalid`` or close an empty stream before
+    the first model event. The same account is accepted by the legacy
+    ``/api/agent/v3/llm_utils_chat`` adapter. Try raw first, then reopen the
+    legacy request only when raw failed before any model output. This keeps
+    existing raw replay tests valid while making the public IDE/SOLO presets
+    usable on accounts that do not have the raw app-config record.
+    """
+
+    options = dict(options or {})
     translation_options = _tool_translation_options(options, messages)
+    raw_requested = bool(options.get("_traecode_raw_chat_function"))
+    legacy_fallback_allowed = not bool(
+        options.get("_disable_upstream_fallback")
+        or options.get("_disable_traecode_legacy_fallback")
+    )
     upstream_metadata: dict[str, Any] = {}
-    ide_resp = await trae_client.send_chat_request(messages, model, stream, options=options)
-    response = ide_resp.response
-    close_response = _chat_response_closer(ide_resp, upstream_metadata)
+
+    def _can_fallback(error: BaseException) -> bool:
+        # Buffered native tools may not have reached the wire yet, but an
+        # observed model turn is still billable and cannot be safely replayed.
+        if isinstance(error, EmptyUpstreamResponse) and (
+            not error.retryable
+            or error.observed_model_event
+            or error.usage is not None
+        ):
+            return False
+        # Account throttling affects both native protocols. Let the outer
+        # retry helper rotate credentials instead of replaying this account.
+        return not _is_native_rate_limit_error(error)
+
+    def _legacy_options() -> dict:
+        legacy = dict(options)
+        legacy.pop("_traecode_raw_chat_function", None)
+        legacy.pop("_traecode_solo", None)
+        legacy["_ide_endpoint"] = str(
+            legacy.get("_legacy_ide_endpoint")
+            or legacy.get("_ide_endpoint")
+            or "/api/agent/v3/llm_utils_chat"
+        )
+        return legacy
+
+    def _mark_raw_fallback(error: BaseException) -> None:
+        trace = options.get("_upstream_trace")
+        if not isinstance(trace, dict):
+            return
+        requested = str(
+            trace.get("requested_endpoint")
+            or trace.get("requested_mode")
+            or options.get("_upstream_mode")
+            or "ide"
+        )
+        reason = f"{requested}: raw -> legacy llm_utils_chat: {str(error)[:800]}"
+        previous = str(trace.get("fallback_reason") or "").strip()
+        trace.update(
+            fallback_used=True,
+            fallback_target="legacy-ide",
+            fallback_reason="; ".join(
+                part for part in (previous, reason) if part
+            )[:1200],
+            actual_endpoint="/api/agent/v3/llm_utils_chat",
+        )
+
+    async def _open(kind: str):
+        if kind == "raw":
+            code_options = dict(options)
+            function = str(
+                code_options.get("_traecode_raw_chat_function") or "chat_v3"
+            )
+            code_options["_traecode_solo"] = function.startswith("solo_")
+            return await raw_client.send_traecode_chat_request(
+                messages,
+                model,
+                stream=stream,
+                options=code_options,
+            )
+        return await trae_client.send_chat_request(
+            messages,
+            model,
+            stream,
+            options=_legacy_options(),
+        )
+
+    if not raw_requested:
+        raw_kind = "legacy"
+    else:
+        raw_kind = "raw"
+
     if stream:
-        async def gen():
+        current_kind = raw_kind
+        current_wrapper = None
+        current_close = None
+        try:
             try:
-                async for chunk in translate_ide_stream(
-                    response,
-                    model,
-                    FORWARD_USAGE,
-                    fail_on_empty=True,
-                    upstream_metadata=upstream_metadata,
-                    **translation_options,
+                current_wrapper = await _open(current_kind)
+            except Exception as exc:
+                if (
+                    current_kind == "raw"
+                    and legacy_fallback_allowed
+                    and _can_fallback(exc)
                 ):
-                    _bind_usage_turn_from_metadata(upstream_metadata)
-                    _track_usage_from_chunk(chunk, model)
-                    yield chunk
-            finally:
-                await close_response()
+                    _mark_raw_fallback(exc)
+                    current_kind = "legacy"
+                    current_wrapper = await _open(current_kind)
+                else:
+                    raise
+            current_close = _chat_response_closer(
+                current_wrapper, upstream_metadata
+            )
+
+            async def close_current():
+                if current_close is not None:
+                    await current_close()
+
+        except BaseException:
+            if current_close is not None:
+                await current_close()
+            raise
+
+        async def gen():
+            nonlocal current_kind, current_wrapper, current_close
+            emitted_model_output = False
+            while True:
+                try:
+                    response = current_wrapper.response
+                    async for chunk in translate_ide_stream(
+                        response,
+                        model,
+                        FORWARD_USAGE,
+                        fail_on_empty=True,
+                        upstream_metadata=upstream_metadata,
+                        **translation_options,
+                    ):
+                        if (
+                            _chunk_text_delta(chunk)
+                            or _chunk_reasoning_delta(chunk)
+                            or _chunk_has_tool_calls(chunk)
+                        ):
+                            emitted_model_output = True
+                        _bind_usage_turn_from_metadata(upstream_metadata)
+                        _track_usage_from_chunk(chunk, model)
+                        yield chunk
+                    await close_current()
+                    return
+                except (asyncio.CancelledError, GeneratorExit):
+                    await close_current()
+                    raise
+                except Exception as exc:
+                    if (
+                        current_kind == "raw"
+                        and legacy_fallback_allowed
+                        and not emitted_model_output
+                        and _can_fallback(exc)
+                    ):
+                        await close_current()
+                        _mark_raw_fallback(exc)
+                        current_kind = "legacy"
+                        current_wrapper = await _open(current_kind)
+                        current_close = _chat_response_closer(
+                            current_wrapper, upstream_metadata
+                        )
+                        continue
+                    await close_current()
+                    raise
+
         try:
             return StreamingResponse(
-                _SessionStreamIterator(gen(), close_response),
+                _SessionStreamIterator(gen(), close_current),
                 media_type="text/event-stream",
                 headers=_sse_headers(),
             )
         except BaseException:
-            await close_response()
+            await close_current()
             raise
-    try:
-        result = await collect_nonstream_ide(
-            response,
-            model,
-            fail_on_empty=True,
-            upstream_metadata=upstream_metadata,
-            **translation_options,
-        )
-        _bind_usage_turn_from_metadata(upstream_metadata)
-        _track_usage_from_result(result, model)
-        return JSONResponse(content=result)
-    finally:
-        await close_response()
+
+    current_kind = raw_kind
+    while True:
+        response_wrapper = None
+        close_response = None
+        try:
+            response_wrapper = await _open(current_kind)
+            response = response_wrapper.response
+            close_response = _chat_response_closer(
+                response_wrapper, upstream_metadata
+            )
+            result = await collect_nonstream_ide(
+                response,
+                model,
+                fail_on_empty=True,
+                upstream_metadata=upstream_metadata,
+                **translation_options,
+            )
+            _bind_usage_turn_from_metadata(upstream_metadata)
+            _track_usage_from_result(result, model)
+            return JSONResponse(content=result)
+        except Exception as exc:
+            if (
+                current_kind == "raw"
+                and legacy_fallback_allowed
+                and _can_fallback(exc)
+            ):
+                _mark_raw_fallback(exc)
+                current_kind = "legacy"
+                continue
+            raise
+        finally:
+            if close_response is not None:
+                await close_response()
 
 
 async def run_traework_native_chat(
@@ -6848,15 +9271,73 @@ async def run_traework_native_chat(
     to load a Windows PE DLL.
     """
 
+    options = dict(options or {})
     translation_options = _tool_translation_options(options, messages)
     upstream_metadata: dict[str, Any] = {}
-    native_resp = await traework_native_bridge.send_native_chat_request(
-        messages,
-        model,
-        stream=stream,
-        options=options,
+    requested_slot_account = str(options.get("_account_id") or "").strip()
+    slot_account_id = auth.resolve_model_account_id(requested_slot_account)
+    if not slot_account_id:
+        slot_account_id = requested_slot_account
+    if not slot_account_id and options.get("_auth_token"):
+        slot_account_id = "token:" + hashlib.sha256(
+            str(options.get("_auth_token")).encode("utf-8")
+        ).hexdigest()
+    slot_acquired = False
+    slot_released = False
+    slot_lease_token = ""
+    slot_release_lock = threading.Lock()
+
+    def release_slot_once() -> None:
+        nonlocal slot_released
+        with slot_release_lock:
+            if slot_released:
+                return
+            slot_released = True
+        if slot_acquired:
+            trae_client.release_web_slot_owned(
+                slot_account_id, slot_lease_token
+            )
+
+    if slot_account_id:
+        try:
+            slot_timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+        except (TypeError, ValueError):
+            slot_timeout = 60.0
+        slot_lease_token = await trae_client.acquire_web_slot(
+            slot_account_id,
+            timeout=max(0.0, slot_timeout),
+            reservation_id=str(
+                options.get("_account_slot_reservation_id") or ""
+            ),
+        )
+        slot_acquired = True
+    try:
+        native_resp = await traework_native_bridge.send_native_chat_request(
+            messages,
+            model,
+            stream=stream,
+            options=options,
+        )
+    except BaseException:
+        release_slot_once()
+        raise
+    close_native_response = _chat_response_closer(
+        native_resp, upstream_metadata
     )
-    close_response = _chat_response_closer(native_resp, upstream_metadata)
+    close_task = None
+
+    async def close_response() -> None:
+        nonlocal close_task
+        if close_task is None:
+            async def cleanup() -> None:
+                try:
+                    await close_native_response()
+                finally:
+                    release_slot_once()
+
+            close_task = asyncio.create_task(cleanup())
+        await _await_session_cleanup(close_task)
+
     if stream:
         async def gen():
             try:
@@ -7143,8 +9624,63 @@ def _polling_retry_limit(options: Optional[Mapping[str, Any]]) -> int:
 def _next_retry_account_snapshot(
     attempted_accounts: set[str], max_rotations: int
 ) -> tuple[str, dict] | None:
-    """Rotate to an account that has not already received this request."""
+    """Atomically reserve an untried account for one retry attempt.
 
+    Credit-priority selection normally keeps returning the richest account
+    while it has capacity.  That is correct for new traffic but not for an
+    account-scoped retry: once that account failed, selecting it again would
+    prevent lower-credit accounts from ever being tried.  Translate every
+    attempted billing identity back to all matching store rows, exclude them,
+    and let the auth scheduler choose and reserve the best remaining slot.
+    """
+
+    if max_rotations <= 0:
+        return None
+    excluded_account_ids: set[str] = set()
+    stored_accounts = auth.get_accounts_raw()
+    # ``list_accounts`` is the public account inventory used by the retry
+    # budget and by a few integrations that provide credentials dynamically.
+    # Use the atomic reservation ledger only when that inventory is backed by
+    # the same persisted rows.  If an integration exposes a temporary/mock
+    # inventory while the process still has unrelated persisted rows, forcing
+    # the ledger path would silently ignore the advertised accounts and make a
+    # retry look exhausted.  In the normal deployment the ids are identical
+    # (apart from filtered invalid rows), so this remains the atomic path.
+    listed_accounts = auth.list_accounts()
+    listed_ids = {
+        str(item.get("id") or "")
+        for item in listed_accounts
+        if isinstance(item, Mapping) and str(item.get("id") or "")
+    }
+    stored_ids = {str(account_id or "") for account_id, _ in stored_accounts}
+    inventory_matches_store = listed_ids == stored_ids
+    for rotation_index, (account_id, record) in enumerate(stored_accounts):
+        safe_record = dict(record) if isinstance(record, Mapping) else {}
+        candidate_key = _retry_account_key(
+            {
+                "_account_id": str(account_id or ""),
+                "_auth_token": str(safe_record.get("token") or ""),
+            },
+            rotation_index,
+        )
+        if (
+            candidate_key in attempted_accounts
+            or str(account_id or "") in attempted_accounts
+        ):
+            excluded_account_ids.add(str(account_id or ""))
+
+    if stored_accounts and inventory_matches_store:
+        account_id, record = auth.reserve_model_account(
+            require_polling=True,
+            excluded_account_ids=excluded_account_ids,
+        )
+        if not account_id:
+            return None
+        return str(account_id), dict(record)
+
+    # Legacy/single-token integrations and tests may expose polling accounts
+    # through the compatibility getters without persisting them in auth.
+    # Retain that path only when the atomic store is genuinely empty.
     for rotation_index in range(max(1, max_rotations)):
         auth.next_polling_account()
         account_id, record = auth.get_active_account_snapshot()
@@ -7159,6 +9695,39 @@ def _next_retry_account_snapshot(
         if account_key not in attempted_accounts:
             return str(account_id or ""), safe_record
     return None
+
+
+def _retry_options_for_account(
+    options: Optional[Mapping[str, Any]], account_id: str, record: Mapping[str, Any]
+) -> tuple[dict, str, str, Mapping[str, Any]]:
+    """Bind a reserved retry slot and its immutable credential snapshot."""
+
+    rebound = dict(options or {})
+    for key in (
+        "_account_slot_reserved",
+        "_account_slot_reservation_account",
+        "_account_slot_reservation_id",
+    ):
+        rebound.pop(key, None)
+    token = str(record.get("token") or "")
+    billing_id = _account_id_from_token(token) or account_id
+    provider_specific = (
+        record.get("provider_specific")
+        or record.get("providerSpecificData")
+        or {}
+    )
+    rebound["_account_id"] = account_id
+    rebound["_billing_id"] = billing_id
+    rebound["_auth_token"] = token
+    rebound["_auth_user_id"] = billing_id
+    if isinstance(provider_specific, Mapping):
+        rebound["provider_specific"] = dict(provider_specific)
+    reservation_id = str(record.get("_slot_reservation_id") or "")
+    if reservation_id:
+        rebound["_account_slot_reserved"] = True
+        rebound["_account_slot_reservation_account"] = account_id
+        rebound["_account_slot_reservation_id"] = reservation_id
+    return rebound, token, billing_id, provider_specific
 
 
 async def _run_web_with_retry(
@@ -7179,14 +9748,18 @@ async def _run_web_with_retry(
             if account_key in attempted_accounts:
                 break
             attempted_accounts.add(account_key)
+            attempt_options = options
             try:
-                return await run_web_session(messages, model, stream, options)
+                return await run_web_session(
+                    messages, model, stream, attempt_options
+                )
             except RuntimeError as e:
                 err = str(e)
                 if "solo_agent_parallel_limit" in err or "429" in err:
                     if attempt_index + 1 >= attempts:
                         break
                     logger.warning("web 429 parallel limit, rotating account: %s", err)
+                    _cancel_unclaimed_account_slot(options)
                     next_snapshot = _next_retry_account_snapshot(
                         attempted_accounts, attempts
                     )
@@ -7195,33 +9768,302 @@ async def _run_web_with_retry(
                     # Rebind options from the newly rotated account so the
                     # retry uses the correct token and billing identity.
                     account_id, record = next_snapshot
-                    token = str(record.get("token") or "")
-                    billing_id = _account_id_from_token(token) or account_id
-                    provider_specific = (
-                        record.get("provider_specific")
-                        or record.get("providerSpecificData")
-                        or {}
-                    )
-                    options = dict(options or {})
-                    options["_account_id"] = account_id
-                    options["_billing_id"] = billing_id
-                    options["_auth_token"] = token
-                    options["_auth_user_id"] = billing_id
-                    if isinstance(provider_specific, Mapping):
-                        options["provider_specific"] = dict(provider_specific)
-                    if tracker is not None:
-                        await tracker.rebind(options)
-                    _rebind_chat_session_account(
-                        str(options.get("session_id") or options.get("sessionId") or ""),
-                        account_id,
-                        billing_id,
+                    (
+                        options,
                         token,
+                        billing_id,
                         provider_specific,
+                    ) = _retry_options_for_account(
+                        options, account_id, record
                     )
+                    try:
+                        if tracker is not None:
+                            await tracker.rebind(options)
+                        _rebind_chat_session_account(
+                            str(
+                                options.get("session_id")
+                                or options.get("sessionId")
+                                or ""
+                            ),
+                            account_id,
+                            billing_id,
+                            token,
+                            provider_specific,
+                        )
+                    except BaseException:
+                        _cancel_unclaimed_account_slot(options)
+                        raise
                     continue
                 raise
+            finally:
+                _cancel_unclaimed_account_slot(attempt_options)
         raise RuntimeError("All web accounts busy: Trae parallel limit reached")
     return await run_web_session(messages, model, stream, options)
+
+
+async def _run_remote_stream_with_retry(
+    messages,
+    model,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
+    """Keep a streaming Remote request inside the polling-account retry loop.
+
+    ``run_remote_session(..., stream=True)`` returns before its body iterator
+    is consumed.  Consequently the ordinary ``_run_remote_with_retry`` loop
+    cannot observe a first-event timeout or an early Remote error: by then it
+    has already returned the ``StreamingResponse`` to Starlette.  This wrapper
+    owns the body iterator and rotates credentials when an attempt ends before
+    model output.  Each nested attempt disables its own account rotation so
+    there is one bounded retry loop and no duplicate account/slot ownership.
+    """
+
+    options = dict(options or {})
+    if not auth.get_polling_status().get("enabled"):
+        return await run_remote_session(messages, model, True, options)
+
+    attempts = _polling_retry_limit(options)
+    attempted_accounts: set[str] = set()
+    current_options = dict(options)
+
+    def _account_key(attempt_index: int) -> str:
+        return _retry_account_key(current_options, attempt_index)
+
+    def _runtime_retry_reason(error: BaseException) -> Optional[str]:
+        lowered = str(error).lower()
+        if (
+            "remote model is not available for the bound account" in lowered
+            or "model binding mismatch" in lowered
+        ):
+            return "model unavailable"
+        if _is_remote_account_capacity_error(error) or "429" in lowered:
+            return "parallel limit"
+        return None
+
+    async def rotate_account(reason: str, attempt_index: int) -> bool:
+        nonlocal current_options
+        _cancel_unclaimed_account_slot(current_options)
+        next_snapshot = _next_retry_account_snapshot(
+            attempted_accounts, max(1, attempts)
+        )
+        if next_snapshot is None:
+            return False
+        account_id, record = next_snapshot
+        (
+            current_options,
+            token,
+            billing_id,
+            provider_specific,
+        ) = _retry_options_for_account(current_options, account_id, record)
+        try:
+            if tracker is not None:
+                await tracker.rebind(current_options)
+            _rebind_chat_session_account(
+                str(
+                    current_options.get("session_id")
+                    or current_options.get("sessionId")
+                    or ""
+                ),
+                account_id,
+                billing_id,
+                token,
+                provider_specific,
+            )
+        except BaseException:
+            _cancel_unclaimed_account_slot(current_options)
+            raise
+        logger.warning(
+            "remote stream %s; rotating account attempt=%d/%d account=%s",
+            reason,
+            attempt_index + 1,
+            attempts,
+            account_id,
+        )
+        return True
+
+    async def close_response(response) -> None:
+        iterator = getattr(response, "body_iterator", None)
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:
+                pass
+
+    # Open the first session before returning so deterministic request errors
+    # (notably RemoteQueryTooLarge -> HTTP 413) keep their status code instead
+    # of being deferred into a 200 streaming wrapper.  Creation failures are
+    # handled here too because the response body has not reached Starlette yet.
+    initial_response = None
+    initial_response_started = False
+    initial_response_closed = False
+    initial_attempt_index = 0
+    for initial_attempt_index in range(max(1, attempts)):
+        account_key = _account_key(initial_attempt_index)
+        if account_key in attempted_accounts:
+            break
+        attempted_accounts.add(account_key)
+        initial_options = dict(current_options)
+        initial_options["_disable_remote_stream_account_retry"] = True
+        try:
+            initial_response = await run_remote_session(
+                messages, model, True, initial_options
+            )
+            break
+        except RemoteQueryTooLarge:
+            raise
+        except (
+            EmptyUpstreamResponse,
+            trae_remote_client.RemoteFirstEventTimeout,
+        ) as exc:
+            if (
+                not bool(getattr(exc, "retryable", True))
+                or bool(getattr(exc, "observed_model_event", False))
+                or initial_attempt_index + 1 >= max(1, attempts)
+                or not await rotate_account(
+                    "empty upstream response", initial_attempt_index
+                )
+            ):
+                raise
+        except RuntimeError as exc:
+            reason = _runtime_retry_reason(exc)
+            if (
+                bool(getattr(exc, "observed_model_event", False))
+                or reason is None
+                or initial_attempt_index + 1 >= max(1, attempts)
+                or not await rotate_account(reason, initial_attempt_index)
+            ):
+                raise
+        finally:
+            _cancel_unclaimed_account_slot(initial_options)
+    if initial_response is None:
+        raise RuntimeError("remote stream retry ended without a response")
+
+    async def gen():
+        nonlocal current_options, initial_response_started
+        attempt_index = initial_attempt_index
+        response = initial_response
+        while True:
+            account_key = _account_key(attempt_index)
+            if account_key not in attempted_accounts:
+                attempted_accounts.add(account_key)
+            elif attempt_index != initial_attempt_index:
+                raise RuntimeError("remote stream account already attempted")
+            local_options = dict(current_options)
+            # The outer wrapper is the sole owner of account rotation.  The
+            # inner session may still perform its same-account Agent -> Work
+            # fallback, but must not start a second account loop.
+            local_options["_disable_remote_stream_account_retry"] = True
+            observed_model_event = False
+            try:
+                if attempt_index == initial_attempt_index:
+                    initial_response_started = True
+                if attempt_index != initial_attempt_index:
+                    response = await run_remote_session(
+                        messages, model, True, local_options
+                    )
+                iterator = getattr(response, "body_iterator", None)
+                if iterator is None:
+                    body = getattr(response, "body", b"")
+                    body_text = (
+                        body.decode("utf-8", errors="replace")
+                        if isinstance(body, bytes)
+                        else str(body or "")
+                    )
+                    if not body_text.strip():
+                        raise EmptyUpstreamResponse(
+                            "Trae remote upstream returned an empty response",
+                            retryable=True,
+                            observed_model_event=False,
+                        )
+                    observed_model_event = bool(
+                        _chunk_text_delta(body_text)
+                        or _chunk_reasoning_delta(body_text)
+                        or _chunk_has_tool_calls(body_text)
+                        or _chunk_marks_terminal(body_text)
+                        or any(
+                            isinstance(value.get("usage"), Mapping)
+                            for value in _iter_sse_payloads(body_text)
+                        )
+                    )
+                    yield body_text
+                    return
+                async for chunk in iterator:
+                    if (
+                        _chunk_text_delta(chunk)
+                        or _chunk_reasoning_delta(chunk)
+                        or _chunk_has_tool_calls(chunk)
+                        or _chunk_marks_terminal(chunk)
+                        or any(
+                            isinstance(value.get("usage"), Mapping)
+                            for value in _iter_sse_payloads(chunk)
+                        )
+                    ):
+                        observed_model_event = True
+                    yield chunk
+                return
+            except asyncio.CancelledError:
+                raise
+            except RemoteQueryTooLarge:
+                # Request-size errors are deterministic and cannot be repaired
+                # by another account.
+                raise
+            except (
+                EmptyUpstreamResponse,
+                trae_remote_client.RemoteFirstEventTimeout,
+            ) as exc:
+                if (
+                    observed_model_event
+                    or not bool(getattr(exc, "retryable", True))
+                    or bool(getattr(exc, "observed_model_event", False))
+                ):
+                    raise
+                if attempt_index + 1 >= max(1, attempts):
+                    raise
+                if not await rotate_account("empty upstream response", attempt_index):
+                    raise
+                attempt_index += 1
+                continue
+            except RuntimeError as exc:
+                reason = _runtime_retry_reason(exc)
+                if (
+                    observed_model_event
+                    or bool(getattr(exc, "observed_model_event", False))
+                    or reason is None
+                ):
+                    raise
+                if attempt_index + 1 >= max(1, attempts):
+                    raise
+                if not await rotate_account(
+                    reason,
+                    attempt_index,
+                ):
+                    raise
+                attempt_index += 1
+                continue
+            finally:
+                # A failed nested stream normally runs its own generator
+                # cleanup.  Explicitly closing the wrapper prevents a
+                # transport-specific iterator from retaining the slot.
+                try:
+                    if response is not None:
+                        await close_response(response)
+                finally:
+                    _cancel_unclaimed_account_slot(local_options)
+
+    async def close_unconsumed_initial_response() -> None:
+        nonlocal initial_response_closed
+        if initial_response_started or initial_response_closed:
+            return
+        initial_response_closed = True
+        await close_response(initial_response)
+
+    return StreamingResponse(
+        _SessionStreamIterator(gen(), close_unconsumed_initial_response),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
 
 
 async def _run_remote_with_retry(
@@ -7234,6 +10076,10 @@ async def _run_remote_with_retry(
 ):
     """Retry 9router-style remote sessions on the provider's parallel limit."""
     tracker = tracker or _USAGE_TRACKER.get()
+    if stream and auth.get_polling_status().get("enabled"):
+        return await _run_remote_stream_with_retry(
+            messages, model, options, tracker=tracker
+        )
     if auth.get_polling_status().get("enabled"):
         attempts = _polling_retry_limit(options)
         attempted_accounts: set[str] = set()
@@ -7241,35 +10087,38 @@ async def _run_remote_with_retry(
         async def rotate_remote_account(reason: str) -> bool:
             nonlocal options
             logger.warning("remote %s, rotating account", reason)
+            _cancel_unclaimed_account_slot(options)
             next_snapshot = _next_retry_account_snapshot(
                 attempted_accounts, attempts
             )
             if next_snapshot is None:
                 return False
             account_id, record = next_snapshot
-            token = str(record.get("token") or "")
-            billing_id = _account_id_from_token(token) or account_id
-            provider_specific = (
-                record.get("provider_specific")
-                or record.get("providerSpecificData")
-                or {}
-            )
-            options = dict(options or {})
-            options["_account_id"] = account_id
-            options["_billing_id"] = billing_id
-            options["_auth_token"] = token
-            options["_auth_user_id"] = billing_id
-            if isinstance(provider_specific, Mapping):
-                options["provider_specific"] = dict(provider_specific)
-            if tracker is not None:
-                await tracker.rebind(options)
-            _rebind_chat_session_account(
-                str(options.get("session_id") or options.get("sessionId") or ""),
-                account_id,
-                billing_id,
+            (
+                options,
                 token,
+                billing_id,
                 provider_specific,
+            ) = _retry_options_for_account(
+                options, account_id, record
             )
+            try:
+                if tracker is not None:
+                    await tracker.rebind(options)
+                _rebind_chat_session_account(
+                    str(
+                        options.get("session_id")
+                        or options.get("sessionId")
+                        or ""
+                    ),
+                    account_id,
+                    billing_id,
+                    token,
+                    provider_specific,
+                )
+            except BaseException:
+                _cancel_unclaimed_account_slot(options)
+                raise
             return True
 
         for attempt_index in range(attempts):
@@ -7277,10 +10126,23 @@ async def _run_remote_with_retry(
             if account_key in attempted_accounts:
                 break
             attempted_accounts.add(account_key)
+            attempt_options = options
             try:
-                return await run_remote_session(messages, model, stream, options)
+                return await run_remote_session(
+                    messages, model, stream, attempt_options
+                )
+            except RemoteQueryTooLarge:
+                # This is a deterministic request-size failure. Preserve it
+                # for the dispatcher so it can return 413 without replaying
+                # the same payload on another account.
+                raise
             except EmptyUpstreamResponse as exc:
-                if not exc.retryable or attempt_index + 1 >= attempts:
+                if (
+                    not exc.retryable
+                    or exc.observed_model_event
+                    or exc.usage is not None
+                    or attempt_index + 1 >= attempts
+                ):
                     raise
                 if not await rotate_remote_account(
                     "upstream returned an empty response"
@@ -7288,6 +10150,11 @@ async def _run_remote_with_retry(
                     raise
                 continue
             except RuntimeError as exc:
+                if (
+                    bool(getattr(exc, "observed_model_event", False))
+                    or getattr(exc, "usage", None) is not None
+                ):
+                    raise
                 message = str(exc)
                 lowered = message.lower()
                 unavailable = (
@@ -7299,7 +10166,7 @@ async def _run_remote_with_retry(
                     # missing the requested model is not a request failure;
                     # rotate to the next polling account that can serve it.
                     reason = "model unavailable on bound account"
-                elif "parallel" in lowered or "429" in lowered:
+                elif _is_remote_account_capacity_error(exc) or "429" in lowered:
                     reason = "parallel limit"
                 else:
                     raise
@@ -7312,8 +10179,321 @@ async def _run_remote_with_retry(
                         raise
                     break
                 continue
+            finally:
+                _cancel_unclaimed_account_slot(attempt_options)
         raise RuntimeError("All remote accounts busy: Trae parallel limit reached")
     return await run_remote_session(messages, model, stream, options)
+
+
+def _is_native_rate_limit_error(error: Any) -> bool:
+    """Return whether a native IDE/SOLO failure is a pre-output rate limit.
+
+    TraeCode reports account-level throttling as business codes ``3004`` and
+    ``4011`` while some gateway variants expose it as HTTP ``429`` or a
+    human-readable rate-limit message.  Parameter errors such as ``4001`` are
+    deliberately excluded: retrying those with another account cannot repair
+    an invalid request envelope.
+    """
+
+    if isinstance(error, EmptyUpstreamResponse) and (
+        not error.retryable
+        or error.observed_model_event
+        or error.usage is not None
+    ):
+        return False
+    code = str(getattr(error, "code", "") or "").strip()
+    if code in {"3004", "4011", "429"}:
+        return True
+    if code == "4001":
+        return False
+    detail = str(error or "").strip().lower()
+    if not detail:
+        return False
+    if "4001" in detail or "param is invalid" in detail:
+        return False
+    return any(
+        marker in detail
+        for marker in (
+            "4011",
+            "429",
+            "rate limit",
+            "rate-limit",
+            "too many requests",
+            "exceeded the rate",
+        )
+    )
+
+
+async def _run_ide_stream_with_retry(
+    messages,
+    model,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
+    """Open a native IDE/SOLO stream with pre-output account rotation.
+
+    ``run_ide_chat`` returns a ``StreamingResponse`` before the upstream SSE
+    body is iterated, so its 4011/429 business error is raised after the
+    dispatcher has already returned.  The old retry helper intentionally
+    skipped all streaming requests and consequently left the public stream
+    with a 502/empty response.  Own the body iterator here, retrying only
+    before the first model data frame and preserving cancellation after output.
+    """
+
+    options = dict(options or {})
+    tracker = tracker or _USAGE_TRACKER.get()
+    polling = auth.get_polling_status()
+    if not polling.get("enabled"):
+        return await run_ide_chat(messages, model, True, options)
+
+    # A rate-limit response is account-scoped.  The old hard cap of two
+    # attempts made a large polling pool effectively useless: after the first
+    # account and one fallback account both returned 4011/429, the request was
+    # surfaced as a 502 even when other enabled accounts were idle.  Rotate
+    # through every usable account once, while retaining the pre-output-only
+    # replay guard below.
+    attempts = _polling_retry_limit(options)
+    attempted_accounts: set[str] = set()
+
+    async def rotate_account() -> bool:
+        nonlocal options
+        _cancel_unclaimed_account_slot(options)
+        next_snapshot = _next_retry_account_snapshot(
+            attempted_accounts, attempts
+        )
+        if next_snapshot is None:
+            return False
+        account_id, record = next_snapshot
+        (
+            options,
+            token,
+            billing_id,
+            provider_specific,
+        ) = _retry_options_for_account(
+            options, account_id, record
+        )
+        try:
+            if tracker is not None:
+                await tracker.rebind(options)
+            _rebind_chat_session_account(
+                str(
+                    options.get("session_id")
+                    or options.get("sessionId")
+                    or ""
+                ),
+                account_id,
+                billing_id,
+                token,
+                provider_specific,
+            )
+        except BaseException:
+            _cancel_unclaimed_account_slot(options)
+            raise
+        logger.warning(
+            "native IDE/SOLO stream rate limit, retrying on account=%s",
+            account_id,
+        )
+        return True
+
+    async def close_response(response: Any) -> None:
+        if response is None:
+            return
+        iterator = getattr(response, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if close_iterator is not None:
+            try:
+                await close_iterator()
+            except Exception:
+                pass
+        close = getattr(response, "close", None)
+        if close is not None:
+            try:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+
+    def has_public_data(chunk: Any) -> bool:
+        if isinstance(chunk, (bytes, bytearray)):
+            text = chunk.decode("utf-8", errors="replace")
+        else:
+            text = str(chunk or "")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.lower().startswith("data:"):
+                continue
+            payload = stripped.split(":", 1)[1].strip()
+            if payload and payload != "[DONE]":
+                return True
+        return False
+
+    def retryable_before_output(exc: Exception, saw_output: bool) -> bool:
+        if saw_output or (
+            isinstance(exc, EmptyUpstreamResponse)
+            and (
+                not exc.retryable
+                or exc.observed_model_event
+                or exc.usage is not None
+            )
+        ):
+            return False
+        if _is_native_rate_limit_error(exc):
+            return True
+        return (
+            isinstance(exc, EmptyUpstreamResponse)
+            and bool(exc.retryable)
+            and not bool(exc.observed_model_event)
+        )
+
+    async def open_for_attempt(attempt_index: int):
+        account_key = _retry_account_key(options, attempt_index)
+        if account_key in attempted_accounts:
+            raise RuntimeError("native IDE/SOLO account already attempted")
+        attempted_accounts.add(account_key)
+        attempt_options = dict(options)
+        try:
+            return await run_ide_chat(messages, model, True, attempt_options)
+        finally:
+            _cancel_unclaimed_account_slot(attempt_options)
+
+    current = None
+    attempt_index = 0
+    while True:
+        try:
+            current = await open_for_attempt(attempt_index)
+            break
+        except Exception as exc:
+            if (
+                attempt_index + 1 >= attempts
+                or not retryable_before_output(exc, False)
+                or not await rotate_account()
+            ):
+                raise
+            attempt_index += 1
+
+    async def body():
+        nonlocal current, attempt_index
+        try:
+            while True:
+                saw_output = False
+                try:
+                    async for chunk in _response_body_iterator(current):
+                        saw_output = saw_output or has_public_data(chunk)
+                        yield chunk
+                    return
+                except Exception as exc:
+                    if (
+                        attempt_index + 1 >= attempts
+                        or not retryable_before_output(exc, saw_output)
+                    ):
+                        raise
+                    await close_response(current)
+                    if not await rotate_account():
+                        raise
+                    attempt_index += 1
+                    current = await open_for_attempt(attempt_index)
+        finally:
+            await close_response(current)
+
+    async def close_current() -> None:
+        await close_response(current)
+
+    return StreamingResponse(
+        _SessionStreamIterator(body(), close_current),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
+
+
+async def _run_ide_with_retry(
+    messages,
+    model,
+    stream: bool,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
+    """Retry a native IDE/SOLO request once on an account rate limit.
+
+    The native endpoint can return a business error before emitting any model
+    event.  In that case the request is safe to replay on another enabled
+    account.  This helper intentionally handles only the request/collection
+    phase; once a streaming response has been handed to the caller, the
+    existing stream cancellation and usage guards remain authoritative.
+    """
+
+    options = dict(options or {})
+    tracker = tracker or _USAGE_TRACKER.get()
+    polling = auth.get_polling_status()
+    if stream:
+        return await _run_ide_stream_with_retry(
+            messages,
+            model,
+            options,
+            tracker=tracker,
+        )
+    if not polling.get("enabled"):
+        return await run_ide_chat(messages, model, stream, options)
+
+    # Keep non-stream and stream native requests consistent.  Both paths may
+    # safely replay only before model output, but neither should stop after an
+    # arbitrary two-account prefix when polling has more usable credentials.
+    attempts = _polling_retry_limit(options)
+    attempted_accounts: set[str] = set()
+    for attempt_index in range(max(1, attempts)):
+        account_key = _retry_account_key(options, attempt_index)
+        if account_key in attempted_accounts:
+            break
+        attempted_accounts.add(account_key)
+        attempt_options = options
+        try:
+            return await run_ide_chat(messages, model, stream, attempt_options)
+        except Exception as exc:
+            if (
+                not _is_native_rate_limit_error(exc)
+                or attempt_index + 1 >= attempts
+            ):
+                raise
+            next_snapshot = _next_retry_account_snapshot(
+                attempted_accounts, attempts
+            )
+            if next_snapshot is None:
+                raise
+            account_id, record = next_snapshot
+            (
+                options,
+                token,
+                billing_id,
+                provider_specific,
+            ) = _retry_options_for_account(
+                options, account_id, record
+            )
+            try:
+                if tracker is not None:
+                    await tracker.rebind(options)
+                _rebind_chat_session_account(
+                    str(
+                        options.get("session_id")
+                        or options.get("sessionId")
+                        or ""
+                    ),
+                    account_id,
+                    billing_id,
+                    token,
+                    provider_specific,
+                )
+            except BaseException:
+                _cancel_unclaimed_account_slot(options)
+                raise
+            logger.warning(
+                "native IDE/SOLO rate limit, retrying on account=%s",
+                account_id,
+            )
+        finally:
+            _cancel_unclaimed_account_slot(attempt_options)
+    raise RuntimeError("native IDE/SOLO rate-limit retry ended unexpectedly")
 
 
 def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -7361,6 +10541,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         max_applied = _optional_bool(record.get("max_mode_enabled"))
     if max_applied is None:
         max_applied = _optional_bool(record.get("max_mode"))
+    if max_applied is None:
+        max_applied = _optional_bool(record.get("max"))
     if context_mode in (None, "") and max_applied is not None:
         context_mode = "max_1m" if max_applied else "standard"
     if context_mode in (None, "") and actual_context_mode not in (None, ""):
@@ -7381,6 +10563,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         max_mode_requested = _context_mode_bool(requested_context)
     if max_mode_requested is None and "max_mode" in record:
         max_mode_requested = _optional_bool(record.get("max_mode"))
+    if max_mode_requested is None and "max" in record:
+        max_mode_requested = _optional_bool(record.get("max"))
     max_mode_enabled = _optional_bool(
         record.get("max_mode_enabled")
         if "max_mode_enabled" in record
@@ -7404,6 +10588,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
     tool_called = _optional_bool(
         record.get("tool_called") if "tool_called" in record else None
     )
+    if tool_called is None and "tool" in record:
+        tool_called = _optional_bool(record.get("tool"))
     if tool_called is None:
         # ``tool_used`` is the canonical actual-result marker in v1.0.2;
         # ``tool_calls_returned`` is retained for compatibility with rows
@@ -7421,10 +10607,55 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         or record.get("_usage_turn_id")
         or ""
     ).strip() or None
+    credits_settled_at = _number_value(record.get("credits_settled_at"))
+    queue_position = _number_value(record.get("queue_position"))
+    auto_continue_rounds = _number_value(record.get("auto_continue_rounds"))
+    trace = record.get("_upstream_trace") or record.get("upstream_trace")
+    trace = trace if isinstance(trace, Mapping) else {}
+    product = _normalize_usage_product(
+        record.get("product")
+        or record.get("provider_product")
+        or record.get("upstream_product")
+        or trace.get("product")
+    )
+    requested_endpoint = (
+        record.get("requested_endpoint")
+        or record.get("requested_mode")
+        or trace.get("requested_endpoint")
+        or trace.get("requested_mode")
+    )
+    actual_endpoint = (
+        record.get("actual_endpoint")
+        or record.get("actual_mode")
+        or trace.get("actual_endpoint")
+        or trace.get("actual_mode")
+    )
+    if product is None:
+        product = _normalize_usage_product(actual_endpoint or requested_endpoint)
+    requested_mode = record.get("requested_mode") or trace.get("requested_mode")
+    actual_mode = record.get("actual_mode") or trace.get("actual_mode")
+    thinking = _normalize_usage_thinking(
+        record.get("thinking")
+        if "thinking" in record
+        else record.get("thinking_config")
+    )
+    tool_choice = record.get("tool_choice")
+    if isinstance(tool_choice, Mapping):
+        # Keep only the public selection name; function schemas belong to the
+        # request payload and are not useful in a billing history row.
+        function = tool_choice.get("function")
+        tool_choice = (
+            function.get("name")
+            if isinstance(function, Mapping) and function.get("name")
+            else tool_choice.get("type") or "specified"
+        )
+    elif tool_choice not in (None, ""):
+        tool_choice = str(tool_choice).strip() or None
     normalized.update(
         {
             "account_id": str(record.get("account_id") or "default"),
             "model": str(record.get("model") or "auto"),
+            "product": product,
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "input_tokens": prompt,
@@ -7453,11 +10684,36 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 record.get("credits_source")
                 or ("upstream" if credits is not None else "unknown")
             ),
+            "credits_settled_at": (
+                credits_settled_at
+                if credits_settled_at is not None
+                else None
+            ),
             # Keep only the opaque upstream turn id needed for delayed billing
             # enrichment. Credentials and token payloads are never persisted.
             "usage_turn_id": usage_turn_id,
             "request_id": str(record.get("request_id") or ""),
             "endpoint": record.get("endpoint") or None,
+            "requested_endpoint": (
+                str(requested_endpoint).strip()
+                if requested_endpoint not in (None, "")
+                else None
+            ),
+            "actual_endpoint": (
+                str(actual_endpoint).strip()
+                if actual_endpoint not in (None, "")
+                else None
+            ),
+            "requested_mode": (
+                str(requested_mode).strip()
+                if requested_mode not in (None, "")
+                else None
+            ),
+            "actual_mode": (
+                str(actual_mode).strip()
+                if actual_mode not in (None, "")
+                else None
+            ),
             "stream": record.get("stream") if "stream" in record else None,
             "status": str(record.get("status") or "completed"),
             "duration_ms": _number_value(record.get("duration_ms")),
@@ -7479,6 +10735,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 if applied_effort not in (None, "")
                 else None
             ),
+            "thinking": thinking,
+            "tool_choice": tool_choice,
             "context_mode_requested": (
                 str(requested_context).strip()
                 if requested_context not in (None, "")
@@ -7503,11 +10761,16 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
             # distinction; these aliases represent the actual observed
             # capability when it is known.
             "max_mode": max_mode_enabled,
+            "max": max_mode_enabled,
             "tools_requested": tools_requested,
             "tool_used": tool_used,
             "tool_calls_returned": tool_calls_returned,
             "tool_called": tool_called,
             "tool": tool_called,
+            # Transport telemetry: how long the request waited in Trae's queue
+            # and how many automatic continuation rounds completed the answer.
+            "queue_position": queue_position,
+            "auto_continue_rounds": auto_continue_rounds,
         }
     )
     return normalized
@@ -7736,6 +10999,11 @@ def _record_usage(
     usage_turn_id: str | None = None,
     request_id: str = "",
     endpoint: str | None = None,
+    product: str | None = None,
+    requested_endpoint: str | None = None,
+    actual_endpoint: str | None = None,
+    requested_mode: str | None = None,
+    actual_mode: str | None = None,
     stream: bool | None = None,
     status: str = "completed",
     duration_ms: int | float | None = None,
@@ -7744,6 +11012,7 @@ def _record_usage(
     reasoning_effort: str | None = None,
     requested_reasoning_effort: str | None = None,
     reasoning_effort_applied: str | None = None,
+    thinking: Any = None,
     context_mode_requested: str | None = None,
     context_mode: str | None = None,
     context_mode_actual: str | None = None,
@@ -7752,9 +11021,12 @@ def _record_usage(
     max_mode_requested: bool | None = None,
     max_mode_enabled: bool | None = None,
     tools_requested: bool | None = None,
+    tool_choice: Any = None,
     tool_used: bool | None = None,
     tool_calls_returned: bool | None = None,
     tool_called: bool | None = None,
+    queue_position: int | None = None,
+    auto_continue_rounds: int | None = None,
 ) -> dict[str, Any]:
     """Record one API request (newest first) and persist it independently."""
     global _USAGE_HISTORY
@@ -7769,9 +11041,15 @@ def _record_usage(
             "tokens_source": tokens_source,
             "credits_consumed": credits_consumed,
             "credits_source": credits_source,
+            "credits_settled_at": time.time() if credits_consumed is not None else None,
             "usage_turn_id": usage_turn_id,
             "request_id": request_id,
             "endpoint": endpoint,
+            "product": product,
+            "requested_endpoint": requested_endpoint,
+            "actual_endpoint": actual_endpoint,
+            "requested_mode": requested_mode,
+            "actual_mode": actual_mode,
             "stream": stream,
             "status": status,
             "duration_ms": duration_ms,
@@ -7779,6 +11057,7 @@ def _record_usage(
             "reasoning_effort": reasoning_effort,
             "requested_reasoning_effort": requested_reasoning_effort,
             "reasoning_effort_applied": reasoning_effort_applied,
+            "thinking": thinking,
             "context_mode_requested": context_mode_requested,
             "context_mode": context_mode,
             "context_mode_actual": context_mode_actual,
@@ -7787,9 +11066,12 @@ def _record_usage(
             "max_mode_requested": max_mode_requested,
             "max_mode_enabled": max_mode_enabled,
             "tools_requested": tools_requested,
+            "tool_choice": tool_choice,
             "tool_used": tool_used,
             "tool_calls_returned": tool_calls_returned,
             "tool_called": tool_called,
+            "queue_position": queue_position,
+            "auto_continue_rounds": auto_continue_rounds,
         }
     )
     with _USAGE_LOCK:
@@ -7810,6 +11092,18 @@ def _record_usage(
         if len(_USAGE_HISTORY) > _USAGE_MAX_HISTORY:
             _USAGE_HISTORY = _USAGE_HISTORY[:_USAGE_MAX_HISTORY]
         _save_usage_history_locked()
+    if request_id and credits_consumed is not None:
+        credits = _refresh_credit_projection(str(account_id or ""))
+        projected = _number_value(credits.get("remaining"))
+        if projected is not None:
+            _update_usage_record(
+                request_id,
+                credits_remaining_after=_credit_round(projected),
+                credits_reconcile_status=credits.get("reconcile_status"),
+                credits_reconcile_confidence=credits.get(
+                    "reconcile_confidence"
+                ),
+            )
     return record
 
 
@@ -7841,14 +11135,11 @@ def _remote_fallback_options(
     fallback = dict(options or {})
     fallback["_upstream_mode"] = "remote"
     fallback["_upstream_fallback_from"] = requested_mode
-    # ``work-agent`` is a selectable Work tier, but its fallback must be the
-    # ordinary Remote/Agent tier.  Carrying ``solo_work_remote`` (or
-    # ``_trae_mode=work``) here only changes the log label while issuing a
-    # second Work request, which is why the UI appeared to "fall back to
-    # Remote" without ever leaving Work.  Native TraeWork compatibility modes
-    # retain their historical Work-tier fallback because they are separate
-    # helper transports.
-    if requested_mode == "work-agent":
+    # Work's primary route uses Remote chat_sessions with an explicit Work
+    # executor. Its fallback must clear those bindings and use the ordinary
+    # Agent tier; otherwise a request labelled Remote can still be billed and
+    # executed as Work.
+    if requested_mode in {"work", "work-agent"}:
         fallback.pop("_trae_mode", None)
         fallback.pop("_remote_agent_type", None)
         fallback.pop("remote_agent_type", None)
@@ -7874,20 +11165,60 @@ def _remote_fallback_options(
 def _update_usage_record(request_id: str, **updates: Any) -> None:
     if not request_id:
         return
+    account_id = ""
+    should_refresh_projection = False
+    normalized_record: dict[str, Any] | None = None
     with _USAGE_LOCK:
         for index, existing in enumerate(_USAGE_HISTORY):
             if existing.get("request_id") != request_id:
                 continue
             merged = dict(existing)
             merged.update(updates)
+            if (
+                "credits_consumed" in updates
+                and _number_value(updates.get("credits_consumed")) is not None
+            ):
+                # The request timestamp can precede a delayed commercial bill.
+                # Keep a settlement timestamp so the overlay is anchored to
+                # when the charge became observable, not when the model began.
+                merged["credits_settled_at"] = time.time()
+                should_refresh_projection = True
             # Round credit fields before normalizing
             for key in ("credits_consumed", "credits_before", "credits_after"):
                 if key in merged:
                     merged[key] = _credit_round(merged[key])
-            _USAGE_HISTORY[index] = _normalize_usage_record(merged)
-            _usage_stats_replace_locked(existing, _USAGE_HISTORY[index])
+            normalized_record = _normalize_usage_record(merged)
+            _USAGE_HISTORY[index] = normalized_record
+            account_id = str(normalized_record.get("account_id") or "")
+            _usage_stats_replace_locked(existing, normalized_record)
             _save_usage_history_locked()
-            return
+            break
+    if normalized_record is None:
+        return
+    if should_refresh_projection and account_id:
+        credits = _refresh_credit_projection(account_id)
+        projected = _number_value(credits.get("remaining"))
+        if projected is not None:
+            # Store the balance visible immediately after this charge.  This
+            # is metadata on the row only; the account cache remains the
+            # single source used by the dashboard.
+            with _USAGE_LOCK:
+                for index, current in enumerate(_USAGE_HISTORY):
+                    if current.get("request_id") != request_id:
+                        continue
+                    updated = dict(current)
+                    updated["credits_remaining_after"] = _credit_round(projected)
+                    updated["credits_reconcile_status"] = credits.get(
+                        "reconcile_status"
+                    )
+                    updated["credits_reconcile_confidence"] = credits.get(
+                        "reconcile_confidence"
+                    )
+                    normalized = _normalize_usage_record(updated)
+                    _USAGE_HISTORY[index] = normalized
+                    _usage_stats_replace_locked(current, normalized)
+                    _save_usage_history_locked()
+                    break
 
 
 # Raw v2 answers ``2001 failed to get app config: record not found`` when the
@@ -7935,6 +11266,557 @@ def _auto_route_enabled() -> bool:
         return False
 
 
+def _task_model_routing_enabled() -> bool:
+    """Whether ``model=auto`` should be assigned from task complexity.
+
+    Automatic task routing is the safe default for this relay: explicit model
+    names are never rewritten, while ``auto`` is assigned to the configured
+    simple/complex candidates before endpoint dispatch. Operators that need
+    the legacy provider-owned ``auto`` selection can disable it explicitly.
+    """
+
+    value = str(os.environ.get("TRAE_TASK_MODEL_ROUTING", "1") or "").strip().lower()
+    return value not in {"", "0", "false", "no", "off", "disabled"}
+
+
+def _task_model_is_automatic(model: Any) -> bool:
+    """Return whether the caller delegated model selection to the relay."""
+
+    return str(model or "").strip().lower() in {"", "auto"}
+
+
+def _task_message_text(message: Any) -> str:
+    """Extract bounded plain text for deterministic complexity classification."""
+
+    if not isinstance(message, Mapping):
+        return str(message or "")
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, Mapping):
+        return " ".join(
+            _task_message_text({"content": value}) for value in content.values()
+        )
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, Mapping):
+                value = (
+                    item.get("text")
+                    or item.get("content")
+                    or item.get("value")
+                    or item.get("input")
+                    or ""
+                )
+                if isinstance(value, (Mapping, list)):
+                    parts.append(_task_message_text({"content": value}))
+                else:
+                    parts.append(str(value or ""))
+            elif item not in (None, ""):
+                parts.append(str(item))
+        return " ".join(parts)
+    return str(content)
+
+
+_TASK_COMPLEXITY_MARKERS = re.compile(
+    r"""
+    \b(?:implement|implementation|modify|change|create|write|edit|patch|refactor|
+       debug|diagnose|fix|test|review|analy[sz]e|research|deploy|download|install|
+       command|shell|script|file|files|project|repository|repo|code|coding|
+       multi[- ]?step|step[- ]?by[- ]?step|batch|automate|automation)\b
+    |(?:实现|修改|创建|编写|编辑|补丁|重构|调试|排查|修复|测试|审查|分析|研究|
+       部署|下载|安装|命令|脚本|文件|项目|仓库|代码|多步|批量|自动化|完整链路)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _task_is_complex(
+    messages: Optional[list[dict[str, Any]]], options: Optional[Mapping[str, Any]]
+) -> tuple[bool, str]:
+    """Classify a request without contacting the upstream model catalog."""
+
+    messages = messages or []
+    options = options or {}
+    if _tool_protocol_requested(dict(options), messages):
+        return True, "tools"
+    if images.messages_have_images(messages):
+        return True, "image"
+    if any(
+        isinstance(message, Mapping)
+        and str(message.get("role") or "").strip().lower()
+        in {"tool", "function"}
+        for message in messages
+    ):
+        return True, "tool_history"
+
+    text = "\n".join(_task_message_text(message) for message in messages)
+    # Long history and large prompts are much more likely to need the
+    # high-capability model even when the latest user turn is short.
+    if len(messages) >= 12 or len(text) >= 16_000:
+        return True, "long_context"
+    if _TASK_COMPLEXITY_MARKERS.search(text):
+        return True, "action_or_code"
+    return False, "simple"
+
+
+def _task_model_endpoint(options: Optional[Mapping[str, Any]] = None) -> str:
+    """Return the canonical endpoint identity used to scope model evidence."""
+
+    options = options or {}
+    mode = str(
+        options.get("_upstream_mode") or _current_upstream_mode() or ""
+    ).strip().lower()
+    aliases = {
+        "direct": "raw",
+        "auto": "raw",
+        "work-agent": "work",
+        "9router": "remote",
+        "trae-remote": "remote",
+    }
+    return aliases.get(mode, mode)
+
+
+def _task_model_account_key(options: Optional[Mapping[str, Any]] = None) -> str:
+    """Return the identity used by the account-bound model catalogue cache."""
+
+    options = options or {}
+    token = str(options.get("_auth_token") or "").strip()
+    user_id = str(
+        options.get("_auth_user_id")
+        or options.get("_billing_id")
+        or options.get("_account_id")
+        or ""
+    ).strip()
+    if not token and not user_id:
+        return ""
+    try:
+        return str(trae_client._web_model_cache_key(token, user_id) or "")
+    except Exception:
+        return user_id
+
+
+def _task_catalog_model_names(
+    options: Optional[Mapping[str, Any]] = None,
+    *,
+    endpoint: str = "",
+) -> set[str]:
+    """Read only model evidence scoped to this endpoint and bound account."""
+
+    options = options or {}
+    endpoint = endpoint or _task_model_endpoint(options)
+    account_key = _task_model_account_key(options)
+    names: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, Mapping):
+            descriptor_keys = {
+                "id",
+                "name",
+                "config_name",
+                "model_name",
+                "display_name",
+                "display_model_name",
+            }
+            if not descriptor_keys.intersection(value):
+                for key in value:
+                    add(key)
+            for key in (
+                "id",
+                "name",
+                "config_name",
+                "model_name",
+                "display_name",
+                "display_model_name",
+            ):
+                add(value.get(key))
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add(item)
+            return
+        text = str(value or "").strip().lower()
+        if text:
+            names.add(text)
+
+    # Internal callers may provide a request-local catalog, but only when its
+    # endpoint and account labels match the already-bound request identity.
+    catalog_endpoint = str(options.get("_available_models_endpoint") or "").strip().lower()
+    catalog_account = str(options.get("_available_models_account_key") or "").strip()
+    if (
+        catalog_endpoint == endpoint
+        and account_key
+        and catalog_account == account_key
+    ):
+        add(options.get("_available_models"))
+
+    # The remote model cache is partitioned by account and executor tier. Do
+    # not use the merged /v1/models cache or a different account/tier as proof
+    # that a candidate can be used on this request.
+    if endpoint in {"remote", "web", "work"} and account_key:
+        requested_agent_type = str(
+            options.get("_remote_agent_type")
+            or options.get("remote_agent_type")
+            or ""
+        ).strip().lower()
+        if endpoint == "work" or requested_agent_type in {
+            "solo_work_remote",
+            "solo_work_lite",
+            "work",
+        }:
+            agent_types = ("solo_work_remote",)
+        elif requested_agent_type in {"solo_agent_remote", "solo_agent_lite", "agent"}:
+            agent_types = ("solo_agent_remote",)
+        else:
+            agent_types = (
+                "solo_work_remote",
+                "solo_agent_remote",
+            ) if os.environ.get("TRAE_REMOTE_AGENT_FIRST", "1").strip().lower() in {
+                "0", "false", "no", "off"
+            } else ("solo_agent_remote",)
+        cache = getattr(trae_client, "_WEB_MODEL_CACHE", {})
+        ttl = float(getattr(trae_client, "_WEB_MODEL_CACHE_TTL", 300) or 300)
+        now = time.time()
+        for agent_type in agent_types:
+            if not isinstance(cache, Mapping):
+                continue
+            prefix = f"{account_key}:{agent_type}:"
+            for cache_key, cached in cache.items():
+                if str(cache_key) != prefix[:-1] and not str(cache_key).startswith(prefix):
+                    continue
+                if (
+                    isinstance(cached, tuple)
+                    and len(cached) > 1
+                    and now - float(cached[0]) <= ttl
+                    and isinstance(cached[1], Mapping)
+                ):
+                    add(cached[1])
+                    break
+    return names
+
+
+def _task_model_available(
+    model: str,
+    options: Optional[Mapping[str, Any]] = None,
+    *,
+    endpoint: str = "",
+) -> bool:
+    """Require a current-endpoint, current-account catalogue match."""
+
+    candidate = str(model or "").strip().lower()
+    if not candidate:
+        return False
+    endpoint = endpoint or _task_model_endpoint(options)
+    names = _task_catalog_model_names(options, endpoint=endpoint)
+    if candidate in names:
+        return True
+    try:
+        mapped = str(trae_client.convert_model_name(candidate) or "").strip().lower()
+    except Exception:
+        mapped = ""
+    return bool(mapped and mapped in names)
+
+
+def _apply_task_model_routing(
+    messages: Optional[list[dict[str, Any]]],
+    model: Any,
+    options: Optional[dict],
+) -> tuple[str, dict]:
+    """Assign configured simple/complex models only for automatic requests.
+
+    The complex candidate is deliberately selected only when it is present in
+    a catalog that was already loaded by this process.  A missing ``6.1sol``
+    must remain an explicit ``auto`` request rather than silently becoming
+    Kimi or another static fallback.
+    """
+
+    options = dict(options or {})
+    requested = str(model or "").strip()
+    if not _task_model_routing_enabled() or not _task_model_is_automatic(model):
+        return requested or str(model or ""), options
+
+    endpoint = _task_model_endpoint(options)
+    account_key = _task_model_account_key(options)
+    existing = str(options.get("_task_model_effective") or "").strip()
+    if (
+        options.get("_task_model_routed")
+        and existing
+        and str(options.get("_task_model_routed_endpoint") or "") == endpoint
+        and str(options.get("_task_model_routed_account_key") or "") == account_key
+    ):
+        return existing, options
+
+    complex_task, reason = _task_is_complex(messages, options)
+    simple_model = (
+        str(os.environ.get("TRAE_SIMPLE_MODEL", "deepseek-v4.1-flash") or "")
+        .strip()
+        or "deepseek-v4.1-flash"
+    )
+    complex_model = (
+        str(os.environ.get("TRAE_COMPLEX_MODEL", "6.1sol") or "").strip()
+        or "6.1sol"
+    )
+    candidate = complex_model if complex_task else simple_model
+    effective = candidate
+    fallback_reason = ""
+    if not _task_model_available(candidate, options, endpoint=endpoint):
+        effective = "auto"
+        fallback_reason = (
+            f"{candidate} is not confirmed for endpoint={endpoint or 'unknown'} "
+            f"account={account_key or 'unbound'}"
+        )
+
+    options.update(
+        {
+            "_task_model_routed": True,
+            "_task_model_routed_endpoint": endpoint,
+            "_task_model_routed_account_key": account_key,
+            "_task_model_requested": requested or "auto",
+            "_task_model_class": "complex" if complex_task else "simple",
+            "_task_model_reason": reason,
+            "_task_model_candidate": candidate,
+            "_task_model_effective": effective,
+        }
+    )
+    if _requested_reasoning_effort(options) is None:
+        options["reasoning_effort"] = "ultra"
+        options["_task_model_reasoning_effort"] = "ultra"
+
+    trace = options.get("_upstream_trace")
+    if not isinstance(trace, dict):
+        trace = {}
+        options["_upstream_trace"] = trace
+    trace.update(
+        task_model_routing=True,
+        task_model_requested=requested or "auto",
+        task_model_class=options["_task_model_class"],
+        task_model_reason=reason,
+        task_model_candidate=candidate,
+        task_model_effective=effective,
+    )
+    if fallback_reason:
+        trace.update(
+            task_model_fallback="auto",
+            task_model_fallback_reason=fallback_reason,
+        )
+        logger.warning(
+            "task model candidate unavailable requested=%s candidate=%s; keeping auto",
+            requested or "auto",
+            candidate,
+        )
+    else:
+        trace.pop("task_model_fallback", None)
+        trace.pop("task_model_fallback_reason", None)
+    logger.info(
+        "task model route requested=%s class=%s candidate=%s effective=%s reason=%s",
+        requested or "auto",
+        options["_task_model_class"],
+        candidate,
+        effective,
+        reason,
+    )
+    return effective, options
+
+
+def _multimodal_catalog_match(
+    configs: Mapping[str, Any], model: Any
+) -> tuple[str, Optional[Mapping[str, Any]]]:
+    requested = str(model or "").strip().casefold()
+    if not requested:
+        return "", None
+    for name, config in configs.items():
+        if not isinstance(config, Mapping):
+            continue
+        values = trae_client._model_descriptor_values(name, config)
+        if any(value.casefold() == requested for value in values):
+            return str(name), config
+    return "", None
+
+
+def _multimodal_catalog_scope(
+    options: Optional[Mapping[str, Any]],
+) -> tuple[str, str]:
+    options = options or {}
+    endpoint = _task_model_endpoint(options)
+    explicit_function = str(
+        options.get("_traecode_raw_chat_function")
+        or options.get("raw_chat_function")
+        or ""
+    ).strip().lower()
+    if explicit_function:
+        return "", explicit_function
+    requested_agent = str(
+        options.get("_remote_agent_type")
+        or options.get("remote_agent_type")
+        or ""
+    ).strip().lower()
+    if endpoint == "work" or requested_agent in {
+        "solo_work_remote",
+        "solo_work_lite",
+        "work",
+    }:
+        return "solo_work_remote", "solo_work_remote"
+    if endpoint in {"remote", "web"} or requested_agent:
+        agent = (
+            "solo_agent_remote"
+            if requested_agent not in {"solo_work_remote", "solo_work_lite", "work"}
+            else "solo_work_remote"
+        )
+        return agent, agent
+    if endpoint == "solo":
+        return "", "solo_agent"
+    if endpoint in {"ide", "raw"}:
+        return "", "chat_v3"
+    return "", ""
+
+
+async def _load_multimodal_catalog(
+    messages: Optional[list[dict]], options: dict
+) -> None:
+    """Attach current-account/function model evidence to one request."""
+
+    if not images.messages_have_images(messages):
+        return
+    requested_model = str(options.get("_requested_model") or "").strip()
+    explicit_request = requested_model and not _task_model_is_automatic(requested_model)
+    explicit_switch = str(
+        os.environ.get("TRAE_MULTIMODAL_AUTO_SWITCH_EXPLICIT", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if explicit_request and not explicit_switch:
+        return
+    token = str(options.get("_auth_token") or "").strip()
+    user_id = str(
+        options.get("_auth_user_id")
+        or options.get("_billing_id")
+        or options.get("_account_id")
+        or ""
+    ).strip()
+    if not token:
+        return
+    provider = options.get("provider_specific")
+    if provider is None:
+        provider = options.get("providerSpecificData")
+    agent_type, raw_function = _multimodal_catalog_scope(options)
+    try:
+        configs = await trae_client.get_scoped_model_configs(
+            token_override=token,
+            user_id_override=user_id,
+            provider_specific=(dict(provider) if isinstance(provider, Mapping) else None),
+            agent_type=agent_type,
+            raw_chat_function=raw_function,
+        )
+    except Exception as exc:
+        logger.info("multimodal catalog lookup failed: %s", exc)
+        return
+    if configs:
+        options["_trae_model_capability_catalog"] = configs
+
+
+def _multimodal_fallback_model(
+    model: str, options: Optional[Mapping[str, Any]] = None
+) -> str:
+    """Pick a vision-capable model for an image-bearing request.
+
+    Trae's text-only configs cannot read an attached image; forwarding the
+    request unchanged makes the model answer as if no image existed.  Prefer
+    the operator's explicit override, then the account's live catalog, then the
+    built-in preference order.
+    """
+
+    requested = str(model or "").strip()
+    catalog = (options or {}).get("_trae_model_capability_catalog")
+    if not isinstance(catalog, Mapping):
+        return ""
+    _current_name, current = _multimodal_catalog_match(catalog, requested)
+    if descriptor_multimodal(current) is True:
+        return ""
+    available: dict[str, str] = {}
+    for name, config in catalog.items():
+        if isinstance(config, Mapping) and descriptor_multimodal(config) is True:
+            available[str(name).strip().casefold()] = str(name).strip()
+    candidates: list[str] = []
+    override = configured_multimodal_model()
+    if override:
+        override_name, override_config = _multimodal_catalog_match(catalog, override)
+        if override_name and descriptor_multimodal(override_config) is True:
+            candidates.append(override_name)
+    candidates.extend(
+        available[name.casefold()]
+        for name in MULTIMODAL_FALLBACK_ORDER
+        if name.casefold() in available
+    )
+    candidates.extend(
+        name for _key, name in sorted(available.items()) if name not in candidates
+    )
+    for candidate in candidates:
+        name = str(candidate or "").strip()
+        if name and name.lower() != requested.lower():
+            return name
+    return ""
+
+
+def _apply_multimodal_switch(
+    messages: Optional[list[dict]], model: str, options: Optional[dict]
+) -> str:
+    """Re-point an image request at a vision model; returns the effective model."""
+
+    if not images.messages_have_images(messages):
+        return model
+    catalog = options.get("_trae_model_capability_catalog") if isinstance(options, Mapping) else None
+    if isinstance(catalog, Mapping):
+        _name, descriptor = _multimodal_catalog_match(catalog, model)
+        if descriptor_multimodal(descriptor) is True:
+            return model
+    # An explicitly selected model is part of the API contract.  Re-pointing
+    # it to a vision model silently changes both the provider fingerprint and
+    # the billable model (for example glm-5.2 -> kimi-k2.6).  Automatic model
+    # selection may still choose a vision-capable candidate, but an explicit
+    # request must stay pinned unless the operator opts into the legacy
+    # behaviour with TRAE_MULTIMODAL_AUTO_SWITCH_EXPLICIT=1.
+    options = options if isinstance(options, dict) else {}
+    requested_model = str(options.get("_requested_model") or "").strip()
+    explicit_request = requested_model and not _task_model_is_automatic(requested_model)
+    explicit_switch = str(
+        os.environ.get("TRAE_MULTIMODAL_AUTO_SWITCH_EXPLICIT", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if explicit_request and not explicit_switch:
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace["multimodal_switch_skipped"] = {
+                "requested": requested_model,
+                "effective": model,
+                "reason": "explicit_model_pinned",
+            }
+        logger.info(
+            "image request keeps explicitly selected model=%s",
+            model,
+        )
+        return model
+    if str(os.environ.get("TRAE_MULTIMODAL_AUTO_SWITCH", "1")).strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return model
+    fallback = _multimodal_fallback_model(model, options)
+    if not fallback:
+        logger.warning(
+            "image request kept on text-only model=%s (no multimodal model available)",
+            model,
+        )
+        return model
+    logger.info(
+        "image request re-pointed model=%s -> %s", model, fallback
+    )
+    trace = (options or {}).get("_upstream_trace")
+    if isinstance(trace, dict):
+        trace["multimodal_switch"] = {"from": model, "to": fallback}
+    return fallback
+
+
 def _apply_auto_route(
     messages: Optional[list[dict]], options: Optional[dict]
 ) -> dict:
@@ -7942,9 +11824,9 @@ def _apply_auto_route(
 
     Auto routing runs when the caller asked for ``auto-route`` explicitly, or
     when the console switch is on and the request carries no explicit
-    endpoint.  Tool requests (tool definitions or tool history) go to IDE
-    Agent, plain chat goes to Remote; the dispatcher's existing fallback then
-    lands on Remote if the chosen endpoint fails.
+    endpoint. Tool and image requests go to IDE Agent, where media travels
+    natively instead of inflating Remote's flattened query. Plain text chat
+    goes to Remote; the existing dispatcher owns endpoint fallback.
     """
 
     options = dict(options or {})
@@ -7962,9 +11844,14 @@ def _apply_auto_route(
         ):
             return options
     uses_tools = _tool_protocol_requested(options, messages)
-    endpoint = AUTO_ROUTE_TOOL_ENDPOINT if uses_tools else AUTO_ROUTE_CHAT_ENDPOINT
+    has_images = images.messages_have_images(messages)
+    endpoint = (
+        AUTO_ROUTE_TOOL_ENDPOINT
+        if uses_tools or has_images
+        else AUTO_ROUTE_CHAT_ENDPOINT
+    )
     options["_upstream_mode"] = endpoint
-    options["_auto_route"] = "tools" if uses_tools else "chat"
+    options["_auto_route"] = "tools" if uses_tools else "images" if has_images else "chat"
     trace = options.get("_upstream_trace")
     if isinstance(trace, dict):
         trace.update(auto_route=True, auto_route_reason=options["_auto_route"])
@@ -8005,7 +11892,44 @@ def _trace_append_failure(trace: Any, endpoint: str, error: Any) -> None:
 
 
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
+    requested_model = model
+    options = dict(options or {})
+    options.setdefault("_requested_model", str(requested_model or "").strip())
     options = _apply_auto_route(messages, options)
+    # Resolve the concrete endpoint before selecting an automatic task model.
+    # Model availability is product/account scoped; choosing from a global
+    # alias table before this point can send an otherwise valid ``auto``
+    # request to a model unsupported by the selected executor.
+    model, options = _apply_task_model_routing(messages, model, options)
+    trace = options.get("_upstream_trace")
+    active_tracker = _USAGE_TRACKER.get()
+    if active_tracker is not None:
+        # Automatic endpoint/model selection happens at dispatch time. Keep
+        # both the usage row's model and its metadata aligned even when the
+        # selected model stays unchanged (for example, auto-route adds the
+        # resolved endpoint or task strength to a copied options mapping).
+        if getattr(active_tracker, "model", model) != model:
+            active_tracker.model = model
+        active_tracker.options = options
+    # A text-only config cannot read an attached image, so an image request is
+    # re-pointed at a multimodal model before any routing decision is made.
+    # Load evidence for this bound account/function first; the switch helper
+    # intentionally refuses to use static model-name capability tables.
+    await _load_multimodal_catalog(messages, options)
+    model = _apply_multimodal_switch(messages, model, options)
+    trace = options.get("_upstream_trace")
+    if active_tracker is not None:
+        # Keep billing/history metadata aligned with the model that will
+        # actually be sent upstream.  This matters when automatic multimodal
+        # selection is enabled; otherwise the row can say glm-5.2 while the
+        # provider fingerprint is kimi-k2.6.
+        active_tracker.model = model
+        active_tracker.options = options
+    if isinstance(trace, dict):
+        trace["requested_model"] = str(
+            options.get("_requested_model") or requested_model or ""
+        ).strip() or "auto"
+        trace["effective_model"] = str(model or "").strip()
     try:
         _ensure_model_account_enabled(
             str(options.get("_account_id") or ""),
@@ -8014,7 +11938,6 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     except _ModelAccountUnavailable as exc:
         return _openai_error(503, str(exc), "model_account_unavailable")
     active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
-    trace = options.get("_upstream_trace")
     fallback_from = str(options.get("_upstream_fallback_from") or "").strip().lower()
     if isinstance(trace, dict):
         if fallback_from:
@@ -8068,10 +11991,41 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     # Keep raw/direct as explicit diagnostics instead of advertising a fallback
     # that cannot catch errors raised later by a StreamingResponse iterator.
     if options.get("_traework_custom_model"):
+        # Trae 3.4.4 Work/Code clients share the raw-v2 endpoint and declare
+        # the native function in the body/header. Route that explicit chain
+        # through the TraeCode adapter so its extended DTO, client headers,
+        # and JWT identity binding are preserved. Older custom-model calls do
+        # not set this marker and retain the Remote compatibility default.
+        if options.get("_traecode_raw_chat_function"):
+            if isinstance(trace, dict):
+                trace.update(
+                    product="trae",
+                    requested_mode="traecode",
+                    requested_endpoint="/api/ide/v2/llm_raw_chat",
+                    actual_mode="ide",
+                    actual_endpoint="/api/ide/v2/llm_raw_chat",
+                )
+            logger.info(
+                "dispatch TraeCode raw-v2 ingress id=%s model=%s function=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+                str(options.get("_traecode_raw_chat_function") or ""),
+            )
+            return await run_ide_chat(messages, model, stream, options)
         custom_mode = str(
             options.get("_traework_upstream_mode")
             or os.environ.get("TRAEWORK_CUSTOM_UPSTREAM_MODE", "remote")
         ).strip().lower()
+        if isinstance(trace, dict):
+            trace.update(
+                product="traework",
+                requested_mode="traework",
+                requested_endpoint="traework",
+                actual_mode=custom_mode,
+                actual_endpoint=(
+                    "remote-work" if custom_mode in {"remote", "web"} else custom_mode
+                ),
+            )
         if custom_mode in {"raw", "direct", "auto"}:
             logger.info(
                 "dispatch TraeWork custom-model ingress id=%s mode=raw model=%s",
@@ -8149,8 +12103,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             return _openai_error(502, str(exc), "upstream_model_mismatch", "model")
 
     # ``auto`` is the direct-proxy mode: every model request reaches Trae's
-    # native llm_utils_chat endpoint. Legacy modes remain explicit opt-ins for
-    # diagnostics, but they are never silent fallbacks for API traffic.
+    # native raw transport. Legacy compatibility modes remain explicit
+    # diagnostics and are never silent fallbacks for API traffic.
     errors = []
     fallback_reasons: list[str] = []
     modes = []
@@ -8164,8 +12118,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         modes = ["web"]
     elif active_mode in ("ide", "solo"):
         modes = [active_mode]
-    elif active_mode == "work-agent":
-        modes = ["work-agent"]
+    elif active_mode in ("work", "work-agent"):
+        modes = ["work"]
     elif active_mode in ("traework-native", "native", "traework"):
         modes = ["traework-native"]
     else:
@@ -8184,15 +12138,39 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         "auto",
         "ide",
         "solo",
-        "work-agent",
+        "work", "work-agent",
         "traework-native",
         "native",
         "traework",
     }
+    remote_fallback_allowed = (
+        fallback_enabled
+        and _remote_fallback_allowed_for_request(messages, options)
+    )
     if fallback_enabled and active_mode in ("raw", "direct"):
         modes.append("ide")
-    if fallback_enabled and active_mode in fallback_modes and "remote" not in modes:
+    if (
+        remote_fallback_allowed
+        and active_mode in fallback_modes
+        and "remote" not in modes
+    ):
         modes.append("remote")
+    elif (
+        fallback_enabled
+        and active_mode in fallback_modes
+        and "remote" not in modes
+        and images.messages_have_images(messages)
+    ):
+        # Preserve the native endpoint error when the image cannot fit Remote
+        # even after history compaction; retrying would only produce a
+        # deterministic 413 and may rotate the same payload through accounts.
+        logger.info(
+            "skip remote fallback for oversized image request id=%s mode=%s",
+            str(options.get("_relay_request_id") or ""),
+            active_mode,
+        )
+        if isinstance(trace, dict):
+            trace["fallback_skipped"] = "remote_query_limit"
     route_initial_mode = modes[0] if modes else active_mode
     raw_skipped = False
     if (
@@ -8219,6 +12197,24 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
 
     for mode in modes:
         try:
+            mode_options = dict(options)
+            if mode == "remote" and modes[0] != "remote":
+                mode_options = _remote_fallback_options(
+                    mode_options, active_mode
+                )
+            mode_model = model
+            if mode != active_mode:
+                # A fallback is a different executor and may have a different
+                # model catalogue. Re-evaluate from the caller's original
+                # ``auto`` instead of carrying a candidate chosen for the
+                # failed endpoint into the fallback request.
+                mode_model, mode_options = _apply_task_model_routing(
+                    messages, requested_model, mode_options
+                )
+                if active_tracker is not None:
+                    if getattr(active_tracker, "model", mode_model) != mode_model:
+                        active_tracker.model = mode_model
+                    active_tracker.options = mode_options
             if isinstance(trace, dict):
                 route_fallback = (
                     bool(fallback_from)
@@ -8230,10 +12226,15 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                     actual_mode=mode,
                     actual_endpoint=mode,
                     fallback_used=route_fallback,
+                    product=(
+                        "traework"
+                        if mode in {"work", "work-agent", "traework-native", "native", "traework"}
+                        else "trae"
+                    ),
                 )
                 if route_fallback:
                     trace["fallback_target"] = (
-                        "remote-work" if mode == "work-agent" else mode
+                        "remote-work" if mode == "work" else mode
                     )
                     if fallback_reasons:
                         trace["fallback_reason"] = "; ".join(fallback_reasons)[:1200]
@@ -8243,9 +12244,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                     trace["max_mode_applied"] = False
                 else:
                     trace.pop("max_mode_applied", None)
-            mode_options = dict(options)
             if mode == "raw":
-                result = await run_raw_chat(messages, model, stream, mode_options)
+                result = await run_raw_chat(messages, mode_model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"raw returned {error}")
@@ -8260,6 +12260,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 "web",
                 "ide",
                 "solo",
+                "work",
                 "work-agent",
                 "traework-native",
             ):
@@ -8267,51 +12268,72 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 mode_options.pop("_account_id", None)
             if mode == "cli":
                 mode_options.pop("_upstream_trace", None)
-                result = await run_cli_chat(messages, model, stream, mode_options)
+                result = await run_cli_chat(messages, mode_model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"cli returned {error}")
                 return result
             if mode == "web":
-                result = await _run_web_with_retry(messages, model, stream, mode_options)
+                result = await _run_web_with_retry(messages, mode_model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"web returned {error}")
                 return result
             if mode == "remote":
-                if modes[0] != "remote":
-                    mode_options = _remote_fallback_options(
-                        mode_options, active_mode
-                    )
-                result = await _run_remote_with_retry(messages, model, stream, mode_options)
+                result = await _run_remote_with_retry(messages, mode_model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"remote returned {error}")
                 return result
-            if mode == "work-agent":
+            if mode in ("work", "work-agent"):
+                # TraeWork uses the Remote chat_sessions transport, pinned to
+                # the Work executor so model binding and billing stay aligned.
                 mode_options["_trae_mode"] = "work"
                 mode_options["_remote_agent_type"] = "solo_work_remote"
-                mode_options.setdefault("_session_variant", "work-agent")
+                mode_options["_session_variant"] = "work"
                 if isinstance(trace, dict):
-                    trace.update(actual_endpoint="remote-work")
+                    trace.update(
+                        actual_mode="work",
+                        actual_endpoint="remote-work",
+                        product="traework",
+                    )
                 result = await _run_remote_with_retry(
-                    messages, model, stream, mode_options
+                    messages, mode_model, stream, mode_options
                 )
                 error = _upstream_response_error(result)
                 if error:
-                    raise RuntimeError(f"work-agent returned {error}")
+                    raise RuntimeError(f"work returned {error}")
                 return result
             if mode == "traework-native":
                 result = await run_traework_native_chat(
-                    messages, model, stream, mode_options
+                    messages, mode_model, stream, mode_options
                 )
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"traework-native returned {error}")
                 return result
             if mode in ("ide", "solo"):
+                # Prefer TraeCode's native raw contract.  Personal CN
+                # accounts can lack the raw app-config record, in which case
+                # run_ide_chat reopens the verified solo_work_lite adapter.
+                # Keep the legacy endpoint visible in options so diagnostics
+                # and older callers retain the exact fallback path.
                 mode_options["_ide_endpoint"] = "/api/agent/v3/llm_utils_chat"
-            result = await run_ide_chat(messages, model, stream, mode_options)
+                mode_options["_legacy_ide_endpoint"] = (
+                    "/api/agent/v3/llm_utils_chat"
+                )
+                mode_options["_traecode_raw_chat_function"] = (
+                    "solo_agent" if mode == "solo" else "chat_v3"
+                )
+                if isinstance(trace, dict):
+                    trace["product"] = "trae"
+            result = await _run_ide_with_retry(
+                messages,
+                mode_model,
+                stream,
+                mode_options,
+                tracker=active_tracker,
+            )
             if getattr(result, "status_code", 200) >= 400:
                 payload = _response_json_payload(result)
                 detail = payload.get("error") if isinstance(payload, Mapping) else None
@@ -8326,9 +12348,40 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             return result
         except Exception as e:
             logger.warning("upstream %s failed: %s", mode, e)
-            reason = _trace_failure_reason(mode, e)
+            # ``work-agent`` is the public endpoint identity while ``work``
+            # is the internal dispatch branch. Keep the public label in
+            # diagnostics so a failed Work request is not misreported as a
+            # different endpoint.
+            diagnostic_mode = (
+                active_mode
+                if mode == "work" and active_mode in {"work-agent", "work"}
+                else mode
+            )
+            reason = _trace_failure_reason(diagnostic_mode, e)
             fallback_reasons.append(reason)
+            # Keep ``failed_endpoint`` tied to the actual dispatch branch
+            # (``work``) while the human-facing reason retains the requested
+            # public tier (``work-agent``).
             _trace_append_failure(trace, mode, e)
+            if diagnostic_mode != mode and isinstance(trace, dict):
+                previous = str(trace.get("fallback_reason") or "").strip()
+                internal = _trace_failure_reason(mode, e)
+                parts = [part.strip() for part in previous.split(";") if part.strip()]
+                if internal in parts:
+                    parts.remove(internal)
+                if reason not in parts:
+                    parts.append(reason)
+                trace["fallback_reason"] = "; ".join(parts)[:1200]
+            if isinstance(e, RemoteQueryTooLarge):
+                # The provider rejects oversized flattened queries
+                # deterministically. Do not fall through to another executor
+                # or replay the same payload on every polling account.
+                return _openai_error(
+                    413,
+                    str(e),
+                    "context_length_exceeded",
+                    "messages",
+                )
             if isinstance(e, _ModelAccountUnavailable):
                 return _openai_error(503, str(e), "model_account_unavailable")
             if isinstance(e, EmptyUpstreamResponse):
@@ -8571,7 +12624,8 @@ async def handle_chat(req: Request):
         return StreamingResponse(
             _tracked_stream(
                 _lease_stream(
-                    _deferred_dispatch_stream(messages, model, options), session_id
+                    _deferred_dispatch_stream(messages, model, options),
+                    session_id,
                 ),
                 tracker,
             ),
@@ -8678,6 +12732,175 @@ async def handle_responses(req: Request):
     )
 
 
+async def handle_anthropic_messages(req: Request):
+    """Anthropic Messages API ingress for Claude Code and compatible clients."""
+
+    request_id = "req-" + uuid_mod.uuid4().hex
+    try:
+        body, _body_bytes = await _read_json_body(
+            req,
+            endpoint="messages",
+            trace_id=request_id,
+        )
+    except _RequestBodyError as exc:
+        logger.warning(
+            "request body rejected id=%s endpoint=messages bytes=%d error=%s",
+            request_id,
+            exc.raw_bytes,
+            exc,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
+    try:
+        messages, options = anthropic_api.normalize_request(body)
+    except anthropic_api.AnthropicRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
+
+    messages = cli_client.sanitize_assistant_history_messages(messages)
+    model = str(body.get("model") or "auto")
+    options = _apply_tool_header_hints(req, options)
+    option_error = _validate_chat_options(options)
+    if option_error is not None:
+        return option_error
+    for key in ("max_tokens", "maxTokens", "max_completion_tokens"):
+        if key in options:
+            options[key] = clamp_max_completion_tokens(options[key], model)
+    options = _with_auto_client_context(req, body, messages, options)
+    options = _bind_chat_session(
+        messages,
+        options,
+        requested_session_id=_request_session_hint(req, body),
+    )
+    stream = bool(body.get("stream", False))
+    tracker = _UsageTracker(model, req.url.path, stream, options, messages)
+    tracker.request_id = request_id
+    options["_relay_request_id"] = request_id
+    input_tokens = anthropic_api.estimate_input_tokens(
+        messages, body.get("system"), options.get("tools")
+    )
+    logger.info(
+        "request received id=%s path=%s keys=%s messages=%d input_chars=%d stream=%s",
+        request_id,
+        req.url.path,
+        ",".join(sorted(str(key) for key in body.keys())),
+        len(messages),
+        sum(
+            len(str(item.get("content") or ""))
+            for item in messages
+            if isinstance(item, Mapping)
+        ),
+        stream,
+    )
+    logger.info(
+        "request binding id=%s account=%s billing=%s session=%s",
+        request_id,
+        str(options.get("_account_id") or "default"),
+        str(options.get("_billing_id") or options.get("_account_id") or "default"),
+        str(options.get("session_id") or options.get("sessionId") or "")[:32],
+    )
+    if stream:
+        session_id = str(options.get("session_id") or options.get("sessionId") or "")
+        return StreamingResponse(
+            _tracked_stream(
+                _lease_stream(
+                    anthropic_api.translate_chat_stream(
+                        _deferred_dispatch_stream(messages, model, options),
+                        model,
+                        request_input_tokens=input_tokens,
+                    ),
+                    session_id,
+                ),
+                tracker,
+            ),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+    chat_response = await _tracked_dispatch(messages, model, options, tracker)
+    if getattr(chat_response, "status_code", 200) >= 400:
+        detail = _upstream_response_error(chat_response) or "Upstream request failed"
+        return JSONResponse(
+            status_code=getattr(chat_response, "status_code", 502),
+            content={
+                "type": "error",
+                "error": {"type": "api_error", "message": detail},
+            },
+        )
+    try:
+        completion = json.loads(chat_response.body)
+    except Exception:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "Invalid Chat Completions response",
+                },
+            },
+        )
+    try:
+        message = anthropic_api.completion_to_message(
+            completion, model, request_input_tokens=input_tokens
+        )
+    except anthropic_api.AnthropicRequestError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {"type": "api_error", "message": str(exc)},
+            },
+        )
+    return JSONResponse(content=message)
+
+
+async def handle_anthropic_count_tokens(req: Request):
+    """Anthropic-compatible token count estimate; this endpoint does not bill."""
+
+    request_id = "req-" + uuid_mod.uuid4().hex
+    try:
+        body, _body_bytes = await _read_json_body(
+            req,
+            endpoint="messages/count_tokens",
+            trace_id=request_id,
+        )
+    except _RequestBodyError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
+    try:
+        messages, options = anthropic_api.normalize_request(body)
+    except anthropic_api.AnthropicRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
+    return JSONResponse(
+        content={
+            "input_tokens": anthropic_api.estimate_input_tokens(
+                messages, body.get("system"), options.get("tools")
+            )
+        }
+    )
+
+
 async def init_app():
     _load_usage_history()
     _load_usage_stats()
@@ -8691,6 +12914,85 @@ async def init_app():
         auth.get_auth().edition,
         cli_client.resolve_cli_command() or "not-found",
     )
+
+
+async def _usage_enrichment_loop():
+    """Retry bill lookups that were still settling after a model response.
+
+    The model response must stay independent from the commercial accounting
+    endpoint.  A short background pass keeps the API fast while preventing a
+    transient empty usage response from becoming a permanently missing credit
+    value in the console.
+    """
+
+    interval = _usage_enrichment_interval_seconds()
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            _schedule_pending_usage_enrichment()
+        except Exception as exc:
+            logger.debug("usage enrichment scheduler error: %s", exc)
+
+
+async def _credit_reconcile_cycle(trigger: str = "schedule") -> dict[str, Any]:
+    """Refresh total credits for every account and keep the local overlay.
+
+    Account-level check-in locks serialize this with manual credit refreshes.
+    A failed upstream query leaves the last known balance intact and only marks
+    the in-memory status stale.
+    """
+
+    summary = {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
+    for account_id, record in list(auth.get_accounts_raw()):
+        summary["total"] += 1
+        if not (record.get("token") or ""):
+            summary["skipped"] += 1
+            continue
+        try:
+            async with _checkin_account_lock(account_id):
+                await _fetch_credit_account_snapshot(account_id, record)
+            _CREDIT_RECONCILE_STATE[account_id] = {
+                "status": "ok",
+                "at": time.time(),
+                "trigger": trigger,
+            }
+            summary["ok"] += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Do not overwrite the cached balance with a zero/empty response.
+            auth.mark_account_credit_reconcile_stale(account_id)
+            _CREDIT_RECONCILE_STATE[account_id] = {
+                "status": "stale",
+                "at": time.time(),
+                "trigger": trigger,
+                "error": str(exc)[:160],
+            }
+            summary["failed"] += 1
+            logger.debug("credit reconciliation failed account=%s: %s", account_id, exc)
+    return summary
+
+
+async def _credit_reconcile_loop():
+    """Periodically calibrate the dashboard's aggregate total credits."""
+
+    try:
+        initial_delay = float(
+            os.environ.get("TRAE_CREDIT_RECONCILE_INITIAL_DELAY_SECONDS", "2")
+            or "2"
+        )
+    except (TypeError, ValueError):
+        initial_delay = 2.0
+    if initial_delay > 0:
+        await asyncio.sleep(min(initial_delay, 60.0))
+    while True:
+        try:
+            await _credit_reconcile_cycle("schedule")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("credit reconciliation cycle error: %s", exc)
+        await asyncio.sleep(_credit_reconcile_interval_seconds())
 
 
 async def _web_reaper_loop():
@@ -8906,13 +13208,29 @@ async def lifespan(app: FastAPI):
     terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
     checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())
     auto_checkin = asyncio.create_task(_auto_checkin_loop())
+    usage_enrichment = asyncio.create_task(_usage_enrichment_loop())
+    credit_reconcile = asyncio.create_task(_credit_reconcile_loop())
     try:
         yield
     finally:
-        for reaper in (web_reaper, terminal_reaper, checkin_retry, auto_checkin):
+        for reaper in (
+            web_reaper,
+            terminal_reaper,
+            checkin_retry,
+            auto_checkin,
+            usage_enrichment,
+            credit_reconcile,
+        ):
             reaper.cancel()
-        await asyncio.gather(web_reaper, terminal_reaper, return_exceptions=True)
-        await asyncio.gather(checkin_retry, auto_checkin, return_exceptions=True)
+        await asyncio.gather(
+            web_reaper,
+            terminal_reaper,
+            checkin_retry,
+            auto_checkin,
+            usage_enrichment,
+            credit_reconcile,
+            return_exceptions=True,
+        )
         await _cancel_usage_tasks()
 
 
@@ -8929,6 +13247,8 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
     """Dashboard home: token totals by day plus account and service state."""
     accounts = auth.list_accounts()
     remaining = 0.0
+    official_remaining = 0.0
+    local_debit = 0.0
     credits_known = False
     unlimited = False
     for account in accounts:
@@ -8941,7 +13261,26 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
                 credits_known = True
             except (TypeError, ValueError):
                 pass
+        try:
+            official = credits.get(
+                "official_remaining", credits.get("remaining")
+            )
+            if official is not None:
+                official_remaining += float(official)
+            local_debit += float(credits.get("local_debit") or 0)
+        except (TypeError, ValueError):
+            pass
     polling = auth.get_polling_status()
+    reconcile_statuses = {
+        str(account.get("credits_reconcile_status") or "").strip().lower()
+        for account in accounts
+    }
+    if reconcile_statuses.intersection({"stale", "error"}):
+        aggregate_reconcile_status = "stale"
+    elif "projected" in reconcile_statuses:
+        aggregate_reconcile_status = "projected"
+    else:
+        aggregate_reconcile_status = "ok"
     with _USAGE_LOCK:
         in_flight = sum(_USAGE_ACTIVE_ACCOUNTS.values())
         recent = [_public_usage_record(record) for record in _USAGE_HISTORY[:5]]
@@ -8957,6 +13296,28 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
                 "checked_in": sum(1 for account in accounts if account.get("checked_in") is True),
                 "credits_remaining": (
                     "unlimited" if unlimited else round(remaining, 2) if credits_known else None
+                ),
+                "credits_official_remaining": (
+                    "unlimited"
+                    if unlimited
+                    else round(official_remaining, 2) if credits_known else None
+                ),
+                "credits_local_debit": round(local_debit, 4),
+                "credits_reconcile_status": aggregate_reconcile_status,
+                "credits_reconciled_at": max(
+                    (
+                        float(account.get("credits_reconciled_at") or 0)
+                        for account in accounts
+                    ),
+                    default=0,
+                ),
+                "credits_reconcile_confidence": min(
+                    (
+                        float(account.get("credits_reconcile_confidence"))
+                        for account in accounts
+                        if account.get("credits_reconcile_confidence") is not None
+                    ),
+                    default=None,
                 ),
                 "active": auth.get_active_account_id() or None,
             },
@@ -9018,6 +13379,10 @@ async def auth_middleware(request: Request, call_next):
         token = header[7:].strip()
     else:
         token = header.strip()
+    if not token:
+        # Anthropic clients (Claude Code) authenticate with ``x-api-key``
+        # instead of a bearer Authorization header.
+        token = request.headers.get("x-api-key", "").strip()
     if token not in API_KEYS:
         return _openai_error(401, "Invalid API key", "authentication_error")
     return await call_next(request)
@@ -9170,6 +13535,16 @@ async def responses(req: Request):
     return await handle_responses(req)
 
 
+@app.post("/v1/messages")
+async def anthropic_messages(req: Request):
+    return await handle_anthropic_messages(req)
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(req: Request):
+    return await handle_anthropic_count_tokens(req)
+
+
 @app.post("/api/model-test")
 async def api_model_test(req: Request):
     """Probe one model end to end through the real dispatch path.
@@ -9242,7 +13617,7 @@ async def api_model_test(req: Request):
     options["max_tokens"] = 64
     effort = str(body.get("reasoning_effort") or "").strip().lower()
     if effort:
-        if effort not in {"minimal", "low", "medium", "high", "xhigh", "max"}:
+        if effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
             return JSONResponse(
                 {"success": False, "error": f"unsupported reasoning_effort: {effort}"},
                 status_code=400,
@@ -9391,24 +13766,143 @@ async def web_login():
     return _web_login_html()
 
 
-START_AUTH_BAT = Path(__file__).resolve().parent.parent / "start_auth.bat"
+def _helper_generated_at() -> str:
+    return datetime.now(_CHECKIN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-@app.get("/web/login/download", response_class=FileResponse)
-async def web_login_download(as_param: str = Query("", alias="as")):
-    if as_param == "bat":
-        if not START_AUTH_BAT.exists():
-            return JSONResponse({"success": False, "error": "start_auth.bat not found"}, status_code=404)
-        return FileResponse(
-            START_AUTH_BAT,
-            media_type="application/octet-stream",
-            filename="start_auth.bat",
-        )
+
+def _helper_relay_url(request: Request, relay_param: str = "") -> str:
+    """Resolve the deployment address to bake into a downloaded helper.
+
+    Prefer an explicit public URL, then the browser address, proxy headers and
+    Host. Never substitute the container's listening port for a mapped port.
+    """
+    try:
+        scheme = str(request.url.scheme or "http").lower()
+    except (AttributeError, ValueError):
+        scheme = "http"
+    host_header = str(request.headers.get("host") or "").strip()
+    # 直连部署可以让 X-Forwarded-* 完全不参与判定，避免代理头被伪造后写进下载脚本。
+    trust_proxy = str(
+        os.environ.get("TRAE_TRUST_PROXY_HEADERS", "1")
+    ).strip().lower() not in ("0", "false", "no", "off")
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "") if trust_proxy else ""
+    forwarded_host = str(request.headers.get("x-forwarded-host") or "") if trust_proxy else ""
+    if forwarded_proto.split(",")[0].strip().lower() in ("http", "https"):
+        scheme = forwarded_proto.split(",")[0].strip().lower()
+    public_base = str(
+        os.environ.get("TRAE_PUBLIC_BASE_URL") or ""
+    ).strip()
+    if public_base:
+        # A typo in an explicit deployment URL should be reported rather than
+        # silently producing a helper bound to a different server.
+        return _normalize_relay_url(public_base)
+    prefix = str(request.scope.get("root_path") or "").rstrip("/")
+    candidates = _helper_candidate_hosts(
+        public_base=public_base,
+        forwarded_proto=forwarded_proto,
+        forwarded_host=forwarded_host + prefix if forwarded_host else "",
+        scheme=scheme,
+        host=host_header + prefix if host_header else "",
+    )
+    browser_origin = str(relay_param or "").strip()
+    if browser_origin:
+        try:
+            browser_base = _normalize_relay_url(browser_origin)
+        except RelayURLError:
+            browser_base = ""
+        if browser_base:
+            def origin(base: str) -> tuple[str, str, int]:
+                parsed = urlsplit(_normalize_relay_url(base))
+                return (
+                    parsed.scheme, parsed.hostname or "",
+                    parsed.port or (443 if parsed.scheme == "https" else 80),
+                )
+
+            allowed_origins = set()
+            # Do not authorize an arbitrary target using the loopback fallback.
+            for candidate in candidates[:-1]:
+                try:
+                    allowed_origins.add(origin(candidate))
+                except RelayURLError:
+                    continue
+            if origin(browser_base) not in allowed_origins:
+                raise RelayURLError("relay URL must match the deployment host or trusted proxy")
+            candidates.insert(0, browser_base)
+    return _pick_relay_url(candidates)
+
+
+def _helper_payload(
+    request: Request, kind: str, relay_param: str = ""
+) -> tuple[str, str, str, str]:
+    kind = (kind or "py").strip().lower()
+    if kind not in HELPER_KINDS:
+        raise RelayURLError(f"unsupported helper kind: {kind}")
+    relay_url = _helper_relay_url(request, relay_param)
+    listener_port = _normalize_listener_port(
+        os.environ.get("WEB_LOGIN_LISTENER_PORT") or LOCAL_LISTENER_PORT
+    )
+    template = ""
     if not WEB_LOGIN_SCRIPT.exists():
-        return JSONResponse({"success": False, "error": "web_login.py not found"}, status_code=404)
-    return FileResponse(
-        WEB_LOGIN_SCRIPT,
-        media_type="text/plain; charset=utf-8",
-        filename="web_login.py",
+        raise FileNotFoundError("web_login.py 未随镜像打包")
+    if kind == "py":
+        template = WEB_LOGIN_SCRIPT.read_text(encoding="utf-8")
+    text = _render_auth_helper(
+        kind,
+        template=template,
+        relay_url=relay_url,
+        listener_port=listener_port,
+        client_id=TRAE_CLIENT_ID,
+        auth_url=TRAE_AUTH_URL,
+        generated_at=_helper_generated_at(),
+    )
+    filename = _helper_file_name(kind)
+    return text, filename, _helper_media_type(kind), relay_url
+
+
+@app.get("/web/login/download")
+async def web_login_download(
+    request: Request,
+    as_param: str = Query("py", alias="as"),
+    relay_param: str = Query("", alias="relay"),
+):
+    """Serve the local authorization helper with this deployment's address baked in."""
+    try:
+        payload, filename, media, relay_url = _helper_payload(request, as_param, relay_param)
+    except FileNotFoundError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=404)
+    except RelayURLError as exc:
+        return JSONResponse({"success": False, "error": f"授权助手生成参数无效: {exc}"}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"success": False, "error": f"读取模板失败: {exc}"}, status_code=500)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+        "X-Relay-Base-Url": relay_url,
+    }
+    return Response(content=payload.encode("utf-8"), media_type=media, headers=headers)
+
+
+@app.get("/web/login/helper-info")
+async def web_login_helper_info(request: Request, relay_param: str = Query("", alias="relay")):
+    """Report the address that generated downloads will embed."""
+    try:
+        relay_url = _helper_relay_url(request, relay_param)
+        listener_port = _normalize_listener_port(
+            os.environ.get("WEB_LOGIN_LISTENER_PORT") or LOCAL_LISTENER_PORT
+        )
+    except RelayURLError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    return JSONResponse(
+        {
+            "success": True,
+            "relay_url": relay_url,
+            "listener_port": listener_port,
+            "generated_py": "/web/login/download?as=py",
+            "generated_bat": "/web/login/download?as=bat",
+            "generated_sh": "/web/login/download?as=sh",
+            "relay_version": APP_VERSION,
+            "revision": str(os.environ.get("RELAY_BUILD_REVISION") or "local"),
+        }
     )
 
 
@@ -9575,22 +14069,27 @@ async def api_checkin_credits(account_id: str):
     path look like an account whose id is literally ``accounts``.
     """
     rec = auth.get_account_record(account_id)
-    token = rec.get("token") or ""
-    if not token:
+    if not (rec.get("token") or ""):
         return JSONResponse(
             {"success": False, "error": "account not found or token missing"},
             status_code=404,
         )
     try:
-        raw = await trae_client.fetch_account_credits(token)
-        parsed = trae_client.parse_account_credits(raw)
-        auth.merge_account_credits(account_id, {"account_credits": parsed})
+        # Keep the single-account endpoint on the same reconciliation path as
+        # bulk and scheduled refreshes.  Directly merging the provider result
+        # here used to erase the weighted local debit until the next poll.
+        async with _checkin_account_lock(account_id):
+            snapshot = await _fetch_credit_account_snapshot(account_id, rec)
+        parsed = snapshot.get("account_credits") or {}
         return JSONResponse(
             {
                 "success": True,
                 "id": account_id,
                 "credits": parsed,
-                "raw": raw,
+                # ``raw`` remains for older clients.  It is returned only
+                # from the single-account diagnostic endpoint; the persisted
+                # cache still stores the parsed, credential-free projection.
+                "raw": snapshot.get("_raw", parsed),
             }
         )
     except Exception as e:
@@ -9628,6 +14127,9 @@ async def _fetch_full_credits(token: str) -> dict:
     return {
         "account_credits": trae_client.parse_account_credits(raw_ac),
         "user_name": _credits_user_name(raw_ac),
+        # Keep the original payload available to the legacy single-account
+        # endpoint without making callers perform a second upstream request.
+        "_raw": raw_ac,
     }
 
 
@@ -9651,6 +14153,39 @@ def _cached_checkin_account_snapshot(
         "credits": cached.get("credits"),
         "checkin_enable": cached.get("enable"),
         "account_credits": cached.get("account_credits"),
+        "credits_official_remaining": (
+            cached.get("account_credits", {}).get(
+                "official_remaining",
+                cached.get("account_credits", {}).get("remaining"),
+            )
+            if isinstance(cached.get("account_credits"), Mapping)
+            else None
+        ),
+        "credits_official_used": (
+            cached.get("account_credits", {}).get("official_used")
+            if isinstance(cached.get("account_credits"), Mapping)
+            else None
+        ),
+        "credits_local_debit": (
+            cached.get("account_credits", {}).get("local_debit", 0)
+            if isinstance(cached.get("account_credits"), Mapping)
+            else 0
+        ),
+        "credits_reconciled_at": (
+            cached.get("account_credits", {}).get("credits_reconciled_at", 0)
+            if isinstance(cached.get("account_credits"), Mapping)
+            else 0
+        ),
+        "credits_reconcile_status": (
+            cached.get("account_credits", {}).get("reconcile_status", "unknown")
+            if isinstance(cached.get("account_credits"), Mapping)
+            else "unknown"
+        ),
+        "credits_reconcile_confidence": (
+            cached.get("account_credits", {}).get("reconcile_confidence")
+            if isinstance(cached.get("account_credits"), Mapping)
+            else None
+        ),
         "checkin_updated_at": record.get(
             "checkin_status_updated_at", record.get("checkin_updated_at", 0)
         ),
@@ -9712,11 +14247,42 @@ async def _fetch_credit_account_snapshot(
         else:
             raise
     patch = {key: value for key, value in full.items() if value is not None}
-    merged = (
-        auth.merge_account_credits(account_id, patch)
-        if patch
-        else dict(record.get("checkin") or {})
-    )
+    if patch and isinstance(patch.get("account_credits"), Mapping):
+        observed_at = time.time()
+        reconcile_state, effective = _credit_snapshot_projection(
+            account_id,
+            patch["account_credits"],
+            observed_at,
+        )
+        merged = auth.reconcile_account_credits(
+            account_id,
+            patch,
+            effective_remaining=effective.get("effective_remaining"),
+            local_debit=reconcile_state.get("local_debit", 0),
+            status=reconcile_state.get("status", "ok"),
+            source=reconcile_state.get("source", "upstream"),
+            confidence=reconcile_state.get("confidence", 1.0),
+            observed_at=observed_at,
+        )
+        # A test harness or a legacy storage adapter may expose a record
+        # through ``get_account_record`` without registering it in the
+        # persistence map used by ``reconcile_account_credits``.  Preserve the
+        # fetched projection for that adapter; normal auth storage returns the
+        # reconciled mapping above.
+        if not merged:
+            merged = dict(record.get("checkin") or {})
+            merged["account_credits"] = dict(patch["account_credits"])
+            merged["account_credits"].update(
+                {
+                    "remaining": effective.get("effective_remaining"),
+                    "local_debit": reconcile_state.get("local_debit", 0),
+                    "reconcile_status": reconcile_state.get("status", "ok"),
+                    "reconcile_source": reconcile_state.get("source", "upstream"),
+                    "reconcile_confidence": reconcile_state.get("confidence", 1.0),
+                }
+            )
+    else:
+        merged = dict(record.get("checkin") or {})
     row = _cached_checkin_account_snapshot(account_id, record)
     row.update(
         {
@@ -9724,6 +14290,8 @@ async def _fetch_credit_account_snapshot(
             "checkin": merged,
         }
     )
+    if "_raw" in full:
+        row["_raw"] = full.get("_raw")
     return row
 
 
@@ -10253,19 +14821,27 @@ async def api_checkin_claim_credits():
 
         credits_sort = 0
         try:
-            full = await _fetch_full_credits(token)
-            row.update(full)
-            parsed = full.get("account_credits") or {}
+            # Reconcile against the last official anchor before sorting.  This
+            # preserves any confirmed local debit that the provider has not
+            # reflected yet and serializes the refresh with other credit reads.
+            async with _checkin_account_lock(aid):
+                snapshot = await _fetch_credit_account_snapshot(aid, rec)
+            parsed = snapshot.get("account_credits") or {}
+            row["account_credits"] = parsed
+            row["checkin"] = snapshot.get("checkin") or row["checkin"]
+            # Keep compatibility with callers that expect the full checkin
+            # mapping in the claim response.  The mapping is already the
+            # reconciled projection; this does not re-merge raw provider data.
+            if row["checkin"]:
+                row["checkin"] = auth.merge_account_credits(aid, row["checkin"])
             # Every pack lives in the merged 通用积分 pool, so the single
             # account_credits value drives the credit-priority ordering.
             credits_sort = parsed.get("remaining") or parsed.get("total_limit") or 0
             if parsed.get("unlimited"):
                 credits_sort = 999999999
-            fresh_checkin = dict(rec.get("checkin") or {})
-            fresh_checkin.update({key: value for key, value in full.items() if value is not None})
-            row["checkin"] = auth.merge_account_credits(aid, fresh_checkin)
-        except Exception:
+        except Exception as exc:
             row["account_credits"] = None
+            row["credit_error"] = str(exc)
             credits_sort = 0
 
         row["credits_sort"] = credits_sort
@@ -10510,6 +15086,24 @@ async def api_settings(request: Request):
                 {"success": False, "error": "endpoint_id does not match URL/mode"},
                 status_code=400,
             )
+        # Older consoles persisted only the shared host (for example
+        # ``https://trae-api-cn.mchost.guru``) when selecting IDE/SOLO.  The
+        # endpoint id is authoritative, so accept that host-only form and
+        # normalize it to the concrete Remote path instead of rejecting a
+        # harmless migration request.
+        try:
+            submitted = urlsplit(web_base_url)
+            canonical = urlsplit(preset_web_base)
+            submitted_is_host_only = (
+                bool(submitted.scheme)
+                and bool(submitted.netloc)
+                and not submitted.path.rstrip("/")
+                and submitted.netloc.lower() == canonical.netloc.lower()
+            )
+        except ValueError:
+            submitted_is_host_only = False
+        if submitted_is_host_only:
+            web_base_url = preset_web_base
         if web_base_url not in (preset_web_base, legacy_gateway) and legacy_gateway:
             return JSONResponse(
                 {"success": False, "error": "endpoint_id does not match URL"},
@@ -10520,6 +15114,18 @@ async def api_settings(request: Request):
         # subsequent fallback keeps the ``/api/remote/v1`` prefix.
         if web_base_url == legacy_gateway:
             web_base_url = preset_web_base
+    elif endpoint_id == "":
+        # The custom entry represents a caller-supplied Web/Remote base.  Do
+        # not leave the previously selected IDE/Work mode active when the UI
+        # submits an empty preset id; that would make the preview and dispatch
+        # disagree after the next refresh or restart.
+        if not web_base_url:
+            return JSONResponse(
+                {"success": False, "error": "自定义端点需要 web_base_url"},
+                status_code=400,
+            )
+        upstream_mode = "remote"
+        model_base_url = explicit_model_base_url or ""
     elif explicit_model_base_url is not None:
         # No preset identity: the caller manages the model gateway directly.
         model_base_url = explicit_model_base_url
@@ -10607,6 +15213,25 @@ async def api_settings(request: Request):
         global UPSTREAM_MODE
         UPSTREAM_MODE = upstream_mode
         os.environ["UPSTREAM_MODE"] = upstream_mode
+    if web_base_url:
+        # Remote clients read this environment value directly. Keep it aligned
+        # with the saved preset so endpoint changes take effect immediately.
+        global WEB_BASE
+        WEB_BASE = web_base_url
+        os.environ["TRAE_WEB_BASE_URL"] = web_base_url
+    if model_base_url is not None:
+        if upstream_mode in {"work", "work-agent"}:
+            if model_base_url:
+                os.environ["TRAE_RAW_BASE_URL"] = model_base_url
+                os.environ["TRAE_WORK_BASE_URL"] = model_base_url
+            else:
+                os.environ.pop("TRAE_RAW_BASE_URL", None)
+                os.environ.pop("TRAE_WORK_BASE_URL", None)
+        elif upstream_mode in {"ide", "solo"}:
+            if model_base_url:
+                os.environ["TRAE_CODE_BASE_URL"] = model_base_url
+            else:
+                os.environ.pop("TRAE_CODE_BASE_URL", None)
     note = (
         "Relay 端口已保存；需同步 Docker 端口映射并重启容器生效"
         if relay_port
@@ -10705,23 +15330,7 @@ async def api_set_max_mode(request: Request):
 
 
 def _max_context_of(config: Mapping[str, Any]) -> int:
-    size = config.get("context_window_size")
-    if isinstance(size, Mapping):
-        raw = size.get("max")
-        if isinstance(raw, list):
-            raw = raw[0] if raw else None
-        if raw:
-            try:
-                return int(raw)
-            except (TypeError, ValueError):
-                pass
-    tokens = config.get("context_window_tokens")
-    if isinstance(tokens, Mapping) and tokens.get("max"):
-        try:
-            return int(tokens.get("max"))
-        except (TypeError, ValueError):
-            pass
-    return 0
+    return descriptor_max_context(config) or 0
 
 
 @app.get("/api/max-mode/models")
@@ -10747,7 +15356,7 @@ async def api_max_mode_models():
             "max_context": _max_context_of(cfg),
         }
         for name, cfg in configs.items()
-        if isinstance(cfg, Mapping) and cfg.get("max_mode")
+        if isinstance(cfg, Mapping) and descriptor_supports_max_mode(cfg)
     ]
     if not configs:
         return JSONResponse(

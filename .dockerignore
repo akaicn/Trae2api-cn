@@ -8,3 +8,4 @@
 !src/**
 !web_login.py
 !start_auth.bat
+!start_auth.sh

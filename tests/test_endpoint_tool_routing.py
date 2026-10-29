@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -140,7 +141,10 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
                 {**_request_options(), "_upstream_trace": trace},
             )
         self.assertEqual(result, {"route": "ide"})
-        self.assertEqual(ide.await_args.args[3]["_ide_endpoint"], "/api/agent/v3/llm_utils_chat")
+        self.assertEqual(
+            ide.await_args.args[3]["_ide_endpoint"],
+            "/api/agent/v3/llm_utils_chat",
+        )
         self.assertEqual(ide.await_args.args[3]["tools"], TOOLS)
         self.assertEqual(trace["actual_endpoint"], "ide")
         self.assertTrue(trace["fallback_used"])
@@ -215,19 +219,42 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
                  "_disable_upstream_fallback": True},
             )
         self.assertEqual(result, {"route": "work"})
+        remote.assert_awaited_once()
         work_options = remote.await_args.args[3]
         self.assertEqual(work_options["_trae_mode"], "work")
         self.assertEqual(work_options["_remote_agent_type"], "solo_work_remote")
+        self.assertEqual(work_options["_session_variant"], "work")
         self.assertEqual(work_options["tools"], TOOLS)
         self.assertEqual(trace["actual_endpoint"], "remote-work")
+        self.assertEqual(trace["product"], "traework")
         self.assertFalse(trace["fallback_used"])
         ide.assert_not_awaited()
+
+    async def test_public_work_preset_uses_work_tier_not_raw_or_agent(self):
+        remote = AsyncMock(return_value={"route": "work"})
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "work"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+        ):
+            result = await main_module._dispatch_chat(
+                [{"role": "user", "content": "Reply pong"}],
+                "glm-5.3",
+                False,
+                {**_request_options(), "_disable_upstream_fallback": True},
+            )
+
+        self.assertEqual(result, {"route": "work"})
+        options = remote.await_args.args[3]
+        self.assertEqual(options["_trae_mode"], "work")
+        self.assertEqual(options["_remote_agent_type"], "solo_work_remote")
+        self.assertEqual(options["_session_variant"], "work")
 
     async def test_work_agent_fallback_switches_to_ordinary_remote_tier(self):
         """A Work failure must not issue a second Work-tier request as fallback."""
 
         work_failure = RuntimeError("work model unavailable")
-        remote = AsyncMock(return_value={"route": "remote"})
+        remote = AsyncMock(side_effect=[work_failure, {"route": "remote"}])
         trace = {}
         with (
             patch.object(main_module, "UPSTREAM_MODE", "work-agent"),
@@ -235,7 +262,7 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 main_module,
                 "_run_remote_with_retry",
-                AsyncMock(side_effect=[work_failure, {"route": "remote"}]),
+                remote,
             ) as dispatch_remote,
         ):
             result = await main_module._dispatch_chat(
@@ -249,17 +276,33 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dispatch_remote.await_count, 2)
         work_options = dispatch_remote.await_args_list[0].args[3]
         fallback_options = dispatch_remote.await_args_list[1].args[3]
-        self.assertEqual(work_options["_trae_mode"], "work")
         self.assertEqual(work_options["_remote_agent_type"], "solo_work_remote")
+        self.assertEqual(work_options["_trae_mode"], "work")
         self.assertNotIn("_trae_mode", fallback_options)
+        self.assertNotIn("remote_agent_type", fallback_options)
         self.assertEqual(fallback_options["_remote_agent_type"], "solo_agent_remote")
         self.assertEqual(fallback_options["_upstream_fallback_from"], "work-agent")
         self.assertEqual(trace["requested_endpoint"], "work-agent")
         self.assertEqual(trace["actual_endpoint"], "remote")
         self.assertTrue(trace["fallback_used"])
         self.assertEqual(trace["fallback_target"], "remote")
-        self.assertEqual(trace["failed_endpoint"], "work-agent")
+        self.assertEqual(trace["failed_endpoint"], "work")
         self.assertIn("work-agent: work model unavailable", trace["fallback_reason"])
+
+    async def test_work_fallback_options_remove_work_tier_binding(self):
+        fallback = main_module._remote_fallback_options(
+            {
+                "_trae_mode": "work",
+                "_remote_agent_type": "solo_work_remote",
+                "remote_agent_type": "solo_work_remote",
+            },
+            "work",
+        )
+
+        self.assertEqual(fallback["_upstream_mode"], "remote")
+        self.assertEqual(fallback["_remote_agent_type"], "solo_agent_remote")
+        self.assertNotIn("_trae_mode", fallback)
+        self.assertNotIn("remote_agent_type", fallback)
 
     async def test_tool_request_falls_back_without_dropping_tool_schema(self):
         selected = AsyncMock(side_effect=RuntimeError("ide unavailable"))
@@ -360,6 +403,162 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         fallback_options = remote.await_args.args[3]
         self.assertEqual(fallback_options["tools"], TOOLS)
         self.assertEqual(fallback_options["_remote_agent_type"], "solo_agent_remote")
+
+    async def test_streaming_ide_body_failure_preserves_remote_query_limit_error(self):
+        async def broken_ide_body():
+            raise RuntimeError("IDE body failed before output")
+            yield "unreachable"
+
+        messages = [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,QUJD"},
+            }],
+        }]
+        selected = AsyncMock(
+            return_value=main_module.StreamingResponse(broken_ide_body())
+        )
+        remote = AsyncMock(
+            side_effect=main_module.RemoteQueryTooLarge(2_895_151, 480_000)
+        )
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "ide"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module.auth, "get_polling_status", return_value={"enabled": False}),
+            patch.object(main_module, "run_ide_chat", selected),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+        ):
+            chunks = [
+                chunk
+                async for chunk in main_module._deferred_dispatch_stream(
+                    messages, "glm-5.2", {"_upstream_mode": "ide"}
+                )
+            ]
+
+        joined = "".join(chunks)
+        events = [
+            json.loads(line[6:])
+            for line in joined.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        errors = [event["error"] for event in events if "error" in event]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["type"], "context_length_exceeded")
+        self.assertEqual(errors[0]["param"], "messages")
+        self.assertIn("configured input limit", errors[0]["message"])
+        self.assertNotIn("IDE body failed", errors[0]["message"])
+        self.assertEqual(joined.count("data: [DONE]"), 1)
+        selected.assert_awaited_once()
+        remote.assert_awaited_once()
+        self.assertEqual(remote.await_args.args[1], "glm-5.2")
+        self.assertEqual(remote.await_args.args[3]["_upstream_fallback_from"], "ide")
+
+    async def test_streaming_initial_query_limit_error_does_not_dispatch_fallback(self):
+        response = main_module.JSONResponse(
+            {
+                "error": {
+                    "message": "Trae remote query exceeds the configured input limit",
+                    "type": "context_length_exceeded",
+                    "param": "messages",
+                }
+            },
+            status_code=413,
+        )
+        dispatch = AsyncMock(return_value=response)
+        with patch.object(main_module, "_dispatch_chat", dispatch):
+            chunks = [
+                chunk
+                async for chunk in main_module._deferred_dispatch_stream(
+                    [{"role": "user", "content": "oversized"}],
+                    "glm-5.2",
+                    {"_upstream_mode": "ide"},
+                )
+            ]
+
+        joined = "".join(chunks)
+        events = [
+            json.loads(line[6:])
+            for line in joined.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        errors = [event["error"] for event in events if "error" in event]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["type"], "context_length_exceeded")
+        self.assertEqual(errors[0]["param"], "messages")
+        self.assertEqual(joined.count("data: [DONE]"), 1)
+        dispatch.assert_awaited_once()
+
+    async def test_work_streaming_failure_falls_back_to_remote_before_output(self):
+        async def broken_work_body():
+            raise RuntimeError("work stream disconnected before model output")
+            yield "unreachable"
+
+        async def remote_body():
+            yield 'data: {"choices":[{"delta":{"content":"pong"}}]}\n\n'
+            yield "data: [DONE]\n\n"
+
+        work_response = main_module.StreamingResponse(broken_work_body())
+        remote_response = main_module.StreamingResponse(remote_body())
+        remote = AsyncMock(side_effect=[work_response, remote_response])
+        options = {**_request_options(), "_upstream_mode": "work"}
+
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "work"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+        ):
+            chunks = [
+                chunk
+                async for chunk in main_module._deferred_dispatch_stream(
+                    [{"role": "user", "content": "Reply pong"}],
+                    "auto",
+                    options,
+                )
+            ]
+
+        joined = "".join(chunks)
+        self.assertIn('"content":"pong"', joined)
+        self.assertIn("data: [DONE]", joined)
+        self.assertEqual(remote.await_count, 2)
+        self.assertEqual(
+            remote.await_args_list[0].args[3]["_remote_agent_type"],
+            "solo_work_remote",
+        )
+        self.assertEqual(
+            remote.await_args_list[1].args[3]["_upstream_fallback_from"], "work"
+        )
+
+    async def test_work_streaming_failure_respects_disabled_fallback(self):
+        async def broken_work_body():
+            raise RuntimeError("work stream disconnected before model output")
+            yield "unreachable"
+
+        remote = AsyncMock(
+            return_value=main_module.StreamingResponse(broken_work_body())
+        )
+        options = {
+            **_request_options(),
+            "_upstream_mode": "work",
+            "_disable_upstream_fallback": True,
+        }
+
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "work"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+        ):
+            chunks = [
+                chunk
+                async for chunk in main_module._deferred_dispatch_stream(
+                    [{"role": "user", "content": "Reply pong"}],
+                    "auto",
+                    options,
+                )
+            ]
+
+        self.assertIn("work stream disconnected before model output", "".join(chunks))
+        remote.assert_awaited_once()
 
     async def test_nonstream_model_event_error_does_not_replay_other_routes(self):
         routes = {
@@ -605,6 +804,388 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
                 ide.assert_not_awaited()
                 remote.assert_not_awaited()
                 usage.assert_called_once_with({"usage": exc.usage}, "auto")
+
+
+class NativeEndpointRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ide_stream_rate_limit_rotates_before_first_output(self):
+        async def limited_body():
+            # Keepalive is transport noise and must not prevent a retry.
+            yield ": relay-keepalive\n\n"
+            raise RuntimeError(
+                "Trae upstream error 4011: requests have exceeded the rate limit"
+            )
+
+        async def ok_body():
+            yield 'data: {"choices":[{"delta":{"content":"pong"}}]}\n\n'
+            yield "data: [DONE]\n\n"
+
+        selected = AsyncMock(
+            side_effect=[
+                main_module.StreamingResponse(limited_body()),
+                main_module.StreamingResponse(ok_body()),
+            ]
+        )
+        tracker = SimpleNamespace(rebind=AsyncMock())
+        options = {
+            "_account_id": "account-a",
+            "_auth_token": "token-a",
+            "_upstream_mode": "ide",
+        }
+        next_snapshot = (
+            "account-b",
+            {
+                "token": "token-b",
+                "provider_specific": {"bizUserId": "account-b"},
+            },
+        )
+
+        with (
+            patch.object(main_module, "run_ide_chat", selected),
+            patch.object(
+                main_module.auth,
+                "get_polling_status",
+                return_value={"enabled": True},
+            ),
+            patch.object(main_module, "_polling_retry_limit", return_value=2),
+            patch.object(
+                main_module,
+                "_next_retry_account_snapshot",
+                return_value=next_snapshot,
+            ) as next_account,
+            patch.object(main_module, "_account_id_from_token", return_value=""),
+            patch.object(main_module, "_rebind_chat_session_account") as rebind,
+        ):
+            response = await main_module._run_ide_with_retry(
+                [{"role": "user", "content": "pong"}],
+                "glm-5.2",
+                True,
+                options,
+                tracker=tracker,
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        joined = "".join(chunks)
+        self.assertIn('"content":"pong"', joined)
+        self.assertIn("data: [DONE]", joined)
+        self.assertEqual(selected.await_count, 2)
+        next_account.assert_called_once()
+        rebind.assert_called_once_with(
+            "",
+            "account-b",
+            "account-b",
+            "token-b",
+            {"bizUserId": "account-b"},
+        )
+        tracker.rebind.assert_awaited_once()
+
+    async def test_ide_rate_limit_rotates_once_to_an_enabled_account(self):
+        selected = AsyncMock(
+            side_effect=[
+                RuntimeError(
+                    "Trae upstream error 4011: requests have exceeded the rate limit"
+                ),
+                {"route": "ide"},
+            ]
+        )
+        tracker = SimpleNamespace(rebind=AsyncMock())
+        options = {
+            "_account_id": "account-a",
+            "_auth_token": "token-a",
+            "_upstream_mode": "ide",
+        }
+        next_snapshot = (
+            "account-b",
+            {
+                "token": "token-b",
+                "provider_specific": {"bizUserId": "account-b"},
+            },
+        )
+
+        with (
+            patch.object(main_module, "run_ide_chat", selected),
+            patch.object(
+                main_module.auth,
+                "get_polling_status",
+                return_value={"enabled": True},
+            ),
+            patch.object(main_module, "_polling_retry_limit", return_value=2),
+            patch.object(
+                main_module,
+                "_next_retry_account_snapshot",
+                return_value=next_snapshot,
+            ) as next_account,
+            patch.object(main_module, "_account_id_from_token", return_value=""),
+            patch.object(main_module, "_rebind_chat_session_account") as rebind,
+        ):
+            result = await main_module._run_ide_with_retry(
+                [{"role": "user", "content": "pong"}],
+                "glm-5.2",
+                False,
+                options,
+                tracker=tracker,
+            )
+
+        self.assertEqual(result, {"route": "ide"})
+        self.assertEqual(selected.await_count, 2)
+        next_account.assert_called_once()
+        rebind.assert_called_once_with(
+            "",
+            "account-b",
+            "account-b",
+            "token-b",
+            {"bizUserId": "account-b"},
+        )
+        tracker.rebind.assert_awaited_once()
+        second_options = selected.await_args_list[1].args[3]
+        self.assertEqual(second_options["_account_id"], "account-b")
+        self.assertEqual(second_options["_auth_token"], "token-b")
+
+    async def test_ide_parameter_error_is_not_retried(self):
+        selected = AsyncMock(
+            side_effect=RuntimeError(
+                "Trae upstream error 4001: the param is invalid"
+            )
+        )
+        with (
+            patch.object(main_module, "run_ide_chat", selected),
+            patch.object(
+                main_module.auth,
+                "get_polling_status",
+                return_value={"enabled": True},
+            ),
+            patch.object(main_module, "_polling_retry_limit", return_value=2),
+            patch.object(main_module, "_next_retry_account_snapshot") as next_account,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "4001"):
+                await main_module._run_ide_with_retry(
+                    [{"role": "user", "content": "pong"}],
+                    "glm-5.2",
+                    False,
+                    {"_account_id": "account-a", "_auth_token": "token-a"},
+                )
+
+        selected.assert_awaited_once()
+        next_account.assert_not_called()
+
+
+class IdeRawLegacyFallbackTests(unittest.IsolatedAsyncioTestCase):
+    class _ReplayResponse:
+        status_code = 200
+
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def iter_lines(self):
+            return iter(self._lines)
+
+        def close(self):
+            return None
+
+    @staticmethod
+    def _wrapper(response):
+        return SimpleNamespace(response=response, close=Mock())
+
+    def _options(self):
+        return {
+            "_upstream_mode": "ide",
+            "_traecode_raw_chat_function": "chat_v3",
+            "_ide_endpoint": "/api/agent/v3/llm_utils_chat",
+            "tools": TOOLS,
+            "tool_choice": "auto",
+        }
+
+    async def test_nonstream_raw_param_error_reopens_legacy_adapter(self):
+        legacy = self._wrapper(
+            self._ReplayResponse(
+                [
+                    "event: output",
+                    'data: {"response":"pong"}',
+                    "",
+                    "event: done",
+                    'data: {"finish_reason":"stop"}',
+                    "",
+                ]
+            )
+        )
+        raw = AsyncMock(side_effect=RuntimeError("Trae upstream error 4001: param invalid"))
+        legacy_send = AsyncMock(return_value=legacy)
+        trace = {}
+
+        with (
+            patch.object(main_module.raw_client, "send_traecode_chat_request", raw),
+            patch.object(main_module.trae_client, "send_chat_request", legacy_send),
+        ):
+            response = await main_module.run_ide_chat(
+                [{"role": "user", "content": "Reply pong"}],
+                "glm-5.3",
+                False,
+                {**self._options(), "_upstream_trace": trace},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.body.decode("utf-8")
+        self.assertIn('"content":"pong"', payload)
+        raw.assert_awaited_once()
+        legacy_send.assert_awaited_once()
+        legacy_options = legacy_send.await_args.kwargs["options"]
+        self.assertNotIn("_traecode_raw_chat_function", legacy_options)
+        self.assertEqual(
+            legacy_options["_ide_endpoint"], "/api/agent/v3/llm_utils_chat"
+        )
+        self.assertTrue(trace["fallback_used"])
+        self.assertEqual(trace["actual_endpoint"], "/api/agent/v3/llm_utils_chat")
+
+    async def test_stream_raw_empty_before_output_reopens_legacy_adapter(self):
+        raw = AsyncMock(
+            return_value=self._wrapper(
+                self._ReplayResponse(
+                    [
+                        # No model payload and no terminal event: the native
+                        # translator raises IncompleteUpstreamResponse before
+                        # anything is exposed to the caller.
+                    ]
+                )
+            )
+        )
+        legacy = self._wrapper(
+            self._ReplayResponse(
+                [
+                    "event: output",
+                    'data: {"response":"pong"}',
+                    "",
+                    "event: done",
+                    'data: {"finish_reason":"stop"}',
+                    "",
+                ]
+            )
+        )
+        legacy_send = AsyncMock(return_value=legacy)
+
+        with (
+            patch.object(main_module.raw_client, "send_traecode_chat_request", raw),
+            patch.object(main_module.trae_client, "send_chat_request", legacy_send),
+        ):
+            response = await main_module.run_ide_chat(
+                [{"role": "user", "content": "Reply pong"}],
+                "glm-5.3",
+                True,
+                self._options(),
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        joined = "".join(chunks)
+        self.assertIn('"content": "pong"', joined)
+        self.assertIn("data: [DONE]", joined)
+        raw.assert_awaited_once()
+        legacy_send.assert_awaited_once()
+
+    async def test_invalid_native_tool_json_does_not_replay_through_legacy(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                native_wrapper = self._wrapper(
+                    self._ReplayResponse(
+                        [
+                            "event: output",
+                            "data: " + json.dumps(
+                                {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_native",
+                                            "function_call": {
+                                                "name": "read_file",
+                                                "arguments": '{"path":',
+                                            },
+                                        }
+                                    ]
+                                }
+                            ),
+                            "",
+                            "event: token_usage",
+                            'data: {"input_token":3,"output_token":5}',
+                            "",
+                            "event: done",
+                            'data: {"finish_reason":"tool_calls"}',
+                            "",
+                        ]
+                    )
+                )
+                legacy_wrapper = self._wrapper(
+                    self._ReplayResponse(
+                        [
+                            "event: output",
+                            'data: {"response":"unexpected legacy replay"}',
+                            "",
+                            "event: done",
+                            'data: {"finish_reason":"stop"}',
+                            "",
+                        ]
+                    )
+                )
+                raw = AsyncMock(return_value=native_wrapper)
+                legacy_send = AsyncMock(return_value=legacy_wrapper)
+                with (
+                    patch.object(
+                        main_module.raw_client, "send_traecode_chat_request", raw
+                    ),
+                    patch.object(
+                        main_module.trae_client, "send_chat_request", legacy_send
+                    ),
+                ):
+                    with self.assertRaises(InvalidNativeToolArguments) as error:
+                        response = await main_module.run_ide_chat(
+                            [{"role": "user", "content": "Read a.txt"}],
+                            "glm-5.3",
+                            stream,
+                            self._options(),
+                        )
+                        if stream:
+                            async for _ in response.body_iterator:
+                                pass
+
+                self.assertFalse(error.exception.retryable)
+                self.assertTrue(error.exception.observed_model_event)
+                self.assertEqual(error.exception.usage["total_tokens"], 8)
+                raw.assert_awaited_once()
+                legacy_send.assert_not_awaited()
+                native_wrapper.close.assert_called_once()
+                legacy_wrapper.close.assert_not_called()
+
+    async def test_guarded_raw_open_errors_do_not_replay_through_legacy(self):
+        for stream in (False, True):
+            for retryable, observed in ((False, False), (True, True)):
+                with self.subTest(
+                    stream=stream, retryable=retryable, observed=observed
+                ):
+                    native_error = EmptyUpstreamResponse(
+                        "native turn cannot be replayed",
+                        retryable=retryable,
+                        observed_model_event=observed,
+                    )
+                    raw = AsyncMock(side_effect=native_error)
+                    legacy_send = AsyncMock()
+                    with (
+                        patch.object(
+                            main_module.raw_client,
+                            "send_traecode_chat_request",
+                            raw,
+                        ),
+                        patch.object(
+                            main_module.trae_client,
+                            "send_chat_request",
+                            legacy_send,
+                        ),
+                    ):
+                        with self.assertRaises(EmptyUpstreamResponse) as error:
+                            await main_module.run_ide_chat(
+                                [{"role": "user", "content": "Read a.txt"}],
+                                "glm-5.3",
+                                stream,
+                                self._options(),
+                            )
+                    self.assertIs(error.exception, native_error)
+                    raw.assert_awaited_once()
+                    legacy_send.assert_not_awaited()
 
 
 if __name__ == "__main__":

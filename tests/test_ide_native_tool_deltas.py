@@ -307,6 +307,44 @@ class IdeNativeToolDeltaTests(unittest.IsolatedAsyncioTestCase):
                     ['{"path":"a.txt"}', '{"path":"b.txt"}'],
                 )
 
+    async def test_reused_source_index_nameless_tail_completes_the_latest_call(self):
+        frames = [
+            [_call('{"path":"a.txt"}', name="read_file", call_id="call_a")],
+            [_call('{"path":', name="read_file", call_id="call_b")],
+            [_call('"b.txt"}')],
+        ]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                calls = await self._calls(frames, stream)
+                self.assertEqual(
+                    [call["id"] for call in calls], ["call_a", "call_b"]
+                )
+                self.assertEqual(
+                    [json.loads(call["function"]["arguments"]) for call in calls],
+                    [{"path": "a.txt"}, {"path": "b.txt"}],
+                )
+
+    async def test_nameless_real_new_id_cannot_complete_or_replace_an_old_call(self):
+        for stream in (False, True):
+            for previous_arguments in ('{"path":', '{"path":"a.txt"}'):
+                with self.subTest(
+                    stream=stream, previous_arguments=previous_arguments
+                ):
+                    frames = [
+                        [
+                            _call(
+                                previous_arguments,
+                                name="read_file",
+                                call_id="call_a",
+                            )
+                        ],
+                        [_call('"b.txt"}', call_id="call_b")],
+                    ]
+                    with self.assertRaises(sse.InvalidNativeToolArguments) as error:
+                        await self._calls(frames, stream)
+                    self.assertFalse(error.exception.retryable)
+                    self.assertTrue(error.exception.observed_model_event)
+
     async def test_standard_native_split_preserves_empty_first_args_and_nameless_tail(self):
         head = _call("", name="read_file", call_id="call_native")
         head["function_call"] = {"name": "read_file", "args": ""}

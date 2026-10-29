@@ -80,6 +80,41 @@ class TraeWorkCustomIngressTests(unittest.TestCase):
         raw.assert_awaited_once()
         remote.assert_not_awaited()
 
+    def test_trae344_raw_function_routes_to_shared_traecode_chain(self):
+        ide = AsyncMock(return_value=JSONResponse({"route": "traecode-raw-v2"}))
+        legacy_raw = AsyncMock(
+            side_effect=AssertionError("3.4.4 raw-v2 must use TraeCode adapter")
+        )
+        remote = AsyncMock(
+            side_effect=AssertionError("3.4.4 raw-v2 must not use Remote")
+        )
+
+        with (
+            patch("src.main.run_ide_chat", ide),
+            patch("src.main.run_raw_chat", legacy_raw),
+            patch("src.main._run_remote_with_retry", remote),
+        ):
+            response = asyncio.run(
+                main_module._dispatch_chat(
+                    [{"role": "user", "content": "hello"}],
+                    "glm-5.2",
+                    False,
+                    {
+                        "_traework_custom_model": True,
+                        "_traework_upstream_mode": "raw",
+                        "_traecode_raw_chat_function": "chat_v3",
+                        "request_seq": 0,
+                    },
+                )
+            )
+
+        self.assertEqual(json.loads(response.body), {"route": "traecode-raw-v2"})
+        ide.assert_awaited_once()
+        self.assertEqual(ide.await_args.args[1], "glm-5.2")
+        self.assertEqual(ide.await_args.args[3]["request_seq"], 0)
+        legacy_raw.assert_not_awaited()
+        remote.assert_not_awaited()
+
     def test_explicit_raw_late_stream_failure_is_not_falsely_cross_retried(self):
         async def failing_body():
             raise RuntimeError("raw iterator failed")
@@ -181,6 +216,9 @@ class TraeWorkCustomIngressTests(unittest.TestCase):
         self.assertFalse(selected["is_preset"])
         self.assertTrue(selected["is_custom_base_url"])
         self.assertTrue(body["model"]["features"]["tool_calls"]["enable"])
+        self.assertNotIn("reasoning", body["model"]["features"])
+        self.assertNotIn("context_window_size", body["model"])
+        self.assertNotIn("prompt_max_tokens", body["model"])
 
     def test_raw_stream_converts_openai_tool_call_for_traework_toolhost(self):
         captured = {}

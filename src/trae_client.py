@@ -1,11 +1,13 @@
 """
 trae_client.py - Trae API 客户端
 
-支持两条上游路径：
-1. IDE/桌面版：先走 /api/agent/v3/llm_utils_chat，失败后依次回退
-   /api/ide/v1/chat 与 /api/agent/v3/create_agent_task
-2. 网页版 remote 会话（OmniRoute 风格）：POST /chat_sessions +
-   GET /chat_sessions/{id}/events
+支持以下上游路径：
+1. TraeCode IDE/SOLO 主聊天：由 ``raw_client`` 走
+   ``/api/ide/v2/llm_raw_chat``（失败回退 ``/api/ide/v1/llm_raw_chat``）。
+2. TraeWork 兼容/旧版 IDE 辅助适配：保留 ``llm_utils_chat``、``/api/ide/v1/chat``
+   和 ``create_agent_task``，但不作为 TraeCode 主聊天链路。
+3. 网页版 Remote/Work 会话（OmniRoute 风格）：POST ``/chat_sessions`` +
+   GET ``/chat_sessions/{id}/events``。
 """
 
 import asyncio
@@ -19,23 +21,32 @@ import math
 import os
 import random
 import string
+import threading
 import time
 import uuid
+from contextvars import ContextVar
 from urllib.parse import urlsplit, urlunsplit
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, AsyncIterator, Mapping, Optional
+from typing import Any, AsyncIterator, Callable, Mapping, Optional
 
 import anyio
 import httpx
 
-from . import auth, raw_client
+from . import auth, images, raw_client
 from .cli_client import (
     renderer_block_text,
     sanitize_assistant_history_messages,
     tool_result_is_failed,
 )
-from .model_limits import clamp_max_completion_tokens
+from .model_limits import (
+    clamp_max_completion_tokens,
+    descriptor_max_context,
+    descriptor_multimodal,
+    descriptor_reasoning_config,
+    descriptor_supports_max_mode,
+)
+from .reasoning_effort import supported_levels
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +64,18 @@ TRAE_USAGE_API_HOST = os.environ.get(
     "TRAE_USAGE_API_HOST", "https://api5-normal.mchost.guru"
 )
 
-# 按优先级依次尝试的 IDE 版上游端点（参考 laojichao/trae-local-api）
+# Legacy IDE adapter endpoints.  Public ``ide``/``solo`` dispatch uses the
+# TraeCode raw transport in ``raw_client``; these remain only for older native
+# callers and compatibility tests.
 IDE_ENDPOINTS = [
     "/api/agent/v3/llm_utils_chat",
     "/api/ide/v1/chat",
     "/api/agent/v3/create_agent_task",
 ]
-DEFAULT_MODEL_GATEWAY = "https://trae-api-cn.mchost.guru"
+DEFAULT_MODEL_GATEWAY = (
+    os.environ.get("TRAE_CODE_BASE_URL")
+    or "https://trae-api-cn.mchost.guru"
+).rstrip("/")
 # Legacy Work ``create_agent_task`` is served from the Work gateway.  The
 # native Work Lite ``workflow/start`` path remains on trae-api-cn.mchost.guru;
 # keeping this host separate prevents an IDE request from being sent to the
@@ -71,9 +87,9 @@ WORK_AGENT_APP_ID = os.environ.get("TRAE_WORK_APP_ID", "931506")
 WORK_AGENT_APP_ID_CHAT = os.environ.get("TRAE_WORK_APP_ID_CHAT", IDE_APP_ID)
 WORK_AGENT_VERSION = os.environ.get("TRAE_WORK_IDE_VERSION", "0.1.63")
 WORK_AGENT_VERSION_CODE = os.environ.get("TRAE_WORK_IDE_VERSION_CODE", "20260901")
-# SOLO/llm_utils_chat uses a different client version family from the legacy
-# IDE payload builder.  Keep it independently configurable so old desktop
-# request values do not make the gateway reject otherwise valid parameters.
+# The legacy SOLO/IDE compatibility adapter uses a different client-version
+# family from the TraeCode raw transport. Keep it independently configurable
+# so old desktop request values do not make the gateway reject valid payloads.
 SOLO_GATEWAY_VERSION = os.environ.get("TRAE_SOLO_GATEWAY_VERSION", "0.1.52")
 SOLO_GATEWAY_VERSION_CODE = os.environ.get(
     "TRAE_SOLO_GATEWAY_VERSION_CODE", "20260811"
@@ -113,6 +129,10 @@ MODEL_ALIASES = {
     "DeepSeek-V4-Flash-Official": "DeepSeek-V4-Flash-Official",
     "deepseek-v4-pro": "DeepSeek-V4-Pro",
     "deepseek-v4-flash": "DeepSeek-V4-Flash",
+    # TraeCode Agent exposes this lowercase config directly.  Keep the
+    # spelling unchanged so it can be selected by automatic simple-task
+    # routing without being rewritten to the older V4 aliases.
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash",
     "deepseek-v4-pro 正式版": "DeepSeek-V4-Pro-Official",
     "deepseek-v4-flash 正式版": "DeepSeek-V4-Flash-Official",
     "seed-2.1-pro": "Doubao-Seed-2.1-Pro",
@@ -165,7 +185,110 @@ _DEVICE_BRANDS = ["92L3", "91C9", "814S", "8P15V", "35G4", "65G4", "55G4"]
 _WEB_SLOTS: dict[str, asyncio.Semaphore] = {}
 _WEB_LEASES: dict[str, dict] = {}
 _WEB_MODEL_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
-_WEB_PARALLEL_LIMIT = int(os.environ.get("TRAE_WEB_PARALLEL_LIMIT", "2"))
+# Accounts present in the auth store use the entitlement-backed reservation
+# ledger.  Unknown ids retain the legacy semaphore path for compatibility with
+# single-token deployments and older integrations.
+_ACCOUNT_SLOT_RESERVATIONS: dict[str, int] = {}
+_ACCOUNT_SLOT_RESERVATIONS_LOCK = threading.Lock()
+# A count keyed only by account cannot identify which transport owns a slot.
+# Keep an opaque request lease for every entitlement-backed acquisition.  The
+# context variable lets teardown code preserve the historical one-argument
+# ``release_web_slot(account_id)`` call shape while still passing ownership to
+# the real release implementation (and to old mocks in the test suite).
+_ACCOUNT_SLOT_LEASE_OWNERS: dict[str, tuple[str, int | None]] = {}
+_ACCOUNT_SLOT_RELEASE_TOKEN: ContextVar[str] = ContextVar(
+    "trae_account_slot_release_token", default=""
+)
+
+
+def _uses_entitlement_slot(account_id: str) -> bool:
+    """Return true only for an account persisted in the auth store.
+
+    Some integrations monkeypatch ``get_account_record`` to provide a bound
+    credential without registering it in the account store.  Those legacy
+    calls must continue using the local semaphore fallback.
+    """
+    account_id = str(account_id or "")
+    if not account_id:
+        return False
+    try:
+        return bool(auth.resolve_model_account_id(account_id))
+    except Exception:
+        return False
+
+
+def _entitlement_slot_key(account_id: str) -> str:
+    return auth.resolve_model_account_id(account_id) or str(account_id or "")
+
+
+def _current_task_id() -> int | None:
+    """Return the current asyncio task identity, if called from an event loop."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return id(task) if task is not None else None
+
+
+def _owned_slot_token(account_id: str) -> str:
+    """Find a slot acquired by this task when legacy teardown omits its token."""
+    task_id = _current_task_id()
+    if task_id is None:
+        return ""
+    with _ACCOUNT_SLOT_RESERVATIONS_LOCK:
+        matches = [
+            token
+            for token, (owner, owner_task_id) in _ACCOUNT_SLOT_LEASE_OWNERS.items()
+            if owner == account_id and owner_task_id == task_id
+        ]
+    # A task should release its own leases explicitly when it owns more than
+    # one; do not guess in that case.
+    return matches[0] if len(matches) == 1 else ""
+
+
+def release_web_slot_owned(account_id: str = "", lease_token: str = "") -> None:
+    """Release a slot while retaining the legacy one-argument call contract.
+
+    ``release_web_slot`` is patched by several integrations and older tests.
+    Passing the token through a context variable means those patches continue
+    to observe one positional argument, while the concrete implementation can
+    enforce request ownership.
+    """
+    lease_token = str(lease_token or "")
+    if not lease_token:
+        release_web_slot(account_id)
+        return
+    marker = _ACCOUNT_SLOT_RELEASE_TOKEN.set(lease_token)
+    try:
+        release_web_slot(account_id)
+    finally:
+        _ACCOUNT_SLOT_RELEASE_TOKEN.reset(marker)
+
+
+def _configured_model_request_parallel_limit(
+    environ: Optional[Mapping[str, str]] = None,
+) -> int:
+    """Read the shared model/native-tool stream capacity.
+
+    ``TRAE_WEB_PARALLEL_LIMIT`` remains a compatibility alias for existing
+    deployments. New configurations should use the transport-neutral name so
+    Raw/IDE and Web/Remote cannot accidentally be tuned to different limits.
+    """
+
+    values = os.environ if environ is None else environ
+    raw = values.get("TRAE_MODEL_REQUEST_PARALLEL_LIMIT")
+    if raw is None or not str(raw).strip():
+        raw = values.get("TRAE_WEB_PARALLEL_LIMIT", "4")
+    try:
+        limit = int(str(raw).strip())
+    except (TypeError, ValueError):
+        limit = 4
+    return max(1, min(limit, 64))
+
+
+# Keep the legacy internal name because older integrations patch it in process.
+# Every transport reads it through ``model_request_parallel_limit()``.
+_WEB_PARALLEL_LIMIT = _configured_model_request_parallel_limit()
 _WEB_IDLE_TIMEOUT = float(os.environ.get("TRAE_WEB_IDLE_TIMEOUT", "60"))
 _WEB_MODEL_CACHE_TTL = float(os.environ.get("TRAE_WEB_MODEL_CACHE_TTL", "300"))
 _WORKSPACE_PREFIXES = ["User", "home", "workspace", "data"]
@@ -192,6 +315,23 @@ def _web_model_cache_key(token: str = "", user_id_override: str = "") -> str:
         return "token:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     return str(auth.get_user_id() or "default")
+
+
+def _model_catalog_cache_key(
+    token: str = "",
+    user_id_override: str = "",
+    *,
+    agent_type: str = "",
+    raw_chat_function: str = "",
+) -> str:
+    """Scope live model metadata to one account and executor function."""
+
+    account = _web_model_cache_key(token, user_id_override)
+    tier = str(agent_type or "default").strip().lower() or "default"
+    function = (
+        str(raw_chat_function or "default").strip().lower() or "default"
+    )
+    return f"{account}:{tier}:{function}"
 
 
 def _tool_protocol_requested(
@@ -249,10 +389,27 @@ class IdeChatResponse:
     """IDE 端点的响应与所属客户端，调用方消费完流式内容后负责关闭。"""
     response: httpx.Response
     client: httpx.Client
+    release_slot: Optional[Callable[[], None]] = field(default=None, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     def close(self) -> None:
-        self.response.close()
-        self.client.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            release_slot = self.release_slot
+            self.release_slot = None
+        try:
+            self.response.close()
+        finally:
+            try:
+                self.client.close()
+            finally:
+                if release_slot is not None:
+                    release_slot()
 
 
 _current_device: Optional[DeviceInfo] = None
@@ -285,6 +442,56 @@ def convert_model_name(model: str) -> str:
     return _ALIAS_LOOKUP.get(m) or _UPSTREAM_MODEL_CASE.get(m) or model
 
 
+async def _resolve_request_model_name(
+    model: str,
+    *,
+    token: str = "",
+    user_id: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Resolve a public model id to the exact upstream config spelling.
+
+    ``/v1/models`` exposes a lower-case alias for every mixed-case config, but
+    Trae's native gateways match ``config_name`` case-sensitively.  A caller
+    can therefore send a lower-case id before it has fetched the model list and
+    receive a misleading ``4001 param invalid`` response.  Known aliases are
+    resolved locally; only an unknown all-lowercase id pays for one bound
+    account catalog lookup.
+    """
+
+    requested = str(model or "").strip()
+    if not requested:
+        return requested
+    mapped = convert_model_name(requested)
+    normalized = requested.lower()
+    # Built-in aliases and a previously learned live mapping are safe without
+    # another network round trip.  Mixed-case input is already exact.
+    if normalized in _ALIAS_LOOKUP or normalized in _UPSTREAM_MODEL_CASE:
+        return mapped
+    if requested != normalized:
+        return mapped
+
+    try:
+        config = await resolve_model_config(
+            requested,
+            token_override=token,
+            user_id_override=user_id,
+            provider_specific=provider_specific,
+        )
+    except Exception as exc:
+        logger.debug("trae-client: lower-case model lookup failed for %s: %s", requested, exc)
+        return mapped
+    exact = str(
+        (config or {}).get("config_name")
+        or (config or {}).get("name")
+        or ""
+    ).strip()
+    if exact:
+        _UPSTREAM_MODEL_CASE[normalized] = exact
+        return exact
+    return mapped
+
+
 def is_model_supported(model: str) -> bool:
     """中转站保持透传：未知模型也交给上游判断，避免新模型上线后需要改代码。"""
     return True
@@ -315,7 +522,14 @@ def _content_to_text(content: Any) -> str:
                     # Trae's renderer stores text/tool_result payloads under
                     # ``value`` instead of ``text``/``content``.
                     text = renderer_block_text(c)
-                parts.append(text or "")
+                if text:
+                    parts.append(text)
+                    continue
+                if images.is_image_part(c) or str(c.get("type") or "") == "image":
+                    block = images.to_renderer_block(c)
+                    parts.append(images.describe(block) if block else "[image omitted]")
+                    continue
+                parts.append("")
             elif isinstance(c, str):
                 parts.append(c)
         return "\n".join(parts)
@@ -729,18 +943,90 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
     This is needed because req_source=2 returns ALL packs (same as req_source=0),
     not just work-specific packs.
     """
+    # ``solo_agent_parallel_limit`` is an account entitlement, not a relay
+    # default.  Keep parsing it alongside credits so the account scheduler can
+    # use the same snapshot that the desktop client uses.  Older responses may
+    # put the quota below ``product_extra.subscription_extra``.
+    data = data if isinstance(data, dict) else {}
     packs = data.get("user_entitlement_pack_list") or []
     total_limit = Decimal(0)
     used = Decimal(0)
     unlimited = False
+    parallel_limits: list[int] = []
+    entitlement_packs: list[dict[str, Any]] = []
+
+    def _number(value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            value = int(Decimal(str(value).strip()))
+        except (InvalidOperation, ValueError, TypeError, AttributeError):
+            return None
+        return value if value >= 1 else None
+
+    def _inactive(status: Any) -> bool:
+        # Keep unknown status values: some API versions use numeric enums that
+        # are not present in the desktop bundle.  Only clearly terminal states
+        # are excluded from the active entitlement calculation.
+        text = str(status or "").strip().lower()
+        # Canceled (3) can retain benefits until the paid period ends.
+        return text in {"expired", "terminated", "inactive", "4", "5"}
+
+    def _pay_identity() -> tuple[Any, str]:
+        raw_identity = data.get("user_pay_identity")
+        if raw_identity is None:
+            raw_identity = data.get("userPayIdentity")
+        text_identity = data.get("user_pay_identity_str")
+        if text_identity is None:
+            text_identity = data.get("userPayIdentityText")
+        # A few gateway revisions wrap the commercial status.
+        status = data.get("pay_status") or data.get("payStatus") or data.get("commercial_pay_status")
+        if isinstance(status, dict):
+            if raw_identity is None:
+                raw_identity = status.get("user_pay_identity", status.get("userPayIdentity"))
+            if text_identity is None:
+                text_identity = status.get("user_pay_identity_str", status.get("userPayIdentityText"))
+        return raw_identity, str(text_identity or "").strip()
+
+    pay_identity, pay_identity_text = _pay_identity()
     for pack in packs:
+        if not isinstance(pack, dict):
+            continue
         bi = pack.get("entitlement_base_info") or {}
+        if not isinstance(bi, dict):
+            bi = {}
         ae = bi.get("available_endpoint", -1)
         # If filtering by endpoint, skip packs that don't match
         if available_endpoint_filter is not None and ae != available_endpoint_filter:
             continue
         usage = pack.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
         quota = bi.get("quota") or {}
+        if not isinstance(quota, dict):
+            quota = {}
+        if not quota:
+            extra = bi.get("product_extra") or {}
+            if isinstance(extra, dict):
+                subscription = extra.get("subscription_extra") or {}
+                if isinstance(subscription, dict):
+                    quota = subscription.get("quota") or {}
+                    if not isinstance(quota, dict):
+                        quota = {}
+        if not _inactive(pack.get("status")):
+            parallel = _number(quota.get("solo_agent_parallel_limit"))
+            if parallel is not None:
+                parallel_limits.append(parallel)
+            entitlement_packs.append(
+                {
+                    "entitlement_id": bi.get("entitlement_id"),
+                    "product_id": bi.get("product_id"),
+                    "product_type": bi.get("product_type"),
+                    "source_id": pack.get("source_id"),
+                    "status": pack.get("status"),
+                    "solo_agent_parallel_limit": parallel,
+                }
+            )
         limit = _credit_decimal(quota.get("credits_limit"))
         if limit is None:
             continue  # skip feature-only packs (product_type=0)
@@ -752,6 +1038,10 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
         if amount >= 0:
             used += amount
     remaining = None if unlimited else max(total_limit - used, Decimal(0))
+    # The service can expose several active packs (for example a base plan and
+    # an add-on).  The effective concurrent-session entitlement is the largest
+    # active value; there is no reliable plan-name -> fixed-number table.
+    parallel_limit = max(parallel_limits) if parallel_limits else None
     return {
         "total_limit": -1 if unlimited else _json_credit_number(total_limit),
         "used": _json_credit_number(used),
@@ -759,6 +1049,15 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
         "unlimited": unlimited,
         "is_credits_billing": bool(data.get("is_credits_billing")),
         "packs": len(packs),
+        "user_pay_identity": pay_identity,
+        "user_pay_identity_str": pay_identity_text,
+        "pay_identity": pay_identity,
+        "pay_identity_str": pay_identity_text,
+        "account_tier": pay_identity_text or (str(pay_identity) if pay_identity is not None else ""),
+        "solo_agent_parallel_limit": parallel_limit,
+        "model_parallel_limit": parallel_limit,
+        "entitlement_packs": entitlement_packs,
+        "entitlement_updated_at": time.time(),
     }
 
 
@@ -929,6 +1228,17 @@ def build_web_headers(
 REMOTE_BASE_DEFAULT = "https://trae-api-cn.mchost.guru/api/remote/v1"
 
 
+def _is_trae_remote_host(hostname: Optional[str]) -> bool:
+    host = str(hostname or "").strip().lower().rstrip(".")
+    return (
+        host == "mchost.guru"
+        or host.endswith(".mchost.guru")
+        or host == "core-normal.trae.cn"
+        or host == "trae.ai"
+        or host.endswith(".trae.ai")
+    )
+
+
 def remote_base_url() -> str:
     """Return the Web/Remote base, repairing a host-only legacy value.
 
@@ -938,18 +1248,25 @@ def remote_base_url() -> str:
     the canonical path for known Trae hosts and preserve custom gateways.
     """
 
-    value = str(os.environ.get("TRAE_WEB_BASE_URL") or REMOTE_BASE_DEFAULT).strip().rstrip("/")
+    value = str(os.environ.get("TRAE_WEB_BASE_URL") or REMOTE_BASE_DEFAULT).strip()
     if not value:
         return REMOTE_BASE_DEFAULT
-    lowered = value.lower()
-    if "/api/remote/" in lowered:
-        return value
-    if any(
-        host in lowered
-        for host in ("mchost.guru", "core-normal.trae.cn", "trae.ai")
-    ):
-        return value + "/api/remote/v1"
-    return value
+    try:
+        parsed = urlsplit(value)
+        path = (parsed.path or "").rstrip("/")
+    except ValueError:
+        return value.rstrip("/")
+    if path.startswith("/api/remote/") or not _is_trae_remote_host(parsed.hostname):
+        return value.rstrip("/")
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            path + "/api/remote/v1",
+            parsed.query,
+            parsed.fragment,
+        )
+    )
 
 
 def web_origin() -> str:
@@ -1031,6 +1348,52 @@ def flatten_query(messages: list[dict]) -> str:
     return json.dumps([{"type": "text", "data": {"content": text}}], ensure_ascii=False)
 
 
+def flatten_query_parts(messages: list[dict]) -> str:
+    """Flatten history to Trae ``query`` parts, keeping image attachments.
+
+    The plain text form above is the historical shape.  When the caller
+    attached images, the remote executor accepts the same renderer media
+    payload the native transports use, so the attachment reaches a multimodal
+    model instead of being described as text and then dropped.
+    """
+
+    media = images.query_parts(messages)
+    if not media:
+        return flatten_query(messages)
+    text = flatten_query(messages)
+    try:
+        text_parts = json.loads(text)
+    except Exception:
+        text_parts = []
+    if not isinstance(text_parts, list):
+        text_parts = []
+    # Text history first so the model reads the conversation, then the media
+    # payloads in the order the caller attached them.
+    return json.dumps([*text_parts, *media], ensure_ascii=False)
+
+
+def _web_image_items(content: Any) -> list[dict]:
+    """Return renderer media parts for the images in one message's content.
+
+    The remote ``content`` array is the structured half of the session body
+    (``query`` is the flattened text half), so an image belongs here as a
+    native renderer block instead of being flattened into the query string.
+    """
+
+    if not isinstance(content, list):
+        return []
+    items: list[dict] = []
+    for part in content:
+        if not isinstance(part, Mapping):
+            continue
+        if not images.is_image_part(part) and str(part.get("type") or "") != "image":
+            continue
+        converted = images.to_renderer_block(part)
+        if converted:
+            items.append(converted)
+    return items
+
+
 def build_web_content(messages: list[dict]) -> list[dict]:
     """Build a structured content array from OpenAI messages for the web remote endpoint.
 
@@ -1048,6 +1411,11 @@ def build_web_content(messages: list[dict]) -> list[dict]:
                 if candidate not in (None, "", [], {}):
                     content = candidate
                     break
+        image_items = _web_image_items(content)
+        if image_items:
+            # Media travels as its own renderer part; the flattened ``query``
+            # only carries the text half of the same turn.
+            items.extend(image_items)
         tool_calls = m.get("tool_calls")
         renderer_results = raw_client._renderer_tool_result_blocks(content)
         if role == "assistant" and not tool_calls:
@@ -1174,28 +1542,125 @@ def _web_account_key() -> str:
     return uid or (auth.get_token()[:16] or "default")
 
 
+def model_request_parallel_limit() -> int:
+    """Return the shared capacity setting for model and native tool streams."""
+
+    return _WEB_PARALLEL_LIMIT
+
+
 def _web_slot(account_id: str = "") -> asyncio.Semaphore:
     key = account_id or _web_account_key()
     sem = _WEB_SLOTS.get(key)
     if sem is None:
-        sem = asyncio.Semaphore(_WEB_PARALLEL_LIMIT)
+        sem = asyncio.Semaphore(model_request_parallel_limit())
         _WEB_SLOTS[key] = sem
     return sem
 
 
 def web_slot_available(account_id: str = "") -> bool:
+    account_id = str(account_id or "")
+    if _uses_entitlement_slot(account_id):
+        account_id = _entitlement_slot_key(account_id)
+        snapshot = auth.account_capacity_snapshot(account_id)
+        return snapshot.get("available", 0) > 0
     return not _web_slot(account_id).locked()
 
 
-async def acquire_web_slot(account_id: str = "", timeout: float = 60.0) -> None:
+async def acquire_web_slot(
+    account_id: str = "",
+    timeout: float = 60.0,
+    reservation_id: str = "",
+) -> str:
+    """Acquire capacity and return an opaque lease token for teardown.
+
+    Persisted accounts require the returned token when releasing the slot.
+    Legacy semaphore-backed identities return an empty token.
+    """
+    account_id = str(account_id or "")
+    if _uses_entitlement_slot(account_id):
+        account_id = _entitlement_slot_key(account_id)
+        # ``auth.reserve_model_account`` may have selected and reserved this
+        # account before the transport was built.  Transfer that reservation
+        # instead of incrementing the live count a second time.
+        # A reservation id is part of the request lease.  Never consume an
+        # arbitrary reservation when a direct/legacy caller omitted it: doing
+        # so could transfer another in-flight request's slot to this one.
+        if reservation_id and auth.consume_account_slot_reservation(
+            account_id, reservation_id
+        ):
+            lease_token = str(reservation_id)
+            with _ACCOUNT_SLOT_RESERVATIONS_LOCK:
+                _ACCOUNT_SLOT_RESERVATIONS[account_id] = (
+                    _ACCOUNT_SLOT_RESERVATIONS.get(account_id, 0) + 1
+                )
+                _ACCOUNT_SLOT_LEASE_OWNERS[lease_token] = (
+                    account_id,
+                    _current_task_id(),
+                )
+            return lease_token
+        # A retry may have rebound the request to a different account before
+        # the first transport consumed its scheduler reservation.  Remove that
+        # exact old reservation before allocating a fresh slot; otherwise the
+        # old account remains permanently occupied.
+        if reservation_id:
+            auth.cancel_account_slot_reservation("", reservation_id)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if auth.try_reserve_account_slot(account_id):
+                lease_token = uuid.uuid4().hex
+                with _ACCOUNT_SLOT_RESERVATIONS_LOCK:
+                    _ACCOUNT_SLOT_RESERVATIONS[account_id] = (
+                        _ACCOUNT_SLOT_RESERVATIONS.get(account_id, 0) + 1
+                    )
+                    _ACCOUNT_SLOT_LEASE_OWNERS[lease_token] = (
+                        account_id,
+                        _current_task_id(),
+                    )
+                return lease_token
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Trae account session slot busy: parallel limit reached")
+            await asyncio.sleep(min(0.025, remaining))
+    if reservation_id:
+        # Unknown-account compatibility paths cannot transfer an entitlement
+        # reservation, but they still must not leak one supplied by a bound
+        # request.
+        auth.cancel_account_slot_reservation("", reservation_id)
     sem = _web_slot(account_id)
     try:
         await asyncio.wait_for(sem.acquire(), timeout=timeout)
     except asyncio.TimeoutError:
         raise RuntimeError("Trae web session slot busy: parallel limit reached")
+    return ""
 
 
-def release_web_slot(account_id: str = "") -> None:
+def release_web_slot(account_id: str = "", lease_token: str = "") -> None:
+    account_id = str(account_id or "")
+    entitlement_slot = _uses_entitlement_slot(account_id)
+    if entitlement_slot:
+        account_id = _entitlement_slot_key(account_id)
+        lease_token = str(
+            lease_token
+            or _ACCOUNT_SLOT_RELEASE_TOKEN.get()
+            or _owned_slot_token(account_id)
+            or ""
+        )
+        owned_account_slot = False
+        with _ACCOUNT_SLOT_RESERVATIONS_LOCK:
+            owner = _ACCOUNT_SLOT_LEASE_OWNERS.get(lease_token)
+            if owner is not None and owner[0] == account_id:
+                owned_account_slot = True
+                _ACCOUNT_SLOT_LEASE_OWNERS.pop(lease_token, None)
+                count = _ACCOUNT_SLOT_RESERVATIONS.get(account_id, 0)
+                if count == 1:
+                    _ACCOUNT_SLOT_RESERVATIONS.pop(account_id, None)
+                elif count > 1:
+                    _ACCOUNT_SLOT_RESERVATIONS[account_id] = count - 1
+        if owned_account_slot:
+            auth.release_account_slot(account_id)
+        # A known account must never fall through to a legacy semaphore or
+        # release a different request's aggregate counter.
+        return
     _web_slot(account_id).release()
 
 
@@ -1206,6 +1671,7 @@ def register_web_lease(
     client: httpx.AsyncClient,
     token: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
+    slot_lease_token: str = "",
 ) -> None:
     _WEB_LEASES[session_id] = {
         "account_id": account_id,
@@ -1214,6 +1680,7 @@ def register_web_lease(
         "client": client,
         "token": token,
         "provider_specific": dict(provider_specific or {}),
+        "slot_lease_token": str(slot_lease_token or ""),
         "last_activity": time.monotonic(),
     }
 
@@ -1288,7 +1755,9 @@ async def reap_idle_web_sessions() -> int:
                     except Exception:
                         pass
             finally:
-                release_web_slot(lease["account_id"])
+                release_web_slot_owned(
+                    lease["account_id"], lease.get("slot_lease_token") or ""
+                )
 
     count = 0
     for lease in idle_web_leases():
@@ -1327,7 +1796,7 @@ async def reap_idle_web_sessions() -> int:
 
 
 
-def _build_web_model_config(raw: dict) -> dict:
+def _build_web_model_config(raw: dict, raw_chat_function: str = "") -> dict:
     """Keep the model object the web frontend would send as custom_model."""
     cfg = dict(raw)
     features = cfg.get("features")
@@ -1336,15 +1805,51 @@ def _build_web_model_config(raw: dict) -> dict:
             cfg["features"] = json.loads(features)
         except Exception:
             cfg["features"] = {}
-    name = cfg.get("name") or ""
-    cfg["config_name"] = cfg.get("config_name") or name
+    reasoning_config = cfg.get("reasoning_effort_config")
+    if isinstance(reasoning_config, str):
+        try:
+            parsed_reasoning = json.loads(reasoning_config)
+        except (TypeError, ValueError):
+            parsed_reasoning = None
+        if isinstance(parsed_reasoning, Mapping):
+            cfg["reasoning_effort_config"] = dict(parsed_reasoning)
+    # Some catalog revisions use ``name`` for the display label while
+    # carrying the exact wire identifier in ``config_name`` or
+    # ``model_name``.  Preserve the raw fields, but always materialize the
+    # canonical identifiers so callers can resolve a lower-case public id
+    # without first loading /v1/models.
+    name = str(cfg.get("name") or "").strip()
+    config_name = (
+        cfg.get("config_name")
+        or cfg.get("configName")
+        or name
+        or cfg.get("model_name")
+        or cfg.get("modelName")
+        or ""
+    )
+    cfg["config_name"] = str(config_name).strip()
     # The CN model-list response uses ``name`` as the config identifier.  The
     # remote executor also accepts/records ``model_name``; keeping both makes
     # the selected model explicit instead of allowing a default fallback.
-    cfg["model_name"] = cfg.get("model_name") or name
+    cfg["model_name"] = (
+        cfg.get("model_name")
+        or cfg.get("modelName")
+        or cfg["config_name"]
+        or name
+    )
     cfg["config_source"] = cfg.get("config_source") or 1
     cfg["provider"] = cfg.get("provider") or ""
-    cfg["multimodal"] = bool(cfg.get("multimodal"))
+    # Capability flags are evidence from the live catalog, not defaults.  In
+    # particular, ``multimodal: null`` and a missing field must remain
+    # unknown; coercing either to False loses the distinction between a
+    # text-only model and a catalog revision that did not expose the flag.
+    if raw_chat_function and not cfg.get("raw_chat_function"):
+        cfg["raw_chat_function"] = str(raw_chat_function)
+    multimodal = descriptor_multimodal(cfg)
+    if multimodal is not None:
+        cfg["multimodal"] = multimodal
+    elif "multimodal" in cfg and cfg.get("multimodal") is None:
+        cfg.pop("multimodal", None)
     cfg["ak"] = cfg.get("ak") or ""
     cfg["sk"] = cfg.get("sk") or ""
     cfg["base_url"] = cfg.get("base_url") or ""
@@ -1353,10 +1858,36 @@ def _build_web_model_config(raw: dict) -> dict:
     return cfg
 
 
+def _descriptor_capabilities(descriptor: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only capabilities proven by this exact Trae descriptor."""
+
+    capabilities: dict[str, Any] = {}
+    multimodal = descriptor_multimodal(descriptor)
+    if multimodal is not None:
+        capabilities["multimodal"] = multimodal
+
+    reasoning = descriptor_reasoning_config(descriptor)
+    if reasoning is not None:
+        support_thinking = reasoning.get("support_thinking")
+        if support_thinking is False:
+            capabilities["reasoning_effort"] = []
+        elif support_thinking is True and "options" in reasoning:
+            capabilities["reasoning_effort"] = supported_levels(descriptor)
+
+    max_mode = descriptor.get("max_mode")
+    if max_mode is False:
+        capabilities["max_mode"] = False
+    elif max_mode is True and descriptor_supports_max_mode(descriptor):
+        capabilities["max_mode"] = True
+        capabilities["max_context"] = descriptor_max_context(descriptor)
+    return capabilities
+
+
 async def _fetch_web_model_configs(
     token_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
+    raw_chat_function: str = "",
 ) -> dict[str, dict]:
     """Fetch the same model list used by the Trae web client."""
     base = remote_base_url()
@@ -1383,15 +1914,100 @@ async def _fetch_web_model_configs(
         return {}
     out: dict[str, dict] = {}
 
+    def _catalog_endpoint(function: str) -> str:
+        """Map a Trae catalog function to the public endpoint identity."""
+
+        function = str(function or "").strip().lower()
+        if "work" in function:
+            return "work"
+        if "agent" in function:
+            return "remote"
+        if "design" in function:
+            return "solo"
+        return "remote"
+
     def _ingest_models(group: Mapping[str, Any]) -> None:
         if not isinstance(group, Mapping):
             return
+        endpoint = _catalog_endpoint(_group_function(group))
+        group_function = _group_function(group)
         for raw in group.get("models", []):
             if not isinstance(raw, Mapping):
                 continue
-            name = (raw.get("name") or "").strip()
-            if name and name not in out:
-                out[name] = _build_web_model_config(raw)
+            entry_function = str(
+                raw.get("raw_chat_function")
+                or raw.get("rawChatFunction")
+                or group.get("raw_chat_function")
+                or requested_function
+                or group_function
+                or ""
+            ).strip()
+            if requested_function:
+                raw_function_value = str(
+                    raw.get("raw_chat_function")
+                    or raw.get("rawChatFunction")
+                    or group.get("raw_chat_function")
+                    or ""
+                ).strip().lower()
+                if raw_function_value:
+                    if raw_function_value != requested_function:
+                        continue
+                elif group_function != requested_function:
+                    # A descriptor with no function evidence cannot be
+                    # borrowed for a different requested function.
+                    continue
+            # ``name`` is the config id in current responses, but older
+            # payloads used it for a display label and supplied the exact
+            # request id in ``config_name``.  Index by the canonical config
+            # id so a caller using the documented lower-case id can resolve
+            # it even before get_models() has populated the case map.
+            raw_name = str(raw.get("name") or "").strip()
+            name = str(
+                raw.get("config_name")
+                or raw.get("configName")
+                or raw_name
+                or raw.get("model_name")
+                or raw.get("modelName")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            config = _build_web_model_config(raw, entry_function)
+            config["_trae_agent_type"] = group_function
+            # Prefer the descriptor's exact raw function.  A single product
+            # group can carry multiple functions (for example chat_v3 and
+            # solo_agent); collapsing them to the group would leak one
+            # function's capabilities into the other.
+            scope = entry_function or group_function
+            if scope:
+                config["_trae_capabilities_by_scope"] = {
+                    scope: _descriptor_capabilities(config)
+                }
+            if name not in out:
+                config["_trae_endpoints"] = [endpoint]
+                out[name] = config
+                continue
+            # The same config can be enabled in Agent and Work catalogs. Keep
+            # the preferred config payload selected above, but retain every
+            # endpoint where the account advertises it for /v1/models.
+            current = out[name]
+            # Preserve the first descriptor's capability values, but retain
+            # the exact function/tier that produced it for diagnostics and
+            # downstream request binding.
+            current.setdefault("raw_chat_function", entry_function)
+            current.setdefault("_trae_agent_type", group_function)
+            current_scopes = current.setdefault("_trae_capabilities_by_scope", {})
+            incoming_scopes = config.get("_trae_capabilities_by_scope")
+            if isinstance(current_scopes, dict) and isinstance(incoming_scopes, Mapping):
+                for scope_name, capabilities in incoming_scopes.items():
+                    if isinstance(capabilities, Mapping):
+                        current_scopes[str(scope_name)] = dict(capabilities)
+            endpoints = current.get("_trae_endpoints")
+            if not isinstance(endpoints, list):
+                endpoints = []
+                current["_trae_endpoints"] = endpoints
+            if endpoint not in endpoints:
+                endpoints.append(endpoint)
 
     def _group_function(group: Mapping[str, Any]) -> str:
         if not isinstance(group, Mapping):
@@ -1401,6 +2017,7 @@ async def _fetch_web_model_configs(
 
     groups = data.get("data", {}).get("list", [])
     requested = str(agent_type or "").strip().lower()
+    requested_function = str(raw_chat_function or "").strip().lower()
     # Keep each agent tier separate.  Agent carries the 1M profile while Work
     # remains the 200K fallback; selecting by tier must not reuse the Agent
     # config from the account cache.
@@ -1425,11 +2042,31 @@ async def _fetch_web_model_configs(
         agent_remote = [g for g in groups if _group_function(g) == "solo_agent_remote"]
         agent_lite = [g for g in groups if _group_function(g) == "solo_agent_lite"]
         preferred = agent_remote + agent_lite
+    # A raw function can be more specific than the product tier (for example
+    # ``chat_v3`` and ``solo_agent`` can both be advertised by Agent).  Keep
+    # only groups carrying that exact function when the caller supplied one;
+    # never borrow a same-name model from another function.
+    if requested_function:
+        function_groups = [
+            g for g in preferred
+            if _group_function(g) == requested_function
+            or str(g.get("raw_chat_function") or "").strip().lower() == requested_function
+        ]
+        if function_groups:
+            preferred = function_groups
+        elif requested:
+            # The endpoint may return one tier group whose individual model
+            # entries carry raw_chat_function.  Ingest it and filter entries
+            # below rather than silently selecting an unrelated function.
+            pass
+        # With no explicit tier, the preferred Agent groups may likewise
+        # contain per-model raw function labels.  Keep them for _ingest_models
+        # to filter instead of returning an unscoped model.
     for group in preferred:
         _ingest_models(group)
     # For the default Agent lookup, preserve the historical fallback to Work;
     # an explicit Work lookup must stay in the Work tier.
-    if not requested:
+    if not requested and not requested_function:
         for group in groups:
             _ingest_models(group)
     return out
@@ -1438,6 +2075,8 @@ async def _fetch_web_model_configs(
 async def _fetch_solo_model_configs(
     token_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
+    user_id_override: str = "",
+    raw_chat_function: str = "solo_work_lite",
 ) -> dict[str, dict]:
     """Fetch the native Solo catalog from ``get_detail_param``.
 
@@ -1452,8 +2091,11 @@ async def _fetch_solo_model_configs(
         return {}
     base = _model_gateway_base()
     url = f"{base}/api/ide/v1/get_detail_param"
+    requested_function = (
+        str(raw_chat_function or "solo_work_lite").strip() or "solo_work_lite"
+    )
     body = {
-        "function": "solo_work_lite",
+        "function": requested_function,
         "config_names": None,
         "need_prompt": False,
         "current_config_info": None,
@@ -1461,7 +2103,13 @@ async def _fetch_solo_model_configs(
         "mode_type": None,
         "agent_type": None,
     }
-    headers = build_headers(token_override=token)
+    # The native catalog is bound to the same user identity as the model
+    # request.  Calling build_headers without the account user id can produce
+    # a valid HTTP request that returns an empty catalog for a rotated account.
+    headers = build_headers(
+        token_override=token,
+        user_id_override=str(user_id_override or ""),
+    )
     headers.update(
         {
             "Accept": "application/json",
@@ -1535,17 +2183,229 @@ async def _fetch_solo_model_configs(
         normalized = dict(raw)
         normalized["name"] = config_name
         normalized["config_name"] = config_name
-        normalized["model_name"] = normalized.get("model_name") or config_name
+        normalized["raw_chat_function"] = str(
+            normalized.get("raw_chat_function") or requested_function
+        )
+        # ``model_name`` is the upstream provider id, not always the config
+        # name.  The native gateway returns the exact id in
+        # ``model_detail_list`` (for example ``glm-5__dev`` or
+        # ``custom_model_claude__max``).  Keep the complete list for the
+        # request resolver and choose the development profile as the default.
+        details = raw.get("model_detail_list")
+        details = (
+            [dict(item) for item in details if isinstance(item, Mapping)]
+            if isinstance(details, list)
+            else []
+        )
+        normalized["_traecode_model_detail_list"] = details
+        default_detail = next(
+            (
+                item
+                for item in details
+                if str(item.get("model_name") or "").strip().lower().endswith("__dev")
+            ),
+            next((item for item in details if item.get("model_name")), None),
+        )
+        normalized["model_name"] = (
+            normalized.get("model_name")
+            or (default_detail or {}).get("model_name")
+            or config_name
+        )
         normalized["display_name"] = (
             normalized.get("display_name")
             or display_config.get("display_name")
             or config_name
         )
-        normalized["max_mode"] = bool(
-            normalized.get("max_mode") or display_config.get("max_mode")
-        )
-        out[config_name] = _build_web_model_config(normalized)
+        if normalized.get("max_mode") is None:
+            if display_config.get("max_mode") is not None:
+                normalized["max_mode"] = display_config.get("max_mode")
+            else:
+                normalized.pop("max_mode", None)
+        config = _build_web_model_config(normalized, requested_function)
+        config["_trae_raw_chat_function"] = requested_function
+        config["_trae_capabilities_by_scope"] = {
+            requested_function: _descriptor_capabilities(config)
+        }
+        # Native TraeCode's catalog is shared by the public IDE and Solo
+        # endpoint presets.  Keep both identities on the entry so discovery
+        # can group the model without duplicating the upstream config.
+        config["_trae_endpoints"] = ["solo", "ide"]
+        out[config_name] = config
     return out
+
+
+def _select_traecode_detail(
+    config: Mapping[str, Any],
+    *,
+    max_mode: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Select the exact provider model id from a TraeCode config entry."""
+
+    details = config.get("_traecode_model_detail_list")
+    if not isinstance(details, list):
+        details = config.get("model_detail_list")
+    candidates = [
+        dict(item)
+        for item in (details or [])
+        if isinstance(item, Mapping) and str(item.get("model_name") or "").strip()
+    ]
+    if not candidates:
+        return None
+    suffix = "__max" if max_mode else "__dev"
+    selected = next(
+        (
+            item
+            for item in candidates
+            if str(item.get("model_name") or "").strip().lower().endswith(suffix)
+        ),
+        None,
+    )
+    return selected or candidates[0]
+
+
+def _traecode_model_match(
+    configs: Mapping[str, Mapping[str, Any]],
+    model_name: str,
+) -> Optional[dict[str, Any]]:
+    """Find a config by exact name, display name, or known public alias."""
+
+    requested = str(model_name or "").strip()
+    lowered = requested.casefold()
+    for name, config in configs.items():
+        if any(
+            value.casefold() == lowered
+            for value in _model_descriptor_values(name, config)
+        ):
+            return dict(config)
+
+    # Remote exposes a few display aliases that the native catalog represents
+    # with a shorter config name.  Only use this compatibility mapping when
+    # the live catalog contains the target; never invent a provider id.
+    aliases = {
+        "glm-5.2": ("glm-5",),
+        "glm-5.1": ("glm-5",),
+        "deepseek-v4-pro": ("DeepSeek-V4-Pro",),
+        "deepseek-v4-flash": ("DeepSeek-V4-Flash",),
+    }
+    for candidate in aliases.get(lowered, ()):
+        for name, config in configs.items():
+            if any(
+                value.casefold() == candidate.casefold()
+                for value in _model_descriptor_values(name, config)
+            ):
+                return dict(config)
+    return None
+
+
+async def resolve_traecode_model_config(
+    model_name: str,
+    *,
+    token_override: str = "",
+    user_id_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+    max_mode: bool = False,
+    raw_chat_function: str = "solo_work_lite",
+) -> Optional[dict[str, Any]]:
+    """Resolve a TraeCode config and its exact function-ready model id.
+
+    The native IDE/Solo endpoint rejects TraeWork ids such as ``glm-5__v2``.
+    Its own catalog is authoritative and returns the provider id in
+    ``model_detail_list``.  This helper deliberately leaves the selected
+    The catalog is function-scoped: the same public model can expose different
+    image, reasoning, and context capabilities in ``chat_v3``, ``solo_agent``
+    and Work.  Query the exact function selected for this request.
+    """
+
+    token = str(token_override or auth.get_token() or "").strip()
+    if not token:
+        return None
+    solo_kwargs: dict[str, Any] = {
+        "token_override": token,
+        "provider_specific": provider_specific,
+        "user_id_override": str(user_id_override or ""),
+        "raw_chat_function": raw_chat_function,
+    }
+    try:
+        configs = await _fetch_solo_model_configs(**solo_kwargs)
+    except TypeError as exc:
+        # Keep compatibility with integrations that monkeypatch the old
+        # three-argument probe while the production resolver uses the scoped
+        # function parameter.
+        if "raw_chat_function" not in str(exc):
+            raise
+        solo_kwargs.pop("raw_chat_function", None)
+        configs = await _fetch_solo_model_configs(**solo_kwargs)
+    config = _traecode_model_match(configs, model_name)
+    if not config:
+        return None
+    detail = _select_traecode_detail(config, max_mode=max_mode)
+    selected_model = str(
+        (detail or {}).get("model_name")
+        or config.get("model_name")
+        or config.get("config_name")
+        or config.get("name")
+        or ""
+    ).strip()
+    config_name = str(
+        config.get("config_name")
+        or config.get("name")
+        or model_name
+    ).strip()
+    if not selected_model or not config_name:
+        return None
+    result = dict(config)
+    result["config_name"] = config_name
+    result["name"] = config_name
+    result["model_name"] = selected_model
+    result["raw_model_name"] = selected_model
+    result["display_name"] = str(
+        config.get("display_name")
+        or config.get("display_model_name")
+        or config_name
+    )
+    result["raw_chat_function"] = str(
+        result.get("raw_chat_function") or raw_chat_function or ""
+    )
+    return result
+
+
+def _model_descriptor_values(
+    key: Any, candidate: Any
+) -> tuple[str, ...]:
+    """Return all public and wire spellings carried by one model entry.
+
+    Trae has shipped catalog payloads where ``name`` is a UI label and
+    ``config_name``/``model_name`` is the value required by the request body.
+    Matching only the mapping key or display label makes a lower-case API
+    request fail until another endpoint happens to warm the case map.  Keep
+    the matching logic centralized and case-insensitive while preserving the
+    exact value in the returned config.
+    """
+
+    values: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text.casefold() not in {item.casefold() for item in values}:
+            values.append(text)
+
+    add(key)
+    if isinstance(candidate, Mapping):
+        for field in (
+            "config_name",
+            "configName",
+            "model_name",
+            "modelName",
+            "raw_model_name",
+            "rawModelName",
+            "name",
+            "display_name",
+            "displayName",
+            "display_model_name",
+            "displayModelName",
+        ):
+            add(candidate.get(field))
+    return tuple(values)
 
 
 async def _get_web_custom_model(
@@ -1555,6 +2415,7 @@ async def _get_web_custom_model(
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
+    raw_chat_function: str = "",
 ) -> Optional[dict]:
     """Return custom_model for a manual web model selection.
 
@@ -1566,7 +2427,12 @@ async def _get_web_custom_model(
     if not model_name:
         return None
     token = token_override or auth.get_token()
-    account_key = _web_model_cache_key(token, user_id_override) + ":" + str(agent_type or "default")
+    account_key = _model_catalog_cache_key(
+        token,
+        user_id_override,
+        agent_type=agent_type,
+        raw_chat_function=raw_chat_function,
+    )
     now = time.time()
     cached = _WEB_MODEL_CACHE.get(account_key)
     if not cached or now - cached[0] > _WEB_MODEL_CACHE_TTL:
@@ -1575,46 +2441,58 @@ async def _get_web_custom_model(
             fetch_kwargs["provider_specific"] = provider_specific
         if agent_type:
             fetch_kwargs["agent_type"] = agent_type
+        if raw_chat_function:
+            fetch_kwargs["raw_chat_function"] = raw_chat_function
         configs = await _fetch_web_model_configs(token, **fetch_kwargs)
         # Only pay the extra native-Solo lookup when the requested config is
         # absent from Remote. This keeps normal model resolution on the fast
         # path while allowing Solo-only models to be used through Remote.
-        lowered_model = str(model_name).strip().lower()
+        lowered_model = str(model_name).strip().casefold()
         found = any(
-            str(name).strip().lower() == lowered_model
-            or str(
-                (candidate or {}).get("display_name")
-                or (candidate or {}).get("display_model_name")
-                or ""
-            ).strip().lower()
-            == lowered_model
+            any(value.casefold() == lowered_model for value in _model_descriptor_values(name, candidate))
             for name, candidate in configs.items()
         )
         if not found and not agent_type:
-            solo_configs = await _fetch_solo_model_configs(token, **fetch_kwargs)
+            solo_kwargs: dict[str, Any] = {}
+            if provider_specific is not None:
+                solo_kwargs["provider_specific"] = provider_specific
+            if user_id_override:
+                solo_kwargs["user_id_override"] = user_id_override
+            if raw_chat_function:
+                solo_kwargs["raw_chat_function"] = raw_chat_function
+            solo_configs = await _fetch_solo_model_configs(token, **solo_kwargs)
             if isinstance(solo_configs, Mapping):
                 for name, config in solo_configs.items():
                     configs.setdefault(name, config)
-        cached = (now, configs)
-        _WEB_MODEL_CACHE[account_key] = cached
+        # Do not pin a transient upstream failure for the full model-cache
+        # TTL.  A failed catalog probe otherwise makes every subsequent
+        # lower-case request return ``None`` until the cache expires, even
+        # though the account/model is healthy on the next attempt.
+        if configs:
+            cached = (now, configs)
+            _WEB_MODEL_CACHE[account_key] = cached
+        else:
+            _WEB_MODEL_CACHE.pop(account_key, None)
+            cached = (now, {})
 
     configs = cached[1]
     cfg = configs.get(model_name)
     if cfg is not None:
         return cfg
 
-    lowered = model_name.lower()
+    lowered = model_name.casefold()
     for name, candidate in configs.items():
-        if name.lower() == lowered:
+        values = _model_descriptor_values(name, candidate)
+        if any(value.casefold() == lowered for value in values):
             return candidate
+    # A few desktop labels replace spaces with hyphens.  Keep this fallback
+    # deliberately narrow so unrelated models cannot be selected by a
+    # substring match.
+    normalized_requested = lowered.replace(" ", "-")
     for name, candidate in configs.items():
-        display = (candidate.get("display_name") or candidate.get("display_model_name") or "").strip()
-        if display and (display.lower() == lowered or display == model_name):
-            return candidate
-    for name, candidate in configs.items():
-        display = (candidate.get("display_name") or "").strip()
-        if display and lowered in (display.lower(), display.replace(" ", "-").lower()):
-            return candidate
+        for value in _model_descriptor_values(name, candidate):
+            if value.casefold().replace(" ", "-") == normalized_requested:
+                return candidate
 
     if lowered in ("mimo-v2.5", "mimo-v2.5-pro", "minimax-m25", "qwen36-35b"):
         return {
@@ -1625,7 +2503,6 @@ async def _get_web_custom_model(
             "display_name": model_name,
             "config_source": 3,
             "provider": "custom_openai_compatible",
-            "multimodal": lowered.startswith("mimo"),
             "is_preset": False,
             "use_remote_service": True,
             "ak": "", "sk": "", "base_url": "", "region": None, "auth_type": 0,
@@ -1641,6 +2518,7 @@ async def resolve_model_config(
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
+    raw_chat_function: str = "",
 ) -> Optional[dict]:
     """Resolve a public/display model label to Trae's exact config object."""
 
@@ -1652,7 +2530,62 @@ async def resolve_model_config(
         kwargs["provider_specific"] = provider_specific
     if agent_type:
         kwargs["agent_type"] = agent_type
+    if raw_chat_function:
+        kwargs["raw_chat_function"] = raw_chat_function
     return await _get_web_custom_model(model_name, **kwargs)
+
+
+async def get_scoped_model_configs(
+    *,
+    token_override: str = "",
+    user_id_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+    agent_type: str = "",
+    raw_chat_function: str = "",
+) -> dict[str, dict]:
+    """Return the live catalog for one account and executor function.
+
+    This is intentionally narrower than :func:`get_models`: callers making a
+    capability decision must not use the merged public model list as evidence
+    for a different account, tier, or raw function.
+    """
+
+    token = str(token_override or auth.get_token() or "").strip()
+    if not token:
+        return {}
+    cache_key = _model_catalog_cache_key(
+        token,
+        user_id_override,
+        agent_type=agent_type,
+        raw_chat_function=raw_chat_function,
+    )
+    now = time.time()
+    cached = _WEB_MODEL_CACHE.get(cache_key)
+    if cached and now - cached[0] <= _WEB_MODEL_CACHE_TTL:
+        return cached[1]
+
+    web_kwargs: dict[str, Any] = {
+        "token_override": token,
+        "agent_type": agent_type,
+        "raw_chat_function": raw_chat_function,
+    }
+    if provider_specific is not None:
+        web_kwargs["provider_specific"] = provider_specific
+    configs = await _fetch_web_model_configs(**web_kwargs)
+    if not configs and not agent_type:
+        solo_kwargs: dict[str, Any] = {
+            "token_override": token,
+            "user_id_override": user_id_override,
+            "raw_chat_function": raw_chat_function or "solo_work_lite",
+        }
+        if provider_specific is not None:
+            solo_kwargs["provider_specific"] = provider_specific
+        configs = await _fetch_solo_model_configs(**solo_kwargs)
+    if configs:
+        _WEB_MODEL_CACHE[cache_key] = (now, configs)
+    else:
+        _WEB_MODEL_CACHE.pop(cache_key, None)
+    return configs
 
 
 async def create_web_session(
@@ -1709,6 +2642,13 @@ async def create_web_session(
         }
         if agent_type != "solo_agent_remote" or requested_agent_type:
             lookup_kwargs["agent_type"] = agent_type
+        raw_function = str(
+            options.get("raw_chat_function")
+            or options.get("_traecode_raw_chat_function")
+            or agent_type
+        ).strip()
+        if raw_function:
+            lookup_kwargs["raw_chat_function"] = raw_function
         custom_model = await _get_web_custom_model(model_name, **lookup_kwargs)
         if custom_model:
             initial_message["custom_model"] = custom_model
@@ -1794,8 +2734,9 @@ def _ide_native_content(content: Any) -> Any:
         if isinstance(block, str):
             blocks.append({"type": "text", "text": block})
         elif isinstance(block, Mapping):
+            block_type = str(block.get("type") or "").strip().lower()
             converted = copy.deepcopy(dict(block))
-            if str(block.get("type") or "").lower() in {"text", "input_text"}:
+            if block_type in {"text", "input_text"}:
                 converted["type"] = "text"
                 text = block.get("text")
                 if not isinstance(text, str):
@@ -1804,6 +2745,14 @@ def _ide_native_content(content: Any) -> Any:
                     text if isinstance(text, str) else renderer_block_text(block)
                 )
                 converted.pop("value", None)
+            elif block_type == "image" and not converted.get("value"):
+                # Anthropic-style ``{"type":"image","source":{...}}`` blocks
+                # become the renderer media block the native transport reads.
+                # IDE/Solo accepts OpenAI ``image_url`` parts natively, so keep
+                # that caller-owned wrapper unchanged for this endpoint.
+                renderer_block = images.to_renderer_block(block)
+                if renderer_block:
+                    converted = renderer_block
             blocks.append(converted)
         else:
             blocks.append(copy.deepcopy(block))
@@ -1857,7 +2806,7 @@ def _ide_native_tool_calls(message: Mapping[str, Any]) -> list[dict]:
 def _convert_ide_native_messages(
     messages: list[dict], options: Optional[dict] = None
 ) -> list[dict]:
-    """Preserve caller-owned tool correlation on llm_utils_chat only."""
+    """Preserve caller-owned tool correlation for the legacy IDE adapter."""
 
     result: list[dict] = []
     prepared = sanitize_assistant_history_messages(
@@ -1955,7 +2904,7 @@ def build_llm_chat_body(
     max_tokens: Optional[int] = None,
     options: Optional[dict] = None,
 ) -> dict:
-    """构造 Trae SOLO ``llm_utils_chat`` 的原生请求体.
+    """构造 TraeWork 兼容适配器的原生请求体.
 
     The upstream endpoint is not an OpenAI-compatible ``inline_chat`` route.
     TraeWork rewrites the request to ``solo_work_lite`` and pins the selected
@@ -1999,7 +2948,7 @@ def build_work_agent_body(
 ) -> dict:
     """Build the legacy Work ``create_agent_task`` envelope.
 
-    Work does not use the plaintext ``llm_utils_chat`` body.  The public
+    Work does not use the TraeCode raw body.  The public
     client still owns tools, so the schemas are represented both in the
     runtime system message (for compatibility with older Work builds) and in
     the native ``tools`` field when supplied.
@@ -2271,7 +3220,17 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
         getattr(auth.get_auth(), "host", ""),
     )
 
-    model_name = convert_model_name(model)
+    provider_specific = bound_record.get("provider_specific") or bound_record.get(
+        "providerSpecificData"
+    )
+    model_name = await _resolve_request_model_name(
+        model,
+        token=bound_token,
+        user_id=bound_user_id,
+        provider_specific=(
+            dict(provider_specific) if isinstance(provider_specific, Mapping) else None
+        ),
+    )
     max_tokens = options.get("maxTokens") or options.get("max_tokens")
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     errors: list[str] = []
@@ -2280,111 +3239,249 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
     if requested_endpoint and requested_endpoint not in IDE_ENDPOINTS:
         raise ValueError(f"Unsupported IDE endpoint: {requested_endpoint}")
     endpoints = [requested_endpoint] if requested_endpoint else IDE_ENDPOINTS
-    for endpoint in endpoints:
-        endpoint_headers = build_headers(
-            token_override=bound_token,
-            user_id_override=bound_user_id,
-        )
-        # Match TraeWork's SOLO headers for llm_utils_chat/ide-v1.  The
-        # account OAuth host and the old IDE version headers are accepted by
-        # some endpoints but produce a generic "param is invalid" response on
-        # the current gateway.
-        endpoint_headers.update(
-            {
-                "x-app-version": "default",
-                "x-app-version-code": SOLO_GATEWAY_VERSION_CODE,
-                "x-ide-version": SOLO_GATEWAY_VERSION,
-                "x-ide-version-code": SOLO_GATEWAY_VERSION_CODE,
-                "x-ide-version-type": "stable",
-                "x-device-brand": SOLO_DEVICE_BRAND,
-                "x-device-type": SOLO_DEVICE_TYPE,
-                "x-device-platform": SOLO_PLATFORM,
-                "x-version-code": SOLO_GATEWAY_VERSION_CODE,
-                "x-os-version": SOLO_OS_VERSION,
-                # These CN/SOLO routing headers are present on the native
-                # Trae client requests.  They are deliberately kept
-                # configurable because account snapshots may come from a
-                # different desktop build, while the defaults match the
-                # current Trae CN stable client.
-                "package-type": SOLO_PACKAGE_TYPE,
-                "x-lscbd-aid": SOLO_LSCBD_AID,
-                "x-lscbd-platform": SOLO_PLATFORM,
-                "x-ss-dp": SOLO_LSCBD_AID,
-                "x-plugin-channel": "icube-ai",
-                "app-version": SOLO_GATEWAY_VERSION,
-                "x-bridge-transport": "aha",
-                "x-ahanet-timeout": "86400",
-                "x-lgw-req-sdk-type": "3",
-                "x-net-sdk-domain-dispatch": "1",
-                "x-ttnet-bypass-decompression": "1",
-                "x-ttnet-bypass-cookie": "0",
-                "request-traffic-type": "prod",
-                "User-Agent": f"Trae/{SOLO_GATEWAY_VERSION}",
-            }
-        )
-        if endpoint == "/api/agent/v3/create_agent_task":
-            endpoint_headers.update(
-                {
-                    "x-app-id": WORK_AGENT_APP_ID_CHAT,
-                    "x-device-type": "macos",
-                    "x-device-platform": "darwin",
-                    "x-platform": "darwin",
-                    "x-os": "darwin",
-                    "x-ostype": "darwin",
-                    "x-system": "darwin",
-                    "x-ide-version": WORK_AGENT_VERSION,
-                    "x-ide-version-code": WORK_AGENT_VERSION_CODE,
-                    "x-app-version-code": WORK_AGENT_VERSION_CODE,
-                    "x-version-code": WORK_AGENT_VERSION_CODE,
-                    "request-traffic-type": "prod",
-                    "User-Agent": f"Trae/{WORK_AGENT_VERSION}",
-                }
-            )
-        client = httpx.Client(
-            headers=endpoint_headers,
-            timeout=timeout,
-            http2=False,
+    # Legacy IDE/Work requests must consume the same per-account model-request
+    # capacity as Remote/Web sessions. Hold the slot from the first upstream
+    # connection attempt until the response wrapper is closed.
+    slot_account_id = _checkin_identity(bound_token, bound_account_id)
+    if not bound_account_id and slot_account_id == bound_token and bound_token:
+        # Opaque test/custom credentials are not JWTs. Keep the semaphore key
+        # stable without retaining the credential itself in process state.
+        slot_account_id = "token:" + hashlib.sha256(
+            bound_token.encode("utf-8")
+        ).hexdigest()
+    try:
+        slot_timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+    except (TypeError, ValueError):
+        slot_timeout = 60.0
+    slot_lease_token = await acquire_web_slot(
+        slot_account_id,
+        timeout=max(0.0, slot_timeout),
+        reservation_id=str(options.get("_account_slot_reservation_id") or ""),
+    )
+    slot_released = False
+    slot_handed_off = False
+    slot_release_lock = threading.Lock()
+
+    def release_slot_once() -> None:
+        nonlocal slot_released
+        with slot_release_lock:
+            if slot_released:
+                return
+            slot_released = True
+        release_web_slot_owned(slot_account_id, slot_lease_token)
+
+    # When a synchronous send runs in a worker thread, cancellation cannot
+    # stop that thread. Keep the slot occupied until the worker has returned
+    # and its response/client have been closed.
+    cancel_cleanup_pending = False
+
+    async def send_stream(client: httpx.Client, request: Any):
+        nonlocal cancel_cleanup_pending
+        send_task = asyncio.create_task(
+            asyncio.to_thread(client.send, request, stream=True)
         )
         try:
-            if endpoint == "/api/ide/v1/chat":
-                _, trae_req = await build_trae_ide_request(
-                    messages,
-                    model,
-                    max_tokens,
-                    options,
+            return await asyncio.shield(send_task)
+        except asyncio.CancelledError:
+            cancel_cleanup_pending = True
+
+            def finish_cancelled_send(task: asyncio.Task) -> None:
+                try:
+                    response = task.result()
+                except BaseException:
+                    response = None
+                try:
+                    if response is not None:
+                        response.close()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        client.close()
+                    except Exception as exc:
+                        logger.warning(
+                            "trae-client cancelled stream cleanup failed: %s",
+                            exc,
+                        )
+                    finally:
+                        release_slot_once()
+
+            send_task.add_done_callback(finish_cancelled_send)
+            raise
+
+    async def read_error_response(
+        client: httpx.Client, response: httpx.Response
+    ) -> None:
+        """Read an HTTP error body without releasing a slot mid-thread."""
+
+        nonlocal cancel_cleanup_pending
+        read_task = asyncio.create_task(asyncio.to_thread(response.read))
+        try:
+            await asyncio.shield(read_task)
+        except asyncio.CancelledError:
+            cancel_cleanup_pending = True
+
+            def finish_cancelled_read(task: asyncio.Task) -> None:
+                try:
+                    task.result()
+                except BaseException:
+                    pass
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        client.close()
+                    except Exception as exc:
+                        logger.warning(
+                            "trae-client cancelled error cleanup failed: %s",
+                            exc,
+                        )
+                    finally:
+                        release_slot_once()
+
+            read_task.add_done_callback(finish_cancelled_read)
+            raise
+
+    try:
+        for endpoint in endpoints:
+            endpoint_headers = build_headers(
+                token_override=bound_token,
+                user_id_override=bound_user_id,
+            )
+            # Match TraeWork's legacy adapter headers for ide-v1.  The
+            # account OAuth host and the old IDE version headers are accepted by
+            # some endpoints but produce a generic "param is invalid" response
+            # on the current gateway.
+            endpoint_headers.update(
+                {
+                    "x-app-version": "default",
+                    "x-app-version-code": SOLO_GATEWAY_VERSION_CODE,
+                    "x-ide-version": SOLO_GATEWAY_VERSION,
+                    "x-ide-version-code": SOLO_GATEWAY_VERSION_CODE,
+                    "x-ide-version-type": "stable",
+                    "x-device-brand": SOLO_DEVICE_BRAND,
+                    "x-device-type": SOLO_DEVICE_TYPE,
+                    "x-device-platform": SOLO_PLATFORM,
+                    "x-version-code": SOLO_GATEWAY_VERSION_CODE,
+                    "x-os-version": SOLO_OS_VERSION,
+                    # These CN/SOLO routing headers are present on the native
+                    # Trae client requests.  They are deliberately kept
+                    # configurable because account snapshots may come from a
+                    # different desktop build, while the defaults match the
+                    # current Trae CN stable client.
+                    "package-type": SOLO_PACKAGE_TYPE,
+                    "x-lscbd-aid": SOLO_LSCBD_AID,
+                    "x-lscbd-platform": SOLO_PLATFORM,
+                    "x-ss-dp": SOLO_LSCBD_AID,
+                    "x-plugin-channel": "icube-ai",
+                    "app-version": SOLO_GATEWAY_VERSION,
+                    "x-bridge-transport": "aha",
+                    "x-ahanet-timeout": "86400",
+                    "x-lgw-req-sdk-type": "3",
+                    "x-net-sdk-domain-dispatch": "1",
+                    "x-ttnet-bypass-decompression": "1",
+                    "x-ttnet-bypass-cookie": "0",
+                    "request-traffic-type": "prod",
+                    "User-Agent": f"Trae/{SOLO_GATEWAY_VERSION}",
+                }
+            )
+            if endpoint == "/api/agent/v3/create_agent_task":
+                endpoint_headers.update(
+                    {
+                        "x-app-id": WORK_AGENT_APP_ID_CHAT,
+                        "x-device-type": "macos",
+                        "x-device-platform": "darwin",
+                        "x-platform": "darwin",
+                        "x-os": "darwin",
+                        "x-ostype": "darwin",
+                        "x-system": "darwin",
+                        "x-ide-version": WORK_AGENT_VERSION,
+                        "x-ide-version-code": WORK_AGENT_VERSION_CODE,
+                        "x-app-version-code": WORK_AGENT_VERSION_CODE,
+                        "x-version-code": WORK_AGENT_VERSION_CODE,
+                        "request-traffic-type": "prod",
+                        "User-Agent": f"Trae/{WORK_AGENT_VERSION}",
+                    }
                 )
-            elif endpoint == "/api/agent/v3/create_agent_task":
-                trae_req = build_work_agent_body(messages, model_name, stream, options)
-            else:
-                trae_req = build_llm_chat_body(
-                    messages,
+            client = httpx.Client(
+                headers=endpoint_headers,
+                timeout=timeout,
+                http2=False,
+            )
+            returned_response = False
+            try:
+                if endpoint == "/api/ide/v1/chat":
+                    _, trae_req = await build_trae_ide_request(
+                        messages,
+                        model_name,
+                        max_tokens,
+                        options,
+                    )
+                elif endpoint == "/api/agent/v3/create_agent_task":
+                    trae_req = build_work_agent_body(messages, model_name, stream, options)
+                else:
+                    trae_req = build_llm_chat_body(
+                        messages,
+                        model_name,
+                        stream,
+                        max_tokens,
+                        options,
+                    )
+                request_base = (
+                    WORK_AGENT_HOST
+                    if endpoint == "/api/agent/v3/create_agent_task"
+                    else base
+                )
+                # The native client sends a route-specific referer.  Supplying
+                # it also makes account records that carry ``/api/remote/v1``
+                # behave like a host-only gateway after _model_gateway_base()
+                # normalizes the stale path.
+                endpoint_headers["Referer"] = request_base + endpoint
+                logger.info(
+                    "trae-client: POST %s%s model=%s tools=%s",
+                    request_base,
+                    endpoint,
                     model_name,
-                    stream,
-                    max_tokens,
-                    options,
+                    _tool_protocol_requested(options, messages),
                 )
-            request_base = WORK_AGENT_HOST if endpoint == "/api/agent/v3/create_agent_task" else base
-            # The native client sends a route-specific referer.  Supplying it
-            # also makes account records that carry ``/api/remote/v1`` behave
-            # like a host-only gateway after _model_gateway_base() normalizes
-            # the stale path.
-            endpoint_headers["Referer"] = request_base + endpoint
-            logger.info("trae-client: POST %s%s model=%s tools=%s", request_base, endpoint, model_name, _tool_protocol_requested(options, messages))
-            request = client.build_request("POST", request_base + endpoint, json=trae_req)
-            resp = await asyncio.to_thread(client.send, request, stream=True)
-            if resp.status_code == 200:
-                return IdeChatResponse(response=resp, client=client)
+                request = client.build_request(
+                    "POST", request_base + endpoint, json=trae_req
+                )
+                resp = await send_stream(client, request)
+                if resp.status_code == 200:
+                    returned_response = True
+                    slot_handed_off = True
+                    return IdeChatResponse(
+                        response=resp,
+                        client=client,
+                        release_slot=release_slot_once,
+                    )
 
-            await asyncio.to_thread(resp.read)
-            body = resp.text[:800]
-            logger.warning("trae-client: %s returned %s: %s", endpoint, resp.status_code, body)
-            errors.append(f"{endpoint} [{resp.status_code}]: {body}")
-        except Exception as e:
-            logger.warning("trae-client: %s error: %s", endpoint, e)
-            errors.append(f"{endpoint}: {e}")
-        client.close()
+                await read_error_response(client, resp)
+                body = resp.text[:800]
+                logger.warning(
+                    "trae-client: %s returned %s: %s",
+                    endpoint,
+                    resp.status_code,
+                    body,
+                )
+                errors.append(f"{endpoint} [{resp.status_code}]: {body}")
+            except Exception as e:
+                logger.warning("trae-client: %s error: %s", endpoint, e)
+                errors.append(f"{endpoint}: {e}")
+            finally:
+                if not returned_response and not cancel_cleanup_pending:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
 
-    raise RuntimeError("Trae ide chat failed: " + " | ".join(errors))
+        raise RuntimeError("Trae ide chat failed: " + " | ".join(errors))
+    finally:
+        if not cancel_cleanup_pending and not slot_handed_off and not slot_released:
+            release_slot_once()
 
 
 _MODEL_LIST_CACHE: dict[str, tuple[float, list[dict]]] = {}
@@ -2392,19 +3489,191 @@ _MODEL_LIST_CACHE_TTL = float(os.environ.get("TRAE_MODEL_LIST_CACHE_TTL", "300")
 # Lowercase public id -> exact upstream config name, learned from the live
 # model list (for example ``doubao-seed-code`` -> ``Doubao-Seed-Code``).
 _UPSTREAM_MODEL_CASE: dict[str, str] = {}
-# Routing ids that are not upstream configs but are always accepted.
+# Routing ids that are accepted internally.  ``work`` is deliberately kept
+# here for backwards-compatible request routing, but hidden from /v1/models
+# because it is a Trae control model rather than a selectable chat model.
 _ROUTING_MODEL_IDS = ("auto", "work")
+_HIDDEN_INTERNAL_MODEL_IDS = frozenset(
+    {
+        "computer_use_subagent",
+        "browser_use_subagent",
+        "aquila",
+        "explore_sub_agent_v2",
+        "file_search_agent",
+        "work",
+    }
+)
+_MODEL_ENDPOINT_ORDER = {
+    "remote": 0,
+    "work": 1,
+    "solo": 2,
+    "ide": 3,
+    "fallback": 9,
+}
+_MODEL_ENDPOINT_GROUP = {
+    # ``solo`` and ``ide`` are the two public TraeCode transports.  Keep the
+    # wire endpoint names in ``endpoints`` while exposing this product-level
+    # grouping for clients that render one column per product.
+    "remote": "remote",
+    "work": "traework",
+    "solo": "traecode",
+    "ide": "traecode",
+    "fallback": "fallback",
+}
+_MODEL_ENDPOINT_GROUP_ORDER = {
+    "remote": 0,
+    "traecode": 1,
+    "traework": 2,
+    "fallback": 9,
+}
 
 
-def _model_item(model_id: str, created: int) -> dict:
-    return {"id": model_id, "object": "model", "created": created, "owned_by": "trae"}
+def _endpoint_groups(endpoints: list[str]) -> list[str]:
+    """Collapse wire endpoint identities into public product groups."""
+
+    groups: list[str] = []
+    for endpoint in endpoints:
+        group = _MODEL_ENDPOINT_GROUP.get(str(endpoint).strip().lower())
+        if group and group not in groups:
+            groups.append(group)
+    groups.sort(
+        key=lambda value: (
+            _MODEL_ENDPOINT_GROUP_ORDER.get(value, 8),
+            value,
+        )
+    )
+    return groups or ["fallback"]
+
+
+def _model_item(
+    model_id: str,
+    created: int,
+    *,
+    endpoint: str = "fallback",
+    endpoints: Optional[list[str]] = None,
+    alias_for: str = "",
+    capabilities_by_scope: Optional[Mapping[str, Any]] = None,
+) -> dict:
+    """Build an OpenAI model object with relay discovery metadata.
+
+    The standard fields remain unchanged.  Endpoint/group metadata and
+    ``alias_for`` are additive fields consumed by the relay UI and ignored by
+    OpenAI-compatible clients that only read ``id``.
+    """
+
+    endpoint = str(endpoint or "fallback").strip().lower() or "fallback"
+    ordered = []
+    for value in endpoints or [endpoint]:
+        value = str(value or "").strip().lower()
+        if value and value not in ordered:
+            ordered.append(value)
+    ordered.sort(key=lambda value: (_MODEL_ENDPOINT_ORDER.get(value, 8), value))
+    groups = _endpoint_groups(ordered)
+    item = {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+        "owned_by": "trae",
+        "endpoint": ordered[0] if ordered else endpoint,
+        "endpoints": ordered or [endpoint],
+        # Additive product-level metadata for UIs that show Remote,
+        # TraeCode, and TraeWork as separate columns.  ``endpoint`` and
+        # ``endpoints`` remain the compatibility contract for older clients.
+        "endpoint_group": groups[0],
+        "endpoint_groups": groups,
+    }
+    if alias_for:
+        item["alias_for"] = alias_for
+    if isinstance(capabilities_by_scope, Mapping) and capabilities_by_scope:
+        item["capabilities_by_scope"] = {
+            str(scope): dict(capabilities)
+            for scope, capabilities in capabilities_by_scope.items()
+            if isinstance(capabilities, Mapping)
+        }
+    return item
 
 
 def _static_model_list(created: int) -> list[dict]:
-    """Offline fallback: lowercase built-in ids only, one entry per spelling."""
-    ids = {mid for mid in SUPPORTED_MODELS if mid and mid == mid.lower()}
-    ids.update(_ROUTING_MODEL_IDS)
-    return [_model_item(mid, created) for mid in sorted(ids)]
+    """Offline fallback with exact names plus lower-case aliases."""
+
+    ids = {
+        str(mid).strip()
+        for mid in SUPPORTED_MODELS
+        if str(mid or "").strip()
+        and str(mid).strip().lower() not in _HIDDEN_INTERNAL_MODEL_IDS
+    }
+    ids.update(
+        mid for mid in _ROUTING_MODEL_IDS if mid.lower() not in _HIDDEN_INTERNAL_MODEL_IDS
+    )
+    items: list[dict] = []
+    for model_id in sorted(ids, key=lambda value: (value.casefold(), value)):
+        items.append(_model_item(model_id, created))
+    return sorted(
+        items,
+        key=lambda item: (
+            _MODEL_ENDPOINT_ORDER.get(str(item.get("endpoint") or ""), 9),
+            str(item.get("id") or "").casefold(),
+            str(item.get("id") or ""),
+        ),
+    )
+
+
+def _catalog_endpoints(config: Mapping[str, Any]) -> list[str]:
+    raw = config.get("_trae_endpoints") if isinstance(config, Mapping) else None
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    result: list[str] = []
+    for value in values:
+        value = str(value or "").strip().lower()
+        if value and value not in result:
+            result.append(value)
+    if not result:
+        result.append("remote")
+    result.sort(key=lambda value: (_MODEL_ENDPOINT_ORDER.get(value, 8), value))
+    return result
+
+
+def _merge_model_item(
+    target: dict[str, dict],
+    model_id: str,
+    created: int,
+    *,
+    endpoints: list[str],
+    alias_for: str = "",
+    capabilities_by_scope: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Insert/merge one exact or alias id while retaining endpoint metadata."""
+
+    if not model_id or model_id.lower() in _HIDDEN_INTERNAL_MODEL_IDS:
+        return
+    current = target.get(model_id)
+    if current is None:
+        target[model_id] = _model_item(
+            model_id,
+            created,
+            endpoint=endpoints[0] if endpoints else "remote",
+            endpoints=endpoints,
+            alias_for=alias_for,
+            capabilities_by_scope=capabilities_by_scope,
+        )
+        return
+    merged = list(current.get("endpoints") or [])
+    for endpoint in endpoints:
+        if endpoint not in merged:
+            merged.append(endpoint)
+    merged.sort(key=lambda value: (_MODEL_ENDPOINT_ORDER.get(value, 8), value))
+    current["endpoints"] = merged
+    current["endpoint"] = merged[0] if merged else "remote"
+    groups = _endpoint_groups(merged)
+    current["endpoint_group"] = groups[0]
+    current["endpoint_groups"] = groups
+    if alias_for and not current.get("alias_for"):
+        current["alias_for"] = alias_for
+    if isinstance(capabilities_by_scope, Mapping) and capabilities_by_scope:
+        existing = current.setdefault("capabilities_by_scope", {})
+        if isinstance(existing, dict):
+            for scope, capabilities in capabilities_by_scope.items():
+                if isinstance(capabilities, Mapping):
+                    existing[str(scope)] = dict(capabilities)
 
 
 async def get_models(force: bool = False) -> list[dict]:
@@ -2413,10 +3682,11 @@ async def get_models(force: bool = False) -> list[dict]:
     Source is the active account's live Trae model lists: the Remote web
     catalog (merged across Agent / Work / Design tiers) plus native Solo's
     ``/api/ide/v1/get_detail_param`` catalog for Solo-only models.
-    Only config names are listed; display labels such as ``GLM-5.3`` are not.
-    Ids are exposed lowercase: config names that carry capitals appear once in
-    lowercase and ``convert_model_name`` maps them back to the exact config
-    name. The built-in table is used only when the upstream list is empty.
+    Exact upstream config names are listed alongside lower-case aliases when
+    the spelling contains capitals.  Each item carries the endpoint catalog
+    and product groups where it was advertised, and the result is ordered by
+    endpoint before the model id.  Internal computer-control model ids are
+    never exposed.
     """
     created = int(time.time())
     account_id, record = auth.get_active_account_snapshot()
@@ -2427,50 +3697,96 @@ async def get_models(force: bool = False) -> list[dict]:
     if not force and cached and time.time() - cached[0] < _MODEL_LIST_CACHE_TTL:
         return [dict(item) for item in cached[1]]
 
-    configs: dict[str, dict] = {}
+    catalogs: list[tuple[Mapping[str, dict], Optional[list[str]]]] = []
     if token:
-        kwargs: dict[str, Any] = {"token_override": token}
+        web_kwargs: dict[str, Any] = {"token_override": token}
+        solo_kwargs: dict[str, Any] = {"token_override": token}
+        bound_user_id = str(
+            (record or {}).get("user_id")
+            or account_id
+            or auth.get_user_id()
+            or ""
+        ).strip()
+        if bound_user_id:
+            solo_kwargs["user_id_override"] = bound_user_id
         provider = (record or {}).get("provider_specific") or (record or {}).get(
             "providerSpecificData"
         )
         if isinstance(provider, Mapping):
-            kwargs["provider_specific"] = dict(provider)
-        # Remote is the primary catalog because it carries the richer
-        # Agent/Work metadata.  Solo fills only models absent from Remote;
-        # this keeps discovery resilient when a newly enabled Solo model has
-        # not propagated to the web catalog yet.
-        remote_task = _fetch_web_model_configs(**kwargs)
-        solo_task = _fetch_solo_model_configs(**kwargs)
+            provider_copy = dict(provider)
+            web_kwargs["provider_specific"] = provider_copy
+            solo_kwargs["provider_specific"] = provider_copy
+        # Keep catalog entries separate until public items are merged.  A
+        # model can be advertised by Remote/Work and native TraeCode at once;
+        # replacing or setdefault-ing the full config would discard one
+        # catalog's endpoint evidence for that shared model.
+        remote_task = _fetch_web_model_configs(**web_kwargs)
+        solo_task = _fetch_solo_model_configs(**solo_kwargs)
         remote_configs, solo_configs = await asyncio.gather(
             remote_task,
             solo_task,
             return_exceptions=True,
         )
         if isinstance(remote_configs, Mapping):
-            configs.update(remote_configs)
+            catalogs.append((remote_configs, None))
         elif isinstance(remote_configs, Exception):
             logger.warning("trae-client: web model list fetch failed: %s", remote_configs)
         if isinstance(solo_configs, Mapping):
-            for name, config in solo_configs.items():
-                configs.setdefault(name, config)
+            catalogs.append((solo_configs, ["solo", "ide"]))
         elif isinstance(solo_configs, Exception):
             logger.warning("trae-client: solo model list fetch failed: %s", solo_configs)
 
-    ids: set[str] = set()
-    for name in configs:
-        exact = str(name or "").strip()
-        if not exact:
-            continue
-        lowered = exact.lower()
-        ids.add(lowered)
-        if lowered != exact:
-            _UPSTREAM_MODEL_CASE[lowered] = exact
-    if not ids:
+    items_by_id: dict[str, dict] = {}
+    for configs, catalog_endpoints in catalogs:
+        for name, config in configs.items():
+            exact = str(name or "").strip()
+            if not exact:
+                continue
+            if exact.lower() in _HIDDEN_INTERNAL_MODEL_IDS:
+                continue
+            endpoints = catalog_endpoints or _catalog_endpoints(config)
+            capabilities_by_scope = config.get("_trae_capabilities_by_scope")
+            if not isinstance(capabilities_by_scope, Mapping):
+                capabilities_by_scope = None
+            _merge_model_item(
+                items_by_id,
+                exact,
+                created,
+                endpoints=endpoints,
+                capabilities_by_scope=capabilities_by_scope,
+            )
+            lowered = exact.lower()
+            if lowered != exact:
+                _UPSTREAM_MODEL_CASE[lowered] = exact
+                _merge_model_item(
+                    items_by_id,
+                    lowered,
+                    created,
+                    endpoints=endpoints,
+                    alias_for=exact,
+                    capabilities_by_scope=capabilities_by_scope,
+                )
+    if not items_by_id:
         # Not cached, so the next request retries the upstream list.
         logger.warning("trae-client: upstream model list empty, using built-in list")
         return _static_model_list(created)
 
-    ids.update(_ROUTING_MODEL_IDS)
-    items = [_model_item(mid, created) for mid in sorted(ids)]
+    for routing_id in _ROUTING_MODEL_IDS:
+        if routing_id.lower() not in _HIDDEN_INTERNAL_MODEL_IDS:
+            _merge_model_item(
+                items_by_id,
+                routing_id,
+                created,
+                endpoints=["fallback"],
+            )
+    items = sorted(
+        items_by_id.values(),
+        key=lambda item: (
+            _MODEL_ENDPOINT_ORDER.get(str(item.get("endpoint") or ""), 9),
+            str(item.get("id") or "").casefold(),
+            0 if not item.get("alias_for") else 1,
+            str(item.get("id") or ""),
+        ),
+    )
     _MODEL_LIST_CACHE[cache_key] = (time.time(), items)
     return [dict(item) for item in items]

@@ -173,6 +173,112 @@ class UsageValuesTests(unittest.TestCase):
         self.assertIs(record["max_mode"], False)
         self.assertIs(record["tool"], False)
 
+    def test_usage_record_normalizes_product_route_thinking_and_tool_aliases(self):
+        record = main_module._normalize_usage_record(
+            {
+                "account_id": "acct",
+                "model": "glm-5.3",
+                "product": "work",
+                "endpoint": "/v1/responses",
+                "requested_endpoint": "work",
+                "actual_endpoint": "remote-work",
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 8192,
+                    "ignored_payload": "must not persist",
+                },
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "read_file", "parameters": {"secret": True}},
+                },
+                "max_mode_enabled": True,
+                "tool_called": True,
+            }
+        )
+        self.assertEqual(record["product"], "traework")
+        self.assertEqual(record["endpoint"], "/v1/responses")
+        self.assertEqual(record["requested_endpoint"], "work")
+        self.assertEqual(record["actual_endpoint"], "remote-work")
+        self.assertEqual(record["thinking"], {"type": "enabled", "budget_tokens": 8192})
+        self.assertEqual(record["tool_choice"], "read_file")
+        self.assertIs(record["max"], True)
+        self.assertIs(record["tool"], True)
+
+    def test_tracker_persists_route_product_and_request_hints(self):
+        with _UsageSandbox() as box:
+            options = {
+                "thinking": {"type": "enabled", "budget_tokens": 16384},
+                "trae_max_mode": True,
+                "tools": [{"type": "function", "function": {"name": "read_file"}}],
+                "tool_choice": "auto",
+                "_upstream_trace": {
+                    "product": "traework",
+                    "requested_endpoint": "work",
+                    "actual_endpoint": "remote-work",
+                    "requested_mode": "work",
+                    "actual_mode": "work",
+                    "max_mode_applied": True,
+                },
+            }
+            tracker = main_module._UsageTracker(
+                "glm-5.3", "/v1/responses", False, options
+            )
+            tracker.request_id = "route-metadata"
+            tracker.update({"prompt_tokens": 4, "completion_tokens": 2})
+            asyncio.run(tracker.finish("completed"))
+
+            record = main_module._USAGE_HISTORY[0]
+            self.assertEqual(record["product"], "traework")
+            self.assertEqual(record["endpoint"], "/v1/responses")
+            self.assertEqual(record["requested_endpoint"], "work")
+            self.assertEqual(record["actual_endpoint"], "remote-work")
+            self.assertEqual(record["requested_mode"], "work")
+            self.assertEqual(record["actual_mode"], "work")
+            self.assertEqual(
+                record["thinking"], {"type": "enabled", "budget_tokens": 16384}
+            )
+            self.assertEqual(record["tool_choice"], "auto")
+            self.assertIs(record["max_mode_enabled"], True)
+            self.assertIs(record["tool_called"], False)
+
+            saved = json.loads(box.root.joinpath("usage_records.json").read_text("utf-8"))
+            persisted = saved["records"][0]
+            for key in (
+                "product",
+                "endpoint",
+                "requested_endpoint",
+                "actual_endpoint",
+                "thinking",
+                "tool_choice",
+                "max_mode_enabled",
+                "tool_called",
+            ):
+                with self.subTest(key=key):
+                    self.assertIn(key, persisted)
+
+    def test_usage_api_exposes_product_and_actual_endpoint_for_legacy_rows(self):
+        with _UsageSandbox():
+            main_module._USAGE_HISTORY.append(
+                {
+                    "request_id": "legacy-route",
+                    "model": "glm-5.3",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "endpoint": "/v1/chat/completions",
+                    "actual_mode": "work",
+                    "thinking": {"type": "enabled", "budget_tokens": 4096},
+                    "timestamp": time.time(),
+                }
+            )
+            response = TestClient(main_module.app).get("/api/usage/records")
+            self.assertEqual(response.status_code, 200)
+            record = response.json()[0]
+            self.assertEqual(record["product"], "traework")
+            self.assertEqual(record["actual_endpoint"], "work")
+            self.assertEqual(
+                record["thinking"], {"type": "enabled", "budget_tokens": 4096}
+            )
+
 
 class DailyStatsTests(unittest.TestCase):
     def test_records_aggregate_into_today_and_persist(self):
@@ -303,6 +409,18 @@ class DailyStatsTests(unittest.TestCase):
             self.assertIsNone(record["tool_called"])
             self.assertIsNone(record["context_window_tokens"])
 
+    def test_applied_max_without_descriptor_window_stays_unknown(self):
+        requested, actual, window, applied = main_module._context_mode_metadata(
+            {
+                "trae_max_mode": True,
+                "_upstream_trace": {"max_mode_applied": True},
+            }
+        )
+        self.assertEqual(requested, "max_1m")
+        self.assertEqual(actual, "max_1m")
+        self.assertIsNone(window)
+        self.assertIs(applied, True)
+
     def test_remote_fallback_keeps_shared_trace_for_actual_context_metadata(self):
         with _UsageSandbox():
             options = {"trae_max_mode": True}
@@ -417,8 +535,14 @@ class OverviewEndpointTests(unittest.TestCase):
                 7,
                 5,
                 request_id="api-metadata",
+                endpoint="/v1/responses",
+                product="traework",
+                requested_endpoint="work",
+                actual_endpoint="remote-work",
                 reasoning_effort="high",
                 reasoning_effort_applied="extra_high",
+                thinking={"type": "enabled", "budget_tokens": 8192},
+                tool_choice="auto",
                 context_mode_requested="max_1m",
                 context_mode_actual="max_1m",
                 context_window_tokens=1_000_000,
@@ -435,6 +559,10 @@ class OverviewEndpointTests(unittest.TestCase):
                 item for item in body.json() if item["request_id"] == "api-metadata"
             )
             expected = {
+                "product": "traework",
+                "endpoint": "/v1/responses",
+                "requested_endpoint": "work",
+                "actual_endpoint": "remote-work",
                 "reasoning_effort": "high",
                 "requested_reasoning_effort": "high",
                 "reasoning_effort_applied": "extra_high",
@@ -449,6 +577,8 @@ class OverviewEndpointTests(unittest.TestCase):
                 "tool_used": True,
                 "tool_called": True,
                 "tool_calls_returned": True,
+                "thinking": {"type": "enabled", "budget_tokens": 8192},
+                "tool_choice": "auto",
             }
             for key, value in expected.items():
                 with self.subTest(key=key):

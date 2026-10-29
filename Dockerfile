@@ -26,8 +26,11 @@ COPY src ./src
 
 COPY web_login.py .
 COPY start_auth.bat .
+COPY start_auth.sh .
 
-RUN chown -R relay:relay /app /home/app && chmod -R u+rwX,go+rX /app
+RUN python -m src.auth_helper \
+    && chown -R relay:relay /app /home/app \
+    && chmod -R u+rwX,go+rX /app
 
 USER relay
 

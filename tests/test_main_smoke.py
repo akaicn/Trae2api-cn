@@ -1483,6 +1483,168 @@ class UsageRecordTests(unittest.TestCase):
                 main_module._USAGE_ACTIVE_ACCOUNTS.clear()
                 main_module._USAGE_UNSAFE_ACCOUNTS.clear()
 
+    def test_concurrent_snapshot_requests_keep_each_credit_delta(self):
+        original_history = main_module._USAGE_HISTORY
+        original_path = main_module._USAGE_RECORDS_PATH
+        main_module._USAGE_HISTORY = []
+        main_module._USAGE_ENRICH_TASKS.clear()
+        main_module._USAGE_SNAPSHOT_TASKS.clear()
+        main_module._USAGE_ACCOUNT_BEFORE_TASKS.clear()
+        main_module._USAGE_CREDIT_SETTLE_GATES.clear()
+        main_module._USAGE_LAST_CREDIT_TOTALS.clear()
+        main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+        main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+
+        async def scenario(path):
+            # One shared before snapshot, then two monotonic after totals.
+            credit_snapshot = AsyncMock(side_effect=[10, 11, 12])
+            options = {
+                "_account_id": "acct-concurrent",
+                "_auth_token": "bound-token",
+            }
+            with (
+                patch("src.main._fetch_used_credits", new=credit_snapshot),
+                patch.dict(
+                    os.environ,
+                    {"TRAE_USAGE_CREDIT_SETTLE_SECONDS": "0"},
+                ),
+            ):
+                first = main_module._UsageTracker(
+                    "glm-5.3", "/v1/chat/completions", False, options
+                )
+                second = main_module._UsageTracker(
+                    "glm-5.3", "/v1/chat/completions", False, options
+                )
+                await first.begin()
+                await second.begin()
+                first.update({"input_tokens": 2, "output_tokens": 1})
+                second.update({"input_tokens": 3, "output_tokens": 2})
+                with patch.object(main_module, "_USAGE_RECORDS_PATH", path):
+                    await first.finish("completed")
+                    await second.finish("completed")
+                    tasks = list(main_module._USAGE_ENRICH_TASKS)
+                    if tasks:
+                        await asyncio.gather(*tasks)
+            return credit_snapshot
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "usage_records.json"
+            try:
+                credit_snapshot = asyncio.run(scenario(path))
+                records = sorted(
+                    main_module._USAGE_HISTORY,
+                    key=lambda item: item["request_id"],
+                )
+                self.assertEqual(len(records), 2)
+                self.assertEqual(
+                    [record["credits_consumed"] for record in records],
+                    [1, 1],
+                )
+                self.assertTrue(
+                    all(
+                        record["credits_source"] == "snapshot_delta"
+                        for record in records
+                    )
+                )
+                self.assertEqual(credit_snapshot.await_count, 3)
+            finally:
+                main_module._USAGE_HISTORY = original_history
+                main_module._USAGE_RECORDS_PATH = original_path
+                main_module._USAGE_ENRICH_TASKS.clear()
+                main_module._USAGE_SNAPSHOT_TASKS.clear()
+                main_module._USAGE_ACCOUNT_BEFORE_TASKS.clear()
+                main_module._USAGE_CREDIT_SETTLE_GATES.clear()
+                main_module._USAGE_LAST_CREDIT_TOTALS.clear()
+                main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+                main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+
+    def test_error_without_upstream_activity_is_not_marked_pending(self):
+        original_history = main_module._USAGE_HISTORY
+        original_path = main_module._USAGE_RECORDS_PATH
+        main_module._USAGE_HISTORY = []
+        main_module._USAGE_ENRICH_TASKS.clear()
+        main_module._USAGE_SNAPSHOT_TASKS.clear()
+        main_module._USAGE_ACCOUNT_BEFORE_TASKS.clear()
+        main_module._USAGE_CREDIT_SETTLE_GATES.clear()
+        main_module._USAGE_LAST_CREDIT_TOTALS.clear()
+        main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+        main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+
+        async def scenario(path):
+            with (
+                patch(
+                    "src.main._fetch_used_credits",
+                    new=AsyncMock(return_value=10),
+                ),
+                patch.object(main_module, "_USAGE_RECORDS_PATH", path),
+            ):
+                tracker = main_module._UsageTracker(
+                    "glm-5.3",
+                    "/v1/chat/completions",
+                    False,
+                    {"_account_id": "acct-error", "_auth_token": "bound-token"},
+                )
+                await tracker.finish("error")
+                await asyncio.sleep(0)
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "usage_records.json"
+            try:
+                asyncio.run(scenario(path))
+                self.assertEqual(len(main_module._USAGE_HISTORY), 1)
+                record = main_module._USAGE_HISTORY[0]
+                self.assertIsNone(record["credits_consumed"])
+                self.assertEqual(record["credits_source"], "unavailable")
+                self.assertFalse(main_module._USAGE_ENRICH_TASKS)
+            finally:
+                main_module._USAGE_HISTORY = original_history
+                main_module._USAGE_RECORDS_PATH = original_path
+                main_module._USAGE_ENRICH_TASKS.clear()
+                main_module._USAGE_SNAPSHOT_TASKS.clear()
+                main_module._USAGE_ACCOUNT_BEFORE_TASKS.clear()
+                main_module._USAGE_CREDIT_SETTLE_GATES.clear()
+                main_module._USAGE_LAST_CREDIT_TOTALS.clear()
+                main_module._USAGE_ACTIVE_ACCOUNTS.clear()
+                main_module._USAGE_UNSAFE_ACCOUNTS.clear()
+
+    def test_restart_pending_without_turn_id_is_marked_unavailable(self):
+        original_history = main_module._USAGE_HISTORY
+        original_path = main_module._USAGE_RECORDS_PATH
+        main_module._USAGE_HISTORY = [
+            main_module._normalize_usage_record(
+                {
+                    "account_id": "acct-old",
+                    "model": "glm-5.3",
+                    "credits_consumed": None,
+                    "credits_source": "pending",
+                    "request_id": "request-old",
+                    "timestamp": time.time() - 1,
+                }
+            )
+        ]
+        try:
+            with patch.dict(
+                os.environ,
+                {"TRAE_USAGE_PENDING_MAX_AGE_SECONDS": "60"},
+            ):
+                self.assertEqual(main_module._schedule_pending_usage_enrichment(), 0)
+            self.assertEqual(
+                main_module._USAGE_HISTORY[0]["credits_source"],
+                "unavailable",
+            )
+            self.assertEqual(
+                main_module._USAGE_HISTORY[0]["credits_resolution"],
+                "no_usage_turn",
+            )
+        finally:
+            main_module._USAGE_HISTORY = original_history
+            main_module._USAGE_RECORDS_PATH = original_path
+            main_module._USAGE_ENRICH_TASKS.clear()
+            main_module._USAGE_SNAPSHOT_TASKS.clear()
+            main_module._USAGE_ACCOUNT_BEFORE_TASKS.clear()
+            main_module._USAGE_CREDIT_SETTLE_GATES.clear()
+            main_module._USAGE_LAST_CREDIT_TOTALS.clear()
+
     def test_raw_retry_binds_second_turn_id_and_queries_usage_once(self):
         original_history = main_module._USAGE_HISTORY
         original_path = main_module._USAGE_RECORDS_PATH
@@ -1801,7 +1963,7 @@ class UsageRecordTests(unittest.TestCase):
 
     def test_usage_records_render_request_mode_metadata(self):
         html = main_module._web_login_html()
-        for heading in ("思考强度", "上下文模式", "Max 模式", "Tool 参数"):
+        for heading in ("产品 / 端点", "思考强度", "上下文模式", "Max 模式", "Tool 参数"):
             with self.subTest(heading=heading):
                 self.assertIn(f"<th>{heading}</th>", html)
         # The browser keeps older records readable while accepting the
@@ -1824,6 +1986,10 @@ class UsageRecordTests(unittest.TestCase):
         self.assertIn("usageContextMeta", html)
         self.assertIn("usageMaxMeta", html)
         self.assertIn("usageToolMeta", html)
+        self.assertIn("usageRouteMeta", html)
+        self.assertIn("actual_endpoint", html)
+        self.assertIn("requested_endpoint", html)
+        self.assertIn("TraeWork", html)
         self.assertIn("usageModelFlags", html)
         self.assertIn("usage-model-flags", html)
         self.assertIn("Max: '+maxText", html)
@@ -2222,10 +2388,10 @@ class SessionLeaseTests(unittest.TestCase):
         # mutable account-store read.
         self.assertEqual(account.call_count, 0)
 
-    def test_ide_and_work_agent_new_sessions_participate_in_polling(self):
+    def test_ide_and_work_new_sessions_participate_in_polling(self):
         """Explicit IDE/Work selections must rotate accounts like Remote."""
 
-        for mode in ("ide", "work-agent"):
+        for mode in ("ide", "work", "work-agent"):
             with self.subTest(mode=mode):
                 main_module._CHAT_HISTORY_SESSIONS.clear()
                 main_module._UPSTREAM_SESSION_LEASES.clear()
@@ -2501,14 +2667,10 @@ class MainCliSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            {
-                key: value
-                for key, value in captured["options"].items()
-                if key not in ("_relay_request_id", "_billing_id")
-            },
-            expected_options,
-        )
+        # Dispatch adds routing/diagnostic metadata and the default
+        # task-model selection. Assert the caller-owned contract only.
+        for key, value in expected_options.items():
+            self.assertEqual(captured["options"].get(key), value)
         self.assertRegex(captured["options"]["_relay_request_id"], r"^req-[0-9a-f]+$")
         choice = response.json()["choices"][0]
         self.assertEqual(choice["finish_reason"], "tool_calls")
@@ -3431,6 +3593,32 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(send_raw.await_count, 2)
         self.assertTrue(all(item.closed for item in attempts))
 
+    def test_remote_query_limit_returns_413_without_endpoint_fallback(self):
+        calls = []
+
+        async def oversized_remote(_messages, _model, _stream, _options):
+            calls.append(True)
+            raise main_module.RemoteQueryTooLarge(700_000, 480_000)
+
+        with (
+            patch("src.main.UPSTREAM_MODE", "remote"),
+            patch.object(main_module, "run_remote_session", new=oversized_remote),
+        ):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kimi-k2.6",
+                    "messages": [{"role": "user", "content": "oversized"}],
+                },
+                headers=AUTH_HEADERS,
+            )
+
+        self.assertEqual(response.status_code, 413, response.text)
+        body = response.json()
+        self.assertEqual(body["error"]["type"], "context_length_exceeded")
+        self.assertIn("configured input limit", body["error"]["message"])
+        self.assertEqual(calls, [True])
+
     def test_chat_stream(self):
         with self.client.stream(
             "POST",
@@ -3598,12 +3786,12 @@ class MainCliSmokeTests(unittest.TestCase):
         self.assertEqual(body["reasoning"], "17*23")
         self.assertEqual(body["usage"]["reasoning_tokens"], 7)
 
-        bad = self.client.post(
+        ultra = self.client.post(
             "/api/model-test",
             json={"model": "glm-5.3", "reasoning_effort": "ultra"},
             headers=AUTH_HEADERS,
         )
-        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(ultra.status_code, 200)
 
     def test_model_test_endpoint_surfaces_failures(self):
         empty = JSONResponse(
@@ -3744,7 +3932,48 @@ class MainCliSmokeTests(unittest.TestCase):
         response = self.client.get("/web/login")
         self.assertEqual(response.status_code, 200)
         self.assertIn("refreshModels", response.text)
-        self.assertIn("获取模型列表", response.text)
+        self.assertIn("刷新模型列表", response.text)
+        self.assertIn('data-tab="model-list"', response.text)
+        self.assertIn('id="models-col-remote"', response.text)
+        self.assertIn('id="models-col-traecode"', response.text)
+        self.assertIn('id="models-col-traework"', response.text)
+        self.assertIn('id="models-fallback"', response.text)
+        self.assertIn('id="models-col-fallback"', response.text)
+        self.assertIn("端点未确认", response.text)
+        self.assertIn("fallbackModels", response.text)
+        self.assertNotIn('id="models-out"', response.text)
+
+    def test_web_login_has_dedicated_grouped_model_list_page(self):
+        """The catalogue is a separate view with one column per endpoint family.
+
+        Keep this as an HTML contract test rather than exercising browser
+        JavaScript.  The page must expose stable ids for the three endpoint
+        groups so the client can render each model list independently, while
+        the model connectivity test remains a separate workflow.
+        """
+
+        response = self.client.get("/web/login")
+        self.assertEqual(response.status_code, 200)
+        html = response.text
+
+        # Navigation and page container are intentionally distinct from the
+        # existing model connectivity tab.
+        for token in (
+            'data-tab="model-list"',
+            'data-page="model-list"',
+            "模型列表",
+            "models-col-remote",
+            "models-col-traecode",
+            "models-col-traework",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, html)
+
+        # The connectivity probe must remain available after moving the
+        # catalogue out of the model-test page.
+        for token in ("data-tab=\"models\"", "conn-run-btn", "/api/model-test"):
+            with self.subTest(token=token):
+                self.assertIn(token, html)
 
     def test_web_login_usage_panel_is_below_account_list(self):
         response = self.client.get("/web/login")

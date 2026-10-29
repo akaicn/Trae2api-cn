@@ -15,6 +15,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,6 +104,13 @@ _poll_enabled: bool = False
 _polling_mode: str = "round-robin"  # "round-robin" | "credit-priority"
 _rotation_cursor: int = 0
 _settings: dict = {}
+# Live model/native-tool streams are account entitlements.  This process-local
+# ledger is deliberately protected by the account-store lock so choosing an
+# account and consuming one of its slots is a single atomic operation.
+_MODEL_ACCOUNT_INFLIGHT: dict[str, int] = {}
+_MODEL_ACCOUNT_RESERVED: dict[str, int] = {}
+_MODEL_ACCOUNT_RESERVATION_OWNERS: dict[str, str] = {}
+_DEFAULT_ACCOUNT_PARALLEL_LIMIT = 2
 
 
 def _safe_read_env_value(key: str) -> str:
@@ -1027,9 +1035,568 @@ def merge_account_credits(account_id: str, data: dict) -> dict:
         checkin = dict(rec.get('checkin') or {})
         checkin.update(dict(data or {}))
         rec['checkin'] = checkin
+        _persist_entitlement_profile_locked(rec, checkin.get("account_credits"))
         rec['credits_updated_at'] = time.time()
         _save_accounts()
         return dict(checkin)
+
+
+def _persist_entitlement_profile_locked(record: dict, profile: object) -> None:
+    """Copy parsed entitlement identity/capacity to the account record.
+
+    Caller must hold ``_STORE_LOCK``.  Keeping these fields at the account
+    level makes capacity lookup independent of the mutable check-in payload.
+    """
+    if not isinstance(record, dict) or not isinstance(profile, dict):
+        return
+    limit = _coerce_positive_int(
+        profile.get("model_parallel_limit")
+        or profile.get("solo_agent_parallel_limit")
+    )
+    identity = profile.get("user_pay_identity", profile.get("pay_identity"))
+    identity_text = profile.get("user_pay_identity_str", profile.get("pay_identity_str"))
+    tier = profile.get("account_tier") or identity_text
+    if identity is not None:
+        record["pay_identity"] = identity
+        record["user_pay_identity"] = identity
+    if identity_text not in (None, ""):
+        record["pay_identity_str"] = str(identity_text)
+        record["user_pay_identity_str"] = str(identity_text)
+    if tier not in (None, ""):
+        record["account_tier"] = str(tier)
+    if limit is not None:
+        record["model_parallel_limit"] = limit
+        record["solo_agent_parallel_limit"] = limit
+    if profile.get("entitlement_updated_at") not in (None, ""):
+        record["entitlement_updated_at"] = profile.get("entitlement_updated_at")
+    provider = record.get("provider_specific")
+    if not isinstance(provider, dict):
+        provider = {}
+    if identity is not None:
+        provider["userPayIdentity"] = identity
+    if identity_text not in (None, ""):
+        provider["userPayIdentityText"] = str(identity_text)
+    if tier not in (None, ""):
+        provider["accountTier"] = str(tier)
+    if limit is not None:
+        provider["soloAgentParallelLimit"] = limit
+    record["provider_specific"] = provider
+
+
+def _coerce_positive_int(value: object) -> int | None:
+    """Parse an entitlement count without accepting booleans/fractions."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(float(str(value).strip()))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number >= 1 else None
+
+
+def _account_entitlement_snapshot(record: dict | None) -> dict:
+    """Return normalized non-secret identity and concurrency metadata."""
+    record = record if isinstance(record, dict) else {}
+    provider = record.get("provider_specific")
+    provider = provider if isinstance(provider, dict) else {}
+    checkin = record.get("checkin")
+    checkin = checkin if isinstance(checkin, dict) else {}
+    credits = checkin.get("account_credits")
+    credits = credits if isinstance(credits, dict) else {}
+    raw_identity = None
+    for value in (
+        record.get("pay_identity"),
+        record.get("user_pay_identity"),
+        provider.get("payIdentity"),
+        provider.get("userPayIdentity"),
+        credits.get("pay_identity"),
+        credits.get("user_pay_identity"),
+    ):
+        if value is not None:
+            raw_identity = value
+            break
+    identity_text = str(
+        record.get("pay_identity_str")
+        or record.get("user_pay_identity_str")
+        or provider.get("payIdentityText")
+        or provider.get("userPayIdentityText")
+        or credits.get("pay_identity_str")
+        or credits.get("user_pay_identity_str")
+        or ""
+    ).strip()
+    tier = str(
+        record.get("account_tier")
+        or provider.get("accountTier")
+        or credits.get("account_tier")
+        or identity_text
+        or provider.get("userIdentity")
+        or (str(raw_identity) if raw_identity is not None else "")
+    ).strip()
+    limit = (
+        record.get("model_parallel_limit")
+        or record.get("solo_agent_parallel_limit")
+        or provider.get("modelParallelLimit")
+        or provider.get("soloAgentParallelLimit")
+        or credits.get("model_parallel_limit")
+        or credits.get("solo_agent_parallel_limit")
+    )
+    limit = _coerce_positive_int(limit)
+    # The report only establishes a dynamic server entitlement.  Free and
+    # unknown accounts have the requested two-session fallback; paid plans
+    # without a returned entitlement use the same conservative fallback.
+    if limit is None:
+        limit = _DEFAULT_ACCOUNT_PARALLEL_LIMIT
+    # An explicitly configured relay capacity is a deployment hard ceiling,
+    # never a replacement for the entitlement.  No implicit/default env value
+    # is applied here.
+    hard_cap = os.environ.get("TRAE_MODEL_REQUEST_PARALLEL_LIMIT")
+    if hard_cap in (None, ""):
+        hard_cap = os.environ.get("TRAE_WEB_PARALLEL_LIMIT")
+    hard_cap = _coerce_positive_int(hard_cap)
+    if hard_cap is not None:
+        limit = min(limit, hard_cap)
+    return {
+        "account_tier": tier,
+        "pay_identity": raw_identity,
+        "pay_identity_str": identity_text,
+        "model_parallel_limit": limit,
+        "entitlement_updated_at": (
+            record.get("entitlement_updated_at")
+            or provider.get("entitlementUpdatedAt")
+            or credits.get("entitlement_updated_at")
+        ),
+    }
+
+
+def account_parallel_limit(account_id: str, record: dict | None = None) -> int:
+    """Return the effective per-account model/tool capacity."""
+    if record is None:
+        canonical = resolve_model_account_id(account_id)
+        record = get_account_record(canonical or account_id)
+    return int(_account_entitlement_snapshot(record)["model_parallel_limit"])
+
+
+def resolve_model_account_id(identity: str) -> str:
+    """Resolve a JWT/user identity to the canonical account-store key."""
+    identity = str(identity or "").strip()
+    if not identity:
+        return ""
+    with _STORE_LOCK:
+        if identity in _accounts:
+            return identity
+        for aid, record in _accounts.items():
+            provider = record.get("provider_specific")
+            provider = provider if isinstance(provider, dict) else {}
+            aliases = (
+                record.get("user_id"),
+                provider.get("webId"),
+                provider.get("bizUserId"),
+                provider.get("userUniqueId"),
+            )
+            if identity in {str(value) for value in aliases if value not in (None, "")}:
+                return aid
+        return ""
+
+
+def account_capacity_snapshot(account_id: str = "") -> dict:
+    """Expose live capacity for diagnostics without exposing credentials."""
+    account_id = resolve_model_account_id(account_id) or str(account_id or "")
+    with _STORE_LOCK:
+        record = dict(_accounts.get(account_id) or {})
+        limit = account_parallel_limit(account_id, record)
+        used = max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(account_id, 0)))
+        return {
+            "account_id": account_id,
+            "limit": limit,
+            "inflight": used,
+            "available": max(0, limit - used),
+        }
+
+
+def account_capacity_snapshot_all() -> dict[str, dict]:
+    with _STORE_LOCK:
+        return {
+            aid: {
+                "account_id": aid,
+                "limit": account_parallel_limit(aid, rec),
+                "inflight": max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(aid, 0))),
+                "available": max(
+                    0,
+                    account_parallel_limit(aid, rec)
+                    - max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(aid, 0))),
+                ),
+            }
+            for aid, rec in _accounts.items()
+        }
+
+
+def release_account_slot(account_id: str) -> bool:
+    """Release one slot owned by a running model/tool transport."""
+    account_id = resolve_model_account_id(account_id) or str(account_id or "")
+    if not account_id:
+        return False
+    with _STORE_LOCK:
+        current = max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(account_id, 0)))
+        if current <= 0:
+            return False
+        if current == 1:
+            _MODEL_ACCOUNT_INFLIGHT.pop(account_id, None)
+        else:
+            _MODEL_ACCOUNT_INFLIGHT[account_id] = current - 1
+        return True
+
+
+def cancel_account_slot_reservation(
+    account_id: str, reservation_id: str = ""
+) -> bool:
+    """Cancel a scheduler reservation before a transport consumes it."""
+    requested_account_id = str(account_id or "")
+    account_id = resolve_model_account_id(requested_account_id) or requested_account_id
+    with _STORE_LOCK:
+        reservation_id = str(reservation_id or "")
+        if reservation_id:
+            owner = _MODEL_ACCOUNT_RESERVATION_OWNERS.get(reservation_id)
+            if not owner:
+                return False
+            if account_id and owner != account_id:
+                return False
+            account_id = owner
+            # Keep ownership intact until the counter is validated below.
+            # This makes a malformed/double cleanup harmless instead of
+            # deleting a live reservation without decrementing its ledger.
+        else:
+            if not account_id:
+                return False
+            reservation_id = next(
+                (
+                    candidate
+                    for candidate, owner in _MODEL_ACCOUNT_RESERVATION_OWNERS.items()
+                    if owner == account_id
+                ),
+                "",
+            )
+        reserved = max(0, int(_MODEL_ACCOUNT_RESERVED.get(account_id, 0)))
+        if reserved <= 0:
+            return False
+        if reservation_id:
+            _MODEL_ACCOUNT_RESERVATION_OWNERS.pop(reservation_id, None)
+        if reserved == 1:
+            _MODEL_ACCOUNT_RESERVED.pop(account_id, None)
+        else:
+            _MODEL_ACCOUNT_RESERVED[account_id] = reserved - 1
+        current = max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(account_id, 0)))
+        if current <= 1:
+            _MODEL_ACCOUNT_INFLIGHT.pop(account_id, None)
+        else:
+            _MODEL_ACCOUNT_INFLIGHT[account_id] = current - 1
+        return True
+
+
+def consume_account_slot_reservation(
+    account_id: str, reservation_id: str = ""
+) -> bool:
+    """Transfer a scheduler reservation to the transport owner."""
+    requested_account_id = str(account_id or "")
+    account_id = resolve_model_account_id(requested_account_id) or requested_account_id
+    if not account_id:
+        return False
+    with _STORE_LOCK:
+        reservation_id = str(reservation_id or "")
+        # A reservation is request-owned.  Never consume an arbitrary pending
+        # reservation when a transport forgot to propagate its id: that can
+        # steal another concurrent request's slot and leave the owner blocked.
+        if not reservation_id:
+            return False
+        if _MODEL_ACCOUNT_RESERVATION_OWNERS.get(reservation_id) != account_id:
+            return False
+        if max(0, int(_MODEL_ACCOUNT_RESERVED.get(account_id, 0))) <= 0:
+            return False
+        _MODEL_ACCOUNT_RESERVATION_OWNERS.pop(reservation_id, None)
+        reserved = max(0, int(_MODEL_ACCOUNT_RESERVED.get(account_id, 0)))
+        if reserved <= 0:
+            return False
+        if reserved == 1:
+            _MODEL_ACCOUNT_RESERVED.pop(account_id, None)
+        else:
+            _MODEL_ACCOUNT_RESERVED[account_id] = reserved - 1
+        return True
+
+
+def try_reserve_account_slot(account_id: str) -> bool:
+    """Atomically reserve one slot for a known account."""
+    account_id = resolve_model_account_id(account_id) or str(account_id or "")
+    if not account_id:
+        return False
+    with _STORE_LOCK:
+        record = _accounts.get(account_id)
+        if not record or not _record_model_eligible(record):
+            return False
+        limit = account_parallel_limit(account_id, record)
+        used = max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(account_id, 0)))
+        if used >= limit:
+            return False
+        _MODEL_ACCOUNT_INFLIGHT[account_id] = used + 1
+        return True
+
+
+def reserve_model_account(
+    *,
+    preferred_account_id: str = "",
+    require_polling: bool = False,
+    excluded_account_ids: Optional[set[str]] = None,
+) -> tuple[str, dict]:
+    """Atomically choose an eligible account and reserve one model slot.
+
+    A preferred id is honored only when it has capacity (used for a pinned
+    continuation).  New requests use credit-priority ordering when enabled;
+    round-robin ordering remains available and skips full accounts.
+    """
+    global _active_account, _rotation_cursor
+    preferred_account_id = (
+        resolve_model_account_id(preferred_account_id)
+        or str(preferred_account_id or "")
+    )
+    excluded = {
+        resolve_model_account_id(account_id) or str(account_id or "")
+        for account_id in (excluded_account_ids or set())
+        if str(account_id or "")
+    }
+    with _STORE_LOCK:
+        eligible = [
+            (aid, rec)
+            for aid, rec in _accounts.items()
+            if _record_model_eligible(rec) and aid not in excluded
+        ]
+        if preferred_account_id:
+            eligible = [
+                item for item in eligible if item[0] == preferred_account_id
+            ]
+        if not eligible and preferred_account_id:
+            # A continuation must never jump to another account; callers can
+            # distinguish this from a new-request exhaustion by the empty id.
+            return "", {}
+        if not eligible:
+            return "", {}
+        if not preferred_account_id and not (_poll_enabled or require_polling):
+            selected = next(
+                (item for item in eligible if item[0] == _active_account),
+                eligible[0],
+            )
+            eligible = [selected]
+
+        available = []
+        for aid, rec in eligible:
+            limit = account_parallel_limit(aid, rec)
+            used = max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(aid, 0)))
+            if used < limit:
+                available.append((aid, rec, limit, used))
+        if not available:
+            return "", {}
+
+        if preferred_account_id:
+            chosen = available[0]
+        elif _polling_mode == "credit-priority":
+            def credit_key(item: tuple[str, dict, int, int]) -> tuple:
+                aid, rec, limit, used = item
+                credits = (rec.get("checkin") or {}).get("account_credits") or {}
+                if credits.get("unlimited"):
+                    balance = float("inf")
+                else:
+                    try:
+                        balance = float(
+                            credits.get("remaining")
+                            if credits.get("remaining") is not None
+                            else credits.get("official_remaining") or 0
+                        )
+                    except (TypeError, ValueError):
+                        balance = 0.0
+                # Higher balance first; when tied, prefer the account with
+                # more free capacity and then use a stable rotating cursor.
+                return (-balance, -(limit - used), used, aid)
+            chosen = sorted(available, key=credit_key)[0]
+        else:
+            ids = [item[0] for item in available]
+            start = _rotation_cursor % max(1, len(ids))
+            chosen = available[start]
+            _rotation_cursor = (start + 1) % max(1, len(ids))
+
+        aid, rec, _limit, _used = chosen
+        reservation_id = uuid.uuid4().hex
+        _MODEL_ACCOUNT_INFLIGHT[aid] = _MODEL_ACCOUNT_INFLIGHT.get(aid, 0) + 1
+        _MODEL_ACCOUNT_RESERVED[aid] = _MODEL_ACCOUNT_RESERVED.get(aid, 0) + 1
+        _MODEL_ACCOUNT_RESERVATION_OWNERS[reservation_id] = aid
+        _active_account = aid
+        _switch_record(rec)
+        snapshot = dict(rec)
+        snapshot["_slot_reservation_id"] = reservation_id
+        return aid, snapshot
+
+
+def get_account_credit_state(account_id: str) -> dict:
+    """Return the persisted credit projection for one account.
+
+    The returned mapping is a copy and never contains credentials.  Credit
+    reconciliation keeps the upstream ``official_*`` values separate from
+    the locally projected ``remaining`` value so delayed billing can be shown
+    immediately without permanently double-counting the next upstream poll.
+    """
+
+    with _STORE_LOCK:
+        rec = _accounts.get(str(account_id or ""))
+        checkin = (rec or {}).get("checkin") or {}
+        credits = checkin.get("account_credits")
+        return dict(credits) if isinstance(credits, dict) else {}
+
+
+def reconcile_account_credits(
+    account_id: str,
+    data: dict,
+    *,
+    effective_remaining: object = None,
+    local_debit: object = 0,
+    status: str = "ok",
+    source: str = "upstream",
+    confidence: object = 1.0,
+    observed_at: object = None,
+) -> dict:
+    """Persist an upstream credit snapshot plus its local projection.
+
+    ``data`` is the parsed entitlement response.  ``remaining`` remains the
+    public/effective balance consumed by the console, while
+    ``official_remaining`` and ``official_used`` preserve the last upstream
+    observation.  ``local_debit`` is only the weighted, post-snapshot usage
+    that the upstream balance has not reflected yet.
+    """
+
+    account_id = str(account_id or "")
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get("checkin") or {})
+        existing = dict(checkin.get("account_credits") or {})
+        incoming = dict(data or {})
+        parsed = dict(
+            incoming.get("account_credits")
+            if isinstance(incoming.get("account_credits"), dict)
+            else incoming
+        )
+        # Keep the private, post-snapshot debit ledger while replacing the
+        # public entitlement fields with the newest upstream observation.
+        # The ledger is deliberately separate from upstream ``remaining``:
+        # billing may settle one or more polls after a response completes.
+        for key in (
+            "credits_pending_debits",
+            "credits_absorbed_debits",
+            "credits_last_settled_at",
+        ):
+            if key not in parsed and key in existing:
+                parsed[key] = existing[key]
+        now = time.time() if observed_at in (None, "") else observed_at
+        try:
+            now = float(now)
+        except (TypeError, ValueError):
+            now = time.time()
+        official_remaining = parsed.get("remaining")
+        parsed["official_remaining"] = official_remaining
+        if "used" in parsed:
+            parsed["official_used"] = parsed.get("used")
+        if effective_remaining is None:
+            effective_remaining = official_remaining
+        try:
+            local_value = max(0.0, float(local_debit or 0))
+        except (TypeError, ValueError):
+            local_value = 0.0
+        try:
+            confidence_value = min(1.0, max(0.0, float(confidence)))
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        parsed["remaining"] = effective_remaining
+        parsed["local_debit"] = round(local_value, 4)
+        parsed["credits_anchor_at"] = now
+        parsed["credits_anchor_used"] = parsed.get("used")
+        parsed["credits_reconciled_at"] = now
+        parsed["reconcile_status"] = str(status or "ok")
+        parsed["reconcile_source"] = str(source or "upstream")
+        parsed["reconcile_confidence"] = round(confidence_value, 4)
+        checkin["account_credits"] = parsed
+        rec["checkin"] = checkin
+        _persist_entitlement_profile_locked(rec, parsed)
+        rec["credits_updated_at"] = now
+        rec["credits_reconciled_at"] = now
+        rec["credits_reconcile_status"] = parsed["reconcile_status"]
+        _save_accounts()
+        return dict(checkin)
+
+
+def update_account_credit_projection(
+    account_id: str,
+    *,
+    effective_remaining: object = None,
+    local_debit: object = 0,
+    status: str = "projected",
+    source: str = "usage_weighted",
+    confidence: object = 0.0,
+    settled_at: object = None,
+) -> dict:
+    """Atomically update only the locally projected balance.
+
+    This is called whenever a usage row moves from pending to a confirmed
+    charge.  It never changes the official upstream snapshot or its anchor.
+    """
+
+    account_id = str(account_id or "")
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get("checkin") or {})
+        credits = dict(checkin.get("account_credits") or {})
+        if not credits:
+            return {}
+        if effective_remaining is not None:
+            credits["remaining"] = effective_remaining
+        try:
+            credits["local_debit"] = round(max(0.0, float(local_debit or 0)), 4)
+        except (TypeError, ValueError):
+            credits["local_debit"] = 0.0
+        try:
+            credits["reconcile_confidence"] = round(
+                min(1.0, max(0.0, float(confidence))), 4
+            )
+        except (TypeError, ValueError):
+            pass
+        credits["reconcile_status"] = str(status or "projected")
+        credits["reconcile_source"] = str(source or "usage_weighted")
+        if settled_at not in (None, ""):
+            try:
+                credits["credits_last_settled_at"] = float(settled_at)
+            except (TypeError, ValueError):
+                pass
+        checkin["account_credits"] = credits
+        rec["checkin"] = checkin
+        _save_accounts()
+        return dict(credits)
+
+
+def mark_account_credit_reconcile_stale(account_id: str) -> dict:
+    """Keep the last balance while marking an unsuccessful poll as stale."""
+
+    account_id = str(account_id or "")
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get("checkin") or {})
+        credits = dict(checkin.get("account_credits") or {})
+        if not credits:
+            return {}
+        credits["reconcile_status"] = "stale"
+        checkin["account_credits"] = credits
+        rec["checkin"] = checkin
+        rec["credits_reconcile_status"] = "stale"
+        _save_accounts()
+        return dict(credits)
 
 
 def sync_account_label_from_credits(account_id: str, user_name: str) -> str:
@@ -1122,6 +1689,11 @@ def list_accounts() -> list[dict]:
         result = []
         for aid, rec in _accounts.items():
             checkin = rec.get('checkin') or {}
+            account_credits = checkin.get('account_credits')
+            account_credits = (
+                dict(account_credits) if isinstance(account_credits, dict) else {}
+            )
+            entitlement = _account_entitlement_snapshot(rec)
             result.append({
                 'id': aid,
                 'user_id': rec.get('user_id', aid),
@@ -1140,7 +1712,42 @@ def list_accounts() -> list[dict]:
                     'checkin_status_updated_at', rec.get('checkin_updated_at', 0)
                 ),
                 'credits_updated_at': rec.get('credits_updated_at', 0),
-                'account_credits': checkin.get('account_credits'),
+                'account_credits': account_credits,
+                'credits_official_remaining': account_credits.get(
+                    'official_remaining',
+                    account_credits.get('remaining'),
+                ),
+                'credits_official_used': account_credits.get('official_used'),
+                'credits_local_debit': account_credits.get('local_debit', 0),
+                'credits_reconciled_at': account_credits.get(
+                    'credits_reconciled_at',
+                    rec.get('credits_reconciled_at', 0),
+                ),
+                'credits_reconcile_status': account_credits.get(
+                    'reconcile_status',
+                    rec.get('credits_reconcile_status', 'unknown'),
+                ),
+                'credits_reconcile_source': account_credits.get(
+                    'reconcile_source', 'unknown'
+                ),
+                'credits_reconcile_confidence': account_credits.get(
+                    'reconcile_confidence'
+                ),
+                'account_tier': entitlement['account_tier'],
+                'pay_identity': entitlement['pay_identity'],
+                'pay_identity_str': entitlement['pay_identity_str'],
+                'model_parallel_limit': entitlement['model_parallel_limit'],
+                'solo_agent_parallel_limit': entitlement['model_parallel_limit'],
+                'entitlement_updated_at': entitlement['entitlement_updated_at'],
+                'capacity': {
+                    'limit': entitlement['model_parallel_limit'],
+                    'inflight': max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(aid, 0))),
+                    'available': max(
+                        0,
+                        entitlement['model_parallel_limit']
+                        - max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(aid, 0))),
+                    ),
+                },
             })
         return result
 
@@ -1165,6 +1772,10 @@ def add_account(creds: dict, label: str = '') -> str:
         'userRegion': creds.get('user_region') or creds.get('userRegion'),
         'userIdentity': creds.get('user_identity') or creds.get('userIdentity'),
         'screenName': creds.get('screen_name') or creds.get('screenName'),
+        'userPayIdentity': creds.get('user_pay_identity') or creds.get('pay_identity'),
+        'userPayIdentityText': creds.get('user_pay_identity_str') or creds.get('pay_identity_str'),
+        'accountTier': creds.get('account_tier'),
+        'soloAgentParallelLimit': creds.get('solo_agent_parallel_limit') or creds.get('model_parallel_limit'),
     }.items():
         if v:
             psd[k] = v
@@ -1181,6 +1792,14 @@ def add_account(creds: dict, label: str = '') -> str:
         'edition': creds.get('edition') or 'cn',
         'provider_specific': psd,
     }
+    profile = {
+        'user_pay_identity': creds.get('user_pay_identity') or creds.get('pay_identity'),
+        'user_pay_identity_str': creds.get('user_pay_identity_str') or creds.get('pay_identity_str'),
+        'account_tier': creds.get('account_tier'),
+        'model_parallel_limit': creds.get('model_parallel_limit') or creds.get('solo_agent_parallel_limit'),
+        'entitlement_updated_at': creds.get('entitlement_updated_at'),
+    }
+    _persist_entitlement_profile_locked(record, profile)
     with _STORE_LOCK:
         previous = _accounts.get(aid) or {}
         record['model_enabled'] = _record_model_enabled(previous)
@@ -1286,6 +1905,8 @@ def next_polling_account() -> None:
         ids = [
             aid for aid, rec in _accounts.items()
             if _record_model_eligible(rec)
+            and max(0, int(_MODEL_ACCOUNT_INFLIGHT.get(aid, 0)))
+            < account_parallel_limit(aid, rec)
         ]
         if not ids:
             return
@@ -1302,6 +1923,16 @@ def next_polling_account() -> None:
             ids.sort(key=_credits_sort_key)
 
         n = len(ids)
+        # Credit-priority intentionally keeps the richest account selected
+        # until its entitlement slots are full.  The old unconditional
+        # ``aid != _active_account`` check defeated multi-slot accounts.
+        if _polling_mode == "credit-priority":
+            aid = ids[0]
+            if aid != _active_account or _active_account not in ids:
+                _active_account = aid
+                _switch_record(_accounts[aid])
+                logger.info("auth: polling switched to account %s (mode=%s)", aid, _polling_mode)
+            return
         for i in range(n):
             idx = (_rotation_cursor + i) % n
             aid = ids[idx]
@@ -1311,6 +1942,10 @@ def next_polling_account() -> None:
                 _switch_record(_accounts[aid])
                 logger.info("auth: polling switched to account %s (mode=%s)", aid, _polling_mode)
                 return
+        # If every other account is full, keep the current account when it has
+        # capacity rather than selecting a full account and blocking a request.
+        if _active_account in ids:
+            return
         _rotation_cursor = (_rotation_cursor + 1) % n
 def get_settings() -> dict:
     with _STORE_LOCK:
@@ -1320,7 +1955,13 @@ def get_settings() -> dict:
             # separately from the Web/Remote base URL.  Keeping them apart
             # prevents an IDE/SOLO preset selection from stripping the
             # ``/api/remote/v1`` path that the Remote transport requires.
-            'model_base_url': _settings.get('model_base_url', ''),
+            # ``None`` means this key predates the split; an empty string is an
+            # explicit request to clear a previously configured gateway.
+            'model_base_url': (
+                _settings.get('model_base_url')
+                if 'model_base_url' in _settings
+                else None
+            ),
             'upstream_mode': _settings.get('upstream_mode', ''),
             # ``web_base_url`` is shared by the IDE Raw/IDE Agent pair and by
             # Remote/Work Agent.  Keep the selected preset id separately so a

@@ -737,6 +737,67 @@ def normalize_inbound_request(
         "provider",
         "config_source",
         "configSource",
+        # Trae 3.4.4 shares the Work/Code raw-v2 DTO. Keep these fields in a
+        # bounded allow-list so the ingress can hand them to raw_client
+        # without exposing arbitrary scheduler/internal keys.
+        "message",
+        "is_custom_model",
+        "isCustomModel",
+        "Request",
+        "request",
+        "encrypted_model_params",
+        "encryptedModelParams",
+        "user_input",
+        "userInput",
+        "request_type",
+        "requestType",
+        "metadata",
+        "queue_id",
+        "queueId",
+        "request_seq",
+        "requestSeq",
+        "mode_type",
+        "modeType",
+        "chat_mode",
+        "chatMode",
+        "access_type",
+        "accessType",
+        "image_config",
+        "imageConfig",
+        "estimate_prompt_tokens",
+        "estimatePromptTokens",
+        "slash_command",
+        "slashCommand",
+        "message_origin",
+        "messageOrigin",
+        "retry_times",
+        "retryTimes",
+        "queue_retry",
+        "queueRetry",
+        "video_config",
+        "videoConfig",
+        "connect_check_param",
+        "connectCheckParam",
+        "user_selected_model_name",
+        "userSelectedModelName",
+        "reasoning_effort_level",
+        "reasoningEffortLevel",
+        "estimated_token_usage",
+        "estimatedTokenUsage",
+        "custom_model_uniq_id",
+        "customModelUniqId",
+        "provider_context",
+        "providerContext",
+        "biz_context",
+        "bizContext",
+        "extra_info",
+        "extraInfo",
+        "use_fast_request",
+        "useFastRequest",
+        "raw_chat_function",
+        "rawChatFunction",
+        "traecode_raw_chat_function",
+        "traeCodeRawChatFunction",
     )
     # Inner payload values win, but copy every layer so wrappers from different
     # Trae versions remain usable.  ``layers`` is outer-to-inner; walking it in
@@ -795,6 +856,66 @@ def normalize_inbound_request(
         options["tool_choice"] = options["toolChoice"]
     if options.get("parallelToolCalls") is not None and options.get("parallel_tool_calls") is None:
         options["parallel_tool_calls"] = options["parallelToolCalls"]
+    # The 3.4.4 client advertises the shared raw-v2 function in the body or
+    # IDE function header. Mark only those explicit requests for the native
+    # Code/Work raw chain; ordinary custom-model requests retain Remote as the
+    # compatibility default.
+    raw_function = _specific_layer_value(
+        layers,
+        "raw_chat_function",
+        "rawChatFunction",
+        "traecode_raw_chat_function",
+        "traeCodeRawChatFunction",
+    )
+    if raw_function in (None, ""):
+        raw_function = _header(headers, "x-ide-function", "x-app-function")
+    if raw_function not in (None, ""):
+        options["_traecode_raw_chat_function"] = str(raw_function)
+        options["_traework_upstream_mode"] = "raw"
+
+    inbound_context = {
+        key: value
+        for key, value in (
+            ("cpu", _header(headers, "x-device-cpu")),
+            ("device_id", _header(headers, "x-device-id")),
+            ("machine_id", _header(headers, "x-machine-id")),
+            ("device_model", _header(headers, "x-device-brand")),
+            ("os_name", _header(headers, "x-device-type")),
+            ("os_version", _header(headers, "x-os-version")),
+            ("webId", _header(headers, "x-web-id")),
+            ("ppeEnvName", _header(headers, "x-tt-env")),
+            ("usePpe", _header(headers, "x-use-ppe")),
+            (
+                "authorizedServices",
+                _header(headers, "x-trae-authorized-services"),
+            ),
+            ("pluginChannel", _header(headers, "x-plugin-channel")),
+            ("ideVersionType", _header(headers, "x-ide-version-type")),
+            ("appVersion", _header(headers, "x-app-version")),
+            (
+                "requestTrafficType",
+                _header(headers, "request-traffic-type"),
+            ),
+        )
+        if value
+    }
+    if inbound_context:
+        existing_context = options.get("client_context")
+        merged_context = (
+            dict(existing_context) if isinstance(existing_context, Mapping) else {}
+        )
+        for key, value in inbound_context.items():
+            merged_context.setdefault(key, value)
+        options["client_context"] = merged_context
+
+    ide_version = _header(headers, "x-ide-version")
+    ide_version_code = _header(
+        headers, "x-ide-version-code", "x-app-version-code"
+    )
+    if ide_version:
+        options.setdefault("traecode_ide_version", ide_version)
+    if ide_version_code:
+        options.setdefault("traecode_ide_version_code", ide_version_code)
     options["session_id"] = session_id
     options["_traework_custom_model"] = True
     options["_trae_request_path"] = path
@@ -816,8 +937,29 @@ def normalize_inbound_request(
     # A Cloud-IDE-JWT header is an explicit upstream credential. A normal
     # Bearer/API key from a custom-model form must stay local to the relay.
     authorization = _header(headers, "authorization")
+    authorization_token = ""
     if authorization.lower().startswith("cloud-ide-jwt "):
-        options["_auth_token"] = authorization.split(" ", 1)[1].strip()
+        authorization_token = authorization.split(" ", 1)[1].strip()
+    ide_token = _header(headers, "x-ide-token")
+    cloudide_token = _header(headers, "x-cloudide-token")
+    supplied_tokens = [
+        token
+        for token in (authorization_token, ide_token, cloudide_token)
+        if token
+    ]
+    if len(set(supplied_tokens)) > 1:
+        token_identities = [raw_client._jwt_identity(token) for token in supplied_tokens]
+        if not all(token_identities) or len(set(token_identities)) != 1:
+            raise ValueError(
+                "Authorization, x-ide-token and x-cloudide-token must "
+                "identify the same account"
+            )
+    bound_token = authorization_token or ide_token or cloudide_token
+    if bound_token:
+        options["_auth_token"] = bound_token
+        bound_identity = raw_client._jwt_identity(bound_token)
+        if bound_identity:
+            options["_auth_user_id"] = bound_identity
     stream_value = _first_layer_value(layers, "stream", "is_stream", "isStream")
     if isinstance(stream_value, str):
         stream = stream_value.strip().lower() in {"1", "true", "yes", "on"}
@@ -1575,6 +1717,10 @@ def connectivity_response(
         "provider": custom.get("provider") or "trae-cn-relay",
         "config_source": config_source,
     })
+    # Connectivity proves that the relay can route this custom model; it does
+    # not prove model-specific image, reasoning, or context capabilities.
+    # Those fields may only come from the current account/function descriptor
+    # supplied in ``models``.
     model_item = {
         "id": binding.config_name,
         "name": binding.config_name,
@@ -1587,15 +1733,35 @@ def connectivity_response(
         "is_custom_base_url": custom_base_url,
         "custom_model_id": custom_model_id,
         "config_source": binding.config_source,
-        "context_window_size": {"default": 200000, "max": 1000000},
-        "prompt_max_tokens": 936000,
-        "max_tokens": 64000,
         "features": {
-            "reasoning": {"enable": True},
             "tool_calls": {"enable": True},
-            "context_windows": {"enable": True, "data": {"dev_context": 200000, "max_context": 1000000}},
         },
     }
+    # A caller may include the descriptor returned by the bound account's
+    # model catalog in ``custom_model``.  Preserve only capability metadata;
+    # credentials and routing fields are intentionally excluded.  This keeps
+    # connectivity discovery honest without dropping explicit per-function
+    # evidence supplied by the client.
+    for capability_key in (
+        "multimodal",
+        "support_read_image",
+        "reasoning_effort_config",
+        "max_mode",
+        "context_window_size",
+        "context_window_sizes",
+        "context_window_tokens",
+        "prompt_max_tokens",
+        "max_tokens",
+        "max_turn",
+        "max_turns",
+    ):
+        if capability_key in custom and custom.get(capability_key) is not None:
+            model_item[capability_key] = copy.deepcopy(custom[capability_key])
+    custom_features = custom.get("features")
+    if isinstance(custom_features, Mapping):
+        model_item["features"].update(copy.deepcopy(dict(custom_features)))
+        model_item["features"].setdefault("tool_calls", {"enable": True})
+    selected_model = model_item
     if models:
         model_list: list[dict[str, Any]] = []
         matched = False
@@ -1610,9 +1776,20 @@ def connectivity_response(
                 or ""
             )
             if identity == binding.config_name:
-                # Keep provider-specific capability fields while overriding
-                # the identity fields that control TraeWork's route choice.
-                candidate.update(model_item)
+                # Keep descriptor-backed capability fields while overriding
+                # only the identity fields that control TraeWork's route.
+                candidate_features = candidate.get("features")
+                candidate.update(
+                    {key: value for key, value in model_item.items() if key != "features"}
+                )
+                features = (
+                    dict(candidate_features)
+                    if isinstance(candidate_features, Mapping)
+                    else {}
+                )
+                features.setdefault("tool_calls", {"enable": True})
+                candidate["features"] = features
+                selected_model = candidate
                 matched = True
             model_list.append(candidate)
         if not matched:
@@ -1628,12 +1805,12 @@ def connectivity_response(
         "config_name": binding.config_name,
         "model_name": binding.raw_model_name,
         "display_name": binding.display_name,
-        "model": model_item,
+        "model": selected_model,
         "models": model_list,
         "data": {
             "success": True,
             "code": 0,
-            "model": model_item,
+            "model": selected_model,
             "models": model_list,
         },
     }
