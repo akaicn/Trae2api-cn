@@ -61,6 +61,7 @@ from . import (
     cli_client,
     continuation,
     images,
+    log_rotate,
     raw_client,
     responses_api,
     trae_client,
@@ -13638,6 +13639,7 @@ def _auto_checkin_payload() -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_app()
+    log_rotate.start_log_rotation()
     web_reaper = asyncio.create_task(_web_reaper_loop())
     terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
     checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())

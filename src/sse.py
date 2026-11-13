@@ -1318,17 +1318,17 @@ class ToolCallAccumulator:
                     # 孤立的 } / ] / 空帧是上游遗留的闭合帧，忽略不拼。
                     first = current_args.lstrip()[:1]
                     if first in ("{", "["):
+                        # 并发工具流复用同一个 index 时，前一个调用闭合后以
+                        # { 开头的新片段是【新调用】的起点，不能按冲突丢弃：
+                        # 丢掉头部会让该调用的续片变成无头碎片，拼出从中间
+                        # 开始的非法 JSON（表现为 invalid JSON arguments）。
+                        # 只有上游整段重放同一个调用时才跳过，避免重复执行。
                         if (
-                            existing.get("_explicit_id") is True
-                            or call.get("_explicit_id") is True
-                            or (
-                                existing.get("_explicit_index") is True
-                                and call.get("_explicit_index") is True
-                                and existing.get("index") == call.get("index")
-                            )
+                            str(call.get("id") or "") == str(existing.get("id") or "")
+                            and str(current_args) == str(previous_args)
                         ):
-                            logger.warning(
-                                "dropping new delta object for closed logical call id=%s",
+                            logger.debug(
+                                "dropping replayed delta object id=%s",
                                 existing.get("id"),
                             )
                             continue
@@ -2349,7 +2349,7 @@ async def translate_ide_stream(
         )
     tool_calls.set_calls(
         _ensure_native_tool_arguments(
-            tool_calls.calls(), final_usage, strict=True
+            tool_calls.calls(), final_usage, strict=False
         )
     )
     if reasoning_summary:
@@ -3668,7 +3668,7 @@ async def collect_nonstream_ide(
             observed_model_event=observed_model_event,
         )
     tool_calls.set_calls(
-        _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=True)
+        _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=False)
     )
     if not full.strip() and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
